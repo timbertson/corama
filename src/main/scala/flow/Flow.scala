@@ -85,8 +85,12 @@ final class TopologyBuilder[S] private[flow] (
 	private[flow] val vars = new VarRegistry()
 
 	val input: Var[S] = vars.add[S](source.name) // mint a generated var name for elements in the source
+	
+	// // only used for query topologies
+	// val output: Var[S] = vars.add[S]("output")
 
-	def variable[A](hint: String): Var[A] = vars.add[A](hint)
+	// def variable[A](hint: String): Var[A] = vars.add[A](hint)
+	def define[A](hint: String = "var"): Var[A] = vars.add[A](hint)
 
 	override def toString: String = s"TopologyBuilder($source)"
 }
@@ -113,7 +117,8 @@ final class Topologies {
 
 	def depot[A](name: String): Depot[A] = Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
 
-	// define a query which returns a value (with no side-effects)
+	// define a query which returns a value
+	// TODO: automatically inject a fan-in and assignment to `topology.output`?
 	def query[A, R](name: String)(
 		block: TopologyBuilder[A] => Flow[R]
 	): Topology[A, R] = {
@@ -185,7 +190,7 @@ object Flow {
 	private[flow] case class UpdateWith[K, V, A]( ps: PState[K, V], key: Var[K], arg: Var[A], f: (Option[V], A) => Option[V]) extends Flow[Unit]
 	
 	// Depot
-	private[flow] case class Emit[A](depot: Depot[A], key: Var[A]) extends Flow[Unit]
+	private[flow] case class PartitionAppend[A](depot: Depot[A], key: Var[A]) extends Flow[Unit]
 
 	def pure[A](v: Var[A]): Flow[A] = Pure(v)
 
@@ -232,7 +237,11 @@ final case class PState[K, V](id: Identity) {
 }
 
 final case class Depot[A](id: Identity) {
-	def emit(value: Var[A]): Flow[Unit] = Flow.Emit(this, value)
+	// append to the current partition of the depot. Care must be taken to ensure this
+	// matches the partitioning scheme of the depot.
+	// TODO: this could fail at runtime (or compile time?) if you're not on the right partition for a depot
+	// with deterministic partitioning.
+	def partitionAppend(value: Var[A]): Flow[Unit] = Flow.PartitionAppend(this, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,35 +267,34 @@ private[flow] object Node {
 	case class Update(pstate: Identity, key: VarId, fn: Option[Any] => Option[Any]) extends Node
 	case class Put(pstate: Identity, key: VarId, value: VarId) extends Node
 	case class UpdateWith(pstate: Identity, key: VarId, arg: VarId, fn: (Option[Any], Any) => Option[Any]) extends Node
-	case class Emit(depot: Identity, arg: VarId) extends Node
+	case class PartitionAppend(depot: Identity, arg: VarId) extends Node
 
 
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*
-		* A query topology may not write PState (Rama rejects it at declaration), so compiling
-		* a write inside one fails here.
+		* TODO: remove unnecessary var return?
 		*/
 	def compile[A](t: TopologyBuilder[?], flow: Flow[A]): (List[Node], Var[A]) = {
 		flow match {
 			case Flow.Pure(v) => (Nil, v)
 
 			case e: Flow.Each1[i, A] =>
-				val out = t.variable[A]("each")
+				val out = t.define[A]("each")
 				(List(Node.Each(args => e.f(args.head.asInstanceOf[i]), List(e.in.vid), out.vid)), out)
 
 			case e: Flow.Each2[a, b, A] =>
-				val out = t.variable[A]("each")
+				val out = t.define[A]("each")
 				val fn = (args: List[Any]) => e.f(args(0).asInstanceOf[a], args(1).asInstanceOf[b])
 				(List(Node.Each(fn, List(e.a.vid, e.b.vid), out.vid)), out)
 
 			case e: Flow.ExplodeOp[i, A] =>
-				val out = t.variable[A]("exploded")
+				val out = t.define[A]("exploded")
 				val fn = (args: List[Any]) => e.f(args.head.asInstanceOf[i]).asInstanceOf[Seq[Any]]
 				(List(Node.Explode(fn, List(e.in.vid), out.vid)), out)
 
 			case f: Flow.FilterOp[i] =>
 				val fn = (args: List[Any]) => f.p(args.head.asInstanceOf[i])
-				val flag = t.variable[Boolean](s"${f.in.vid.hint}_keep")
+				val flag = t.define[Boolean](s"${f.in.vid.hint}_keep")
 				(List(Node.Filter(fn, List(f.in.vid), flag.vid)), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
@@ -299,11 +307,11 @@ private[flow] object Node {
 
 			case a: Flow.Agg[x] =>
 				val (inner, innerVar) = compile(t, a.inner)
-				val out = t.variable[A]("agg")
+				val out = t.define[A]("agg")
 				(List(Node.Scope(inner, innerVar.vid, out.vid)), out)
 
 			case s: Flow.Select[k, v] =>
-				val out = t.variable[A]("select")
+				val out = t.define[A]("select")
 				(List(Node.Select(s.ps.id, s.key.vid, out.vid)), out)
 
 			case u: Flow.Update[k, v] =>
@@ -321,8 +329,8 @@ private[flow] object Node {
 						(List(Node.UpdateWith(ps.id, key.vid, arg.vid, fnWrapped)), Var.unit.asInstanceOf[Var[A]])
 				}
 
-			case Flow.Emit(depot, value) =>
-				(List(Node.Emit(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])
+			case Flow.PartitionAppend(depot, value) =>
+				(List(Node.PartitionAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])
 		}
 	}
 }

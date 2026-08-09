@@ -154,8 +154,8 @@ class Partition(interpreter: Interpreter) {
 					}
 				} *> continue(tail, envs)
 
-			case Node.Emit(ps, value) :: tail =>
-				val state = depot(ps.name)
+			case Node.PartitionAppend(dep, value) :: tail =>
+				val state = depot(dep.name)
 				envs.traverse_ { env =>
 					val v = env(value)
 					state.inner.update(_.appended(v))

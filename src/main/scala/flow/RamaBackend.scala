@@ -4,9 +4,6 @@ import com.rpl.rama.{Agg, Block, Path}
 import com.rpl.rama.ops.{RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
 
 /** Compiles the [[Node]] AST to a `com.rpl.rama.Block`.
-  * Both namespaces are mapped here, at the boundary: PState names get Rama's `$$`
-  * prefix, and [[VarId]]s are rendered to `*hint_id` by [[varName]]. Nothing upstream
-  * of this file knows Rama's naming convention.
   */
 object RamaBackend {
 
@@ -14,25 +11,23 @@ object RamaBackend {
 		def invoke(a: A): B = f(a)
 	}
 
-	private def pstateVar(name: String): String = "$$" + name
+	// generate a rama varname for the given identity
+	private def compileIdentity(id: Identity) = {
+		id.namespace match {
+			case IdentityNamespace.PState => "$$" + id.name
+			case IdentityNamespace.Depot => "*" + id.name
+			case IdentityNamespace.Query => id.name
+		}
+	}
 
-	/** Renders a [[VarId]] to its Rama var name.
-	  *
-	  * A direct function, not a stateful allocator: ids come from the topology's
-	  * counter and are already unique and stable, so the name needs no bookkeeping.
-	  * The hint rides along because var names are what Rama prints in compile errors
-	  * and the cluster UI.
-	  */
-	private[flow] def varName(vid: VarId): String = {
+	// generate a rama var name
+	private[flow] def compileVar(vid: VarId): String = {
 		require(vid != Var.unit.vid, "Var.unit has no Rama representation: it stands for the absence of a value")
 		// TODO assert hint doesn't have any special characters
 		s"*${vid.hint}_${vid.id}"
 	}
 
-	/** The Rama name a var is bound to — what the caller passes to
-	  * `topology.source(depot).out(...)` so the block's reads line up.
-	  */
-	def varName[A](v: Var[A]): String = varName(v.vid)
+	def compileVar[A](v: Var[A]): String = compileVar(v.vid)
 
 	private def eachStep(fn: List[Any] => Any, ins: List[String], out: String): Block.Impl =
 		ins match {
@@ -68,27 +63,27 @@ object RamaBackend {
 		}
 
 	private def compileNode(node: Node): Block.Impl = node match {
-		case Node.Each(fn, ins, out)    => eachStep(fn, ins.map(varName), varName(out))
-		case Node.Explode(fn, ins, out) => explodeStep(fn, ins.map(varName), varName(out))
+		case Node.Each(fn, ins, out)    => eachStep(fn, ins.map(compileVar), compileVar(out))
+		case Node.Explode(fn, ins, out) => explodeStep(fn, ins.map(compileVar), compileVar(out))
 
 		case Node.Filter(fn, ins, flag) =>
 			// The flag var is minted by `Lower`, so the two filters over one input get
 			// distinct names without the backend having to allocate anything.
-			val flagName = varName(flag)
-			eachStep(args => fn(args).asInstanceOf[Any], ins.map(varName), flagName)
+			val flagName = compileVar(flag)
+			eachStep(args => fn(args).asInstanceOf[Any], ins.map(compileVar), flagName)
 				.`macro`(Block.keepTrue(flagName))
 
-		case Node.Partition(in) => Block.hashPartition(varName(in))
+		case Node.Partition(in) => Block.hashPartition(compileVar(in))
 
 		case Node.Scope(inner, collectFrom, out) =>
 			// Rama's `agg` collapses an implicit region; here the region is exactly the
 			// nested block, which is what makes `aggList`'s type change meaningful.
 			Block.create()
-				.`macro`(compile(inner))
-				.`macro`(Block.agg(Agg.list(varName(collectFrom))).out(varName(out)))
+				.`macro`(compileNodes(inner))
+				.`macro`(Block.agg(Agg.list(compileVar(collectFrom))).out(compileVar(out)))
 
 		case Node.Select(ps, key, out) =>
-			Block.localSelect(pstateVar(ps), Path.key(varName(key))).out(varName(out))
+			Block.localSelect(compileIdentity(ps), Path.key(compileVar(key))).out(compileVar(out))
 
 		case Node.Update(ps, key, fn) =>
 			// Rama models read-modify-write as a `term` on the path: the function
@@ -96,10 +91,13 @@ object RamaBackend {
 			val term = new RamaFunction1[Any, Any] {
 				def invoke(current: Any): Any = fn(Option(current)).orNull
 			}
-			Block.localTransform(pstateVar(ps), Path.key(varName(key)).term(term))
+			Block.localTransform(compileIdentity(ps), Path.key(compileVar(key)).term(term))
 
 		case Node.Put(ps, key, value) =>
-			Block.localTransform(pstateVar(ps), Path.key(varName(key)).termVal(varName(value)))
+			Block.localTransform(compileIdentity(ps), Path.key(compileVar(key)).termVal(compileVar(value)))
+
+		case Node.PartitionAppend(dep, value) =>
+			Block.depotPartitionAppend(compileIdentity(dep), compileVar(value))
 
 		case Node.UpdateWith(ps, key, arg, fn) =>
 			// Rama's 2-arity `term`: the extra var is passed as a path argument, which
@@ -107,20 +105,16 @@ object RamaBackend {
 			val term = new RamaFunction2[Any, Any, Any] {
 				def invoke(current: Any, a: Any): Any = fn(Option(current), a).orNull
 			}
-			Block.localTransform(pstateVar(ps), Path.key(varName(key)).term(term, varName(arg)))
+			Block.localTransform(compileIdentity(ps), Path.key(compileVar(key)).term(term, compileVar(arg)))
 	}
 
-	/** Compile a lowered flow to a Rama block.
-	  *
-	  * No source name to pass: every var already has a canonical name, so the caller
-	  * wires the source up with `topology.source(depot).out(RamaBackend.varName(v))`.
-	  */
-	def compile(nodes: List[Node]): Block.Impl =
+	private def compileNodes(nodes: List[Node]): Block.Impl =
 		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
 
-	/** Lower and compile a flow in one step, against the builder that owns its vars. */
-	def compileFlow[A](t: TopologyBuilder[?], flow: Flow[A]): Block.Impl =
-		compile(Lower(t, flow)._1)
+	// /** Compile a topology to a Rama block.
+	//   */
+	// def compileToBlock(t: Topology[?, ?]): Block.Impl =
+	// 	compileNodes(t.compiled.map(_._1))
 
 	/** What a declared topology compiles to, plus the names Rama needs positionally.
 	  *
@@ -129,34 +123,16 @@ object RamaBackend {
 	  * of `topologies.query(name, in)`. `out` is present only for a query — Rama's
 	  * `.out("*result")` — because a stream has no result to name.
 	  */
-	final case class Compiled(kind: TopologyKind, name: String, in: String, out: Option[String], block: Block.Impl)
+	final case class Compiled(source: Identity, in: Var[?], out: Option[Var[?]], block: Block.Impl)
 
-	/** Compile a declared topology, reporting the names its input and result are bound
-	  * to. The caller wires those into Rama's declaration, so the block's reads and
-	  * writes line up by construction rather than by matching string literals by hand.
+	/** Compile a declared topology, reporting the names its input and result are bound to.
 	  */
-	def compileTopology[S, R](t: Topology[S, R]): Compiled = {
-		val (nodes, result) = Lower(t)
-		val out = t.kind match {
-			case TopologyKind.Query  => Some(varName(result))
-			case TopologyKind.Stream => None
+	def compile[S, R](t: Topology[S, R]): Compiled = {
+		val (nodes, result) = t.compiled
+		val out = t.builder.source.namespace match {
+			case IdentityNamespace.Query => Some(result)
+			case _ => None
 		}
-		Compiled(t.kind, t.name, varName(t.input), out, compile(nodes))
-	}
-
-	/** Every Rama var name a lowered tree binds or reads, in traversal order.
-	  *
-	  * `Block` has no public inspection API, so this is how naming is asserted on.
-	  */
-	private[flow] def namesOf(nodes: List[Node]): List[String] = nodes.flatMap {
-		case Node.Each(_, ins, out)       => ins.map(varName) :+ varName(out)
-		case Node.Explode(_, ins, out)    => ins.map(varName) :+ varName(out)
-		case Node.Filter(_, ins, flag)    => ins.map(varName) :+ varName(flag)
-		case Node.Partition(in)           => List(varName(in))
-		case Node.Scope(inner, from, out) => namesOf(inner) ++ List(varName(from), varName(out))
-		case Node.Select(_, k, out)       => List(varName(k), varName(out))
-		case Node.Update(_, k, _)         => List(varName(k))
-		case Node.Put(_, k, v)            => List(varName(k), varName(v))
-		case Node.UpdateWith(_, k, a, _)  => List(varName(k), varName(a))
+		Compiled(t.builder.source, t.input, out, compileNodes(nodes))
 	}
 }
