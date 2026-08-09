@@ -87,7 +87,7 @@ final class TopologyBuilder[S] private[flow] (
 	val input: Var[S] = vars.add[S](source.name) // mint a generated var name for elements in the source
 	
 	// // only used for query topologies
-	// val output: Var[S] = vars.add[S]("output")
+	// val output: Var[S] = vars.add[S]("out")
 
 	// def variable[A](hint: String): Var[A] = vars.add[A](hint)
 	def define[A](hint: String = "var"): Var[A] = vars.add[A](hint)
@@ -252,12 +252,12 @@ private[flow] sealed trait Node
 private[flow] object Node {
 	case class Each(fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
 
-	case class Explode(fn: List[Any] => Seq[Any], ins: List[VarId], out: VarId) extends Node
+	case class Explode(fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
 
 	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
 	  * it. Unused by `interp` backend.
 		*/
-	case class Filter(fn: List[Any] => Boolean, ins: List[VarId], flag: VarId) extends Node
+	case class Filter(fn: Any => Boolean, in: VarId, flag: VarId) extends Node
 
 	case class Partition(in: VarId) extends Node
 
@@ -289,13 +289,13 @@ private[flow] object Node {
 
 			case e: Flow.ExplodeOp[i, A] =>
 				val out = t.define[A]("exploded")
-				val fn = (args: List[Any]) => e.f(args.head.asInstanceOf[i]).asInstanceOf[Seq[Any]]
-				(List(Node.Explode(fn, List(e.in.vid), out.vid)), out)
+				val fn = (arg: Any) => e.f(arg.asInstanceOf[i]).asInstanceOf[Seq[Any]]
+				(List(Node.Explode(fn, e.in.vid, out.vid)), out)
 
 			case f: Flow.FilterOp[i] =>
-				val fn = (args: List[Any]) => f.p(args.head.asInstanceOf[i])
+				val fn = (arg: Any) => f.p(arg.asInstanceOf[i])
 				val flag = t.define[Boolean](s"${f.in.vid.hint}_keep")
-				(List(Node.Filter(fn, List(f.in.vid), flag.vid)), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.Filter(fn, f.in.vid, flag.vid)), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
 				(List(Node.Partition(p.in.vid)), Var.unit.asInstanceOf[Var[A]])

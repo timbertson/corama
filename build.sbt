@@ -1,4 +1,5 @@
 ThisBuild / scalaVersion := "3.4.2"
+ThisBuild / fork := true
 
 val ceVersion = "3.5.4"
 resolvers ++= Seq(

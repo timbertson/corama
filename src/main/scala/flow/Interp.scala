@@ -7,6 +7,7 @@ import scala.util.Try
 import cats.effect.IO
 import cats.effect.kernel.Ref
 import flow.Interpreter.Env
+import scala.util.Random
 
 /** Simple interpreter: runs a [[Flow]] as plain Scala over in-memory state.
   *
@@ -26,13 +27,24 @@ class Partitions(interpreter: Interpreter, numPartitions: Int) {
 	}
 	def partitionKey(value: Any) = partitions(rawPartitionKey(value))
 
+	def random: Partition = {
+		partitions(Random.nextInt(numPartitions))
+	}
+
 	def groupByPartitions[A](values: List[A], keyFn: A => Any): List[(Partition, List[A])] =
 		values.groupBy(v => rawPartitionKey(keyFn(v))).toList.map { case (p, items) =>
 			(partitions(p) -> items)
 		}
 
 	// TODO make much better
-	private def rawPartitionKey(value: Any) = value.hashCode() % numPartitions
+	private def rawPartitionKey(value: Any) = {
+		val mod = value.hashCode() % numPartitions
+		if (mod < 0) {
+			mod + numPartitions
+		} else {
+			mod
+		}
+	}
 
 }
 
@@ -57,6 +69,45 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 	
 	def running[A](block: IO[A]): IO[A] = {
 		IO.race(block, run).map(_.merge)
+	}
+
+	def put[K, V](pstate: flow.PState[K, V], key: K, value: V): IO[Unit] =
+		this.partitions.partitionKey(key).put(pstate, key, value)
+
+	def delete[K, V](pstate: flow.PState[K, V], key: K): IO[Unit] =
+		this.partitions.partitionKey(key).delete(pstate, key)
+
+	def get[K, V](pstate: flow.PState[K, V], key: K): IO[Option[V]] =
+		this.partitions.partitionKey(key).get(pstate, key)
+
+	def getKeys[K, V](pstate: flow.PState[K, V]): IO[Set[K]] =
+		this.partitions.all.flatTraverse { partition =>
+			partition.getKeys(pstate).map(_.toList)
+		}.map(_.toSet)
+
+	def emit[A](depot: flow.Depot[A], value: A): IO[Unit] =
+		// TODO use the depot's partitioning strategy
+		this.partitions.partitionKey(value).emit(depot, value)
+
+	def readDepot[A](depot: flow.Depot[A]): IO[Vector[A]] =
+		this.partitions.all.toVector.flatTraverse { partition =>
+			partition.readDepot(depot)
+		}
+
+	/** Invoke a query topology, as a client would.
+	  */
+	def invoke[S, R](q: Topology[S, R], value: S): IO[R] = {
+		// TODO: wrap a QueryTopology(topology) instead of asserting
+		val source = q.builder.source
+		require(source.namespace == IdentityNamespace.Query, s"${source} is not a query")
+		
+		val env: Env = Map(q.builder.input.vid -> value)
+		partitions.random.continue(q.compiled._1, List(env)).map {
+			case List(resultEnv: Env) => {
+				resultEnv.getOrElse(q.compiled._2.vid, throw new RuntimeException("output var not present in query result")).asInstanceOf[R]
+			}
+			case other => throw new IllegalStateException(s"query '${q.builder.source}' emitted ${other.length} values, expected exactly 1: $other")
+		}
 	}
 }
 
@@ -85,35 +136,76 @@ class Partition(interpreter: Interpreter) {
 	val run: IO[Nothing] = {
 		IO.never
 	}
+	
+	def put[K, V](pstate: flow.PState[K, V], key: K, value: V): IO[Unit] =
+		this.pstate(pstate.id.name).inner.update(_.updated(key, value))
+
+	def delete[K, V](pstate: flow.PState[K, V], key: K): IO[Unit] =
+		this.pstate(pstate.id.name).inner.update(_.removed(key))
+
+	def get[K, V](pstate: flow.PState[K, V], key: K): IO[Option[V]] = {
+		this.pstate(pstate.id.name).inner.get.map(_.get(key).map(_.asInstanceOf[V]))
+	}
+
+	def getKeys[K, V](pstate: flow.PState[K, V]): IO[Set[K]] = {
+		this.pstate(pstate.id.name).inner.get.map(_.keySet.map(_.asInstanceOf[K]))
+	}
+
+	def emit[A](depot: flow.Depot[A], value: A): IO[Unit] = {
+		this.depot(depot.id.name).inner.update(vec => vec.appended(value))
+	}
+
+	def readDepot[A](depot: flow.Depot[A]): IO[Vector[A]] = {
+		this.depot(depot.id.name).inner.get.map(vec => vec.map(_.asInstanceOf[A]))
+	}
 
 	private def pstate(name: String) = pstates.getOrElse(name, throw new RuntimeException(s"Unknown pstate: ${name}"))
 	private def depot(name: String) = depots.getOrElse(name, throw new RuntimeException(s"Unknown depot: ${name}"))
 
-	private def continue(nodes: List[Node], envs: List[Env]): IO[Unit] =
+	// runs a list of nodes with the given envs. Returns the resulting list of envs
+	private [flow] def continue(nodes: List[Node], envs: List[Env]): IO[List[Env]] =
 		nodes match {
-			case Nil => IO.unit
+			case Nil => IO.pure(envs)
+
 			case Node.Each(fn, ins, out) :: tail =>
 				val results = envs.map(env => env.updated(out, fn(ins.map(env(_)))))
 				continue(tail, results)
 
-			case Node.Explode(fn, ins, out) :: tail =>
-				// TODO
-				???
+			case Node.Explode(fn, in, out) :: tail =>
+				val exploded = envs.flatMap { env =>
+					// in each env, `in` holds an `A`
+					// `fn` takes A and yields a Seq of values.
+					// we expand each of these into `out` in a
+					// copy of the parent env
+					fn(env(in)).toList.map { value =>
+						env.updated(out, value)
+					}
+				}
+				continue(tail, exploded)
+				
 
-			case Node.Filter(fn, ins, _) :: tail =>
+			case Node.Filter(fn, in, _) :: tail =>
 				// The flag var exists for Rama's `keepTrue`; here the predicate prunes
 				// directly, so nothing needs binding.
-				continue(tail, envs.filter(env => fn(ins.map(env(_)))))
+				continue(tail, envs.filter(env => fn(env(in))))
 
 			case Node.Partition(in) :: tail => {
-				interpreter.partitions.groupByPartitions(envs, env => env(in)).traverse_ { case (partition, penvs) =>
+				interpreter.partitions.groupByPartitions(envs, env => env(in)).toList.flatTraverse { case (partition, penvs) =>
 					partition.continue(tail, penvs)
 				}
 			}
 
-			case Node.Scope(inner, collectFrom, out) :: tail =>
-				// TODO
-				???
+			case Node.Scope(inner, collectFrom, out) :: tail => {
+				envs.traverse { env =>
+					// for each env, we execute the sub-block and add its result to `out` in the
+					// single resulting env
+					continue(inner, List(env)).map { innerEnvs =>
+						env.updated(out, innerEnvs.map(inner => inner(collectFrom)))
+					}
+				}.flatMap { outputEnvs =>
+					continue(tail, outputEnvs)
+				}
+			}
 
 			case Node.Select(ps, key, out) :: tail =>
 				val state = pstate(ps.name)
@@ -199,19 +291,4 @@ class Partition(interpreter: Interpreter) {
 	// 	values.map(v => runLowered(nodes, out, t.input, v, store)).toList
 	// }
 
-	// /** Invoke a query topology, as a client would.
-	//   */
-	// def invoke[S, R](q: Topology[S, R], value: S): IO[R] = {
-	// 	// TODO: wrap a QueryTopology(topology) instead of asserting
-	// 	val source = q.builder.source
-	// 	require(source.namespace == IdentityNamespace.Query, s"${source} is not a query")
-	// 	???
-	// 	val trace = run(q, List(value), store).head
-	// 	trace.values match {
-	// 		case List(one) => one.asInstanceOf[R]
-	// 		case other =>
-	// 			throw new IllegalStateException(
-	// 				s"query '${q.name}' emitted ${other.length} values, expected exactly 1: $other")
-	// 	}
-	// }
 }

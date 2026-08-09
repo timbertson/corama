@@ -50,27 +50,21 @@ object RamaBackend {
 	  * `Seq` from having to be converted to a `java.util.List` first, and it makes
 	  * the "0..n emissions" shape explicit at the call site.
 	  */
-	private def explodeStep(fn: List[Any] => Seq[Any], ins: List[String], out: String): Block.Impl =
-		ins match {
-			case List(a) =>
-				val op = new RamaOperation1[Any] {
-					def invoke(x: Any, collector: OutputCollector): Unit =
-						fn(List(x)).foreach(v => collector.emit(v))
-				}
-				Block.each(op, a).out(out)
-			case other =>
-				throw new UnsupportedOperationException(s"explodeStep: arity ${other.length}")
+	private def explodeStep(fn: List[Any] => Seq[Any], in: String, out: String): Block.Impl = {
+		val op = new RamaOperation1[Any] {
+			def invoke(x: Any, collector: OutputCollector): Unit =
+				fn(List(x)).foreach(v => collector.emit(v))
 		}
+		Block.each(op, in).out(out)
+	}
 
 	private def compileNode(node: Node): Block.Impl = node match {
 		case Node.Each(fn, ins, out)    => eachStep(fn, ins.map(compileVar), compileVar(out))
-		case Node.Explode(fn, ins, out) => explodeStep(fn, ins.map(compileVar), compileVar(out))
+		case Node.Explode(fn, in, out) => explodeStep(fn, compileVar(in), compileVar(out))
 
-		case Node.Filter(fn, ins, flag) =>
-			// The flag var is minted by `Lower`, so the two filters over one input get
-			// distinct names without the backend having to allocate anything.
+		case Node.Filter(fn, in, flag) =>
 			val flagName = compileVar(flag)
-			eachStep(args => fn(args).asInstanceOf[Any], ins.map(compileVar), flagName)
+			eachStep(arg => fn(arg).asInstanceOf[Any], List(compileVar(in)), flagName)
 				.`macro`(Block.keepTrue(flagName))
 
 		case Node.Partition(in) => Block.hashPartition(compileVar(in))
