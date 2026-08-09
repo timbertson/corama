@@ -26,7 +26,7 @@ class Partitions(interpreter: Interpreter, numPartitions: Int) {
 	}
 	def partitionKey(value: Any) = partitions(rawPartitionKey(value))
 
-	def groupByPartitions[A](values: List[A], keyFn: A => Any): List[(Partition, List[Any])] =
+	def groupByPartitions[A](values: List[A], keyFn: A => Any): List[(Partition, List[A])] =
 		values.groupBy(v => rawPartitionKey(keyFn(v))).toList.map { case (p, items) =>
 			(partitions(p) -> items)
 		}
@@ -52,7 +52,7 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 	// def hashPartition(value: Any): Partition = ???
 
 	def run: IO[Nothing] = {
-		partitions.all.parTraverse_(p => p.run())
+		partitions.all.parTraverse_(p => p.run) *> IO.raiseError(new RuntimeException("IO[Nothing] completed"))
 	}
 	
 	def running[A](block: IO[A]): IO[A] = {
@@ -60,22 +60,22 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 	}
 }
 
-// TODO this could possibly take a pair of (ids, partitioned)
+// TODO this could possibly take a pair of (ids, partitioned) - it doesn't require the full interpreter
 class Partition(interpreter: Interpreter) {
 	import Storage._
 
 	private val idList = interpreter.topologies.ids.toList
 
-	private val pstates: Map[String, PState] = idList.mapFilter { case (ns, id) =>
-		if (ns == IdentityNamespace.PState) {
+	private val pstates: Map[String, PState] = idList.mapFilter { id =>
+		if (id.namespace == IdentityNamespace.PState) {
 			Some(id.name -> new PState())
 		} else {
 			None
 		}
 	}.toMap
 	
-	private val depots: Map[String, Depot] = idList.mapFilter { case (ns, id) =>
-		if (ns == IdentityNamespace.Depot) {
+	private val depots: Map[String, Depot] = idList.mapFilter { id =>
+		if (id.namespace == IdentityNamespace.Depot) {
 			Some(id.name -> new Depot())
 		} else {
 			None
@@ -106,8 +106,8 @@ class Partition(interpreter: Interpreter) {
 				continue(tail, envs.filter(env => fn(ins.map(env(_)))))
 
 			case Node.Partition(in) :: tail => {
-				interpreter.partitions.groupByPartitions(envs, env => env(in)).traverse { case (partition, envs) =>
-					partition.continue(tail, env)
+				interpreter.partitions.groupByPartitions(envs, env => env(in)).traverse_ { case (partition, penvs) =>
+					partition.continue(tail, penvs)
 				}
 			}
 
@@ -116,7 +116,7 @@ class Partition(interpreter: Interpreter) {
 				???
 
 			case Node.Select(ps, key, out) :: tail =>
-				val state = pstate(ps)
+				val state = pstate(ps.name)
 				envs.traverse { env =>
 					val k = env(key)
 					state.inner.get.map(_.get(k)).map { value =>
@@ -127,7 +127,7 @@ class Partition(interpreter: Interpreter) {
 				}
 
 			case Node.Update(ps, key, fn) :: tail =>
-				val state = pstate(ps)
+				val state = pstate(ps.name)
 				envs.traverse_ { env =>
 					val k = env(key)
 					state.inner.update { map =>
@@ -136,7 +136,7 @@ class Partition(interpreter: Interpreter) {
 				} *> continue(tail, envs)
 
 			case Node.Put(ps, key, value) :: tail =>
-				val state = pstate(ps)
+				val state = pstate(ps.name)
 				envs.traverse_ { env =>
 					val k = env(key)
 					state.inner.update { map =>
@@ -145,62 +145,73 @@ class Partition(interpreter: Interpreter) {
 				} *> continue(tail, envs)
 
 			case Node.UpdateWith(ps, key, arg, fn) :: tail =>
-				val state = pstate(ps)
+				val state = pstate(ps.name)
 				envs.traverse_ { env =>
 					val k = env(key)
 					val a = env(arg)
 					state.inner.update { map =>
-						map.updatedWith(k)(v => fn(a, v))
+						map.updatedWith(k)(v => fn(v, v))
 					}
 				} *> continue(tail, envs)
+
+			case Node.Emit(ps, value) :: tail =>
+				val state = depot(ps.name)
+				envs.traverse_ { env =>
+					val v = env(value)
+					state.inner.update(_.appended(v))
+				} *> continue(tail, envs)
+
 		}
 
-	/** Run one source value through an already-lowered flow.
-	  */
-	private def runLowered[S, A](
-		nodes: List[Node],
-		out: Var[A],
-		source: Var[S],
-		value: S,
-		store: Store): Trace = {
-		val hops = List.newBuilder[Any]
-		val start: Env = Map(source.vid -> value, Var.unit.vid -> (()))
-		val finalEnvs = run(nodes, List(start), store, hops)
-		Trace(finalEnvs.map(_(out.vid)), hops.result())
-	}
+	// /** Run one source value through an already-lowered flow.
+	//   */
+	// private def runLowered[S, A](
+	// 	nodes: List[Node],
+	// 	out: Var[A],
+	// 	source: Var[S],
+	// 	value: S,
+	// 	store: Store): Trace = {
+	// 	val hops = List.newBuilder[Any]
+	// 	val start: Env = Map(source.vid -> value, Var.unit.vid -> (()))
+	// 	val finalEnvs = run(nodes, List(start), store, hops)
+	// 	Trace(finalEnvs.map(_(out.vid)), hops.result())
+	// }
 
-	/** Feed one input value through a flow, returning what it emitted.
-	  */
-	def runOne[S, A](t: TopologyBuilder[S], value: S, flow: Flow[A], store: Store = new Store): Trace = {
-		val (nodes, out) = Lower(t, flow)
-		runLowered(nodes, out, t.input, value, store)
-	}
+	// /** Feed one input value through a flow, returning what it emitted.
+	//   */
+	// def runOne[S, A](t: TopologyBuilder[S], value: S, flow: Flow[A], store: Store = new Store): Trace = {
+	// 	val (nodes, out) = Lower(t, flow)
+	// 	runLowered(nodes, out, t.input, value, store)
+	// }
 
-	/** Feed a sequence of input values through, sharing one store — the useful
-	  * shape for testing stateful topologies. Lowers once, then runs per value.
-	  */
-	def runAll[S, A](t: TopologyBuilder[S], values: Seq[S], flow: Flow[A]): (List[Trace], Store) = {
-		val store = new Store
-		val (nodes, out) = Lower(t, flow)
-		(values.map(v => runLowered(nodes, out, t.input, v, store)).toList, store)
-	}
+	// /** Feed a sequence of input values through, sharing one store — the useful
+	//   * shape for testing stateful topologies. Lowers once, then runs per value.
+	//   */
+	// def runAll[S, A](t: TopologyBuilder[S], values: Seq[S], flow: Flow[A]): (List[Trace], Store) = {
+	// 	val store = new Store
+	// 	val (nodes, out) = Lower(t, flow)
+	// 	(values.map(v => runLowered(nodes, out, t.input, v, store)).toList, store)
+	// }
 
-	/** Run a declared topology over a sequence of inputs, sharing one store. */
-	def run[S, R](t: Topology[S, R], values: Seq[S], store: Store = new Store): List[Trace] = {
-		val (nodes, out) = Lower(t)
-		values.map(v => runLowered(nodes, out, t.input, v, store)).toList
-	}
+	// /** Run a declared topology over a sequence of inputs, sharing one store. */
+	// def run[S, R](t: Topology[S, R], values: Seq[S], store: Store = new Store): List[Trace] = {
+	// 	val (nodes, out) = Lower(t)
+	// 	values.map(v => runLowered(nodes, out, t.input, v, store)).toList
+	// }
 
-	/** Invoke a query topology, as a client would.
-	  */
-	def invoke[S, R](q: Topology[S, R], value: S, store: Store = new Store): R = {
-		require(q.kind == TopologyKind.Query, s"${q.name} is a ${q.kind} topology, not a query")
-		val trace = run(q, List(value), store).head
-		trace.values match {
-			case List(one) => one.asInstanceOf[R]
-			case other =>
-				throw new IllegalStateException(
-					s"query '${q.name}' emitted ${other.length} values, expected exactly 1: $other")
-		}
-	}
+	// /** Invoke a query topology, as a client would.
+	//   */
+	// def invoke[S, R](q: Topology[S, R], value: S): IO[R] = {
+	// 	// TODO: wrap a QueryTopology(topology) instead of asserting
+	// 	val source = q.builder.source
+	// 	require(source.namespace == IdentityNamespace.Query, s"${source} is not a query")
+	// 	???
+	// 	val trace = run(q, List(value), store).head
+	// 	trace.values match {
+	// 		case List(one) => one.asInstanceOf[R]
+	// 		case other =>
+	// 			throw new IllegalStateException(
+	// 				s"query '${q.name}' emitted ${other.length} values, expected exactly 1: $other")
+	// 	}
+	// }
 }

@@ -1,4 +1,4 @@
-package flow
+/* package flow
 
 /** A slice of `example.HelloWorldModule` rewritten in [[Flow]], as an API check.
   *
@@ -154,3 +154,4 @@ object Example {
 		println("  ok — interpreted and compiled to Rama")
 	}
 }
+ */
