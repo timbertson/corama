@@ -1,13 +1,17 @@
 package flow
 
+import fs2.Stream
 import cats.syntax.all._
 import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.util.Try
 import cats.effect.IO
 import cats.effect.kernel.Ref
+import cats.effect.unsafe
 import flow.Interpreter.Env
 import scala.util.Random
+import fs2.concurrent.SignallingRef
+import fs2.Chunk
 
 /** Simple interpreter: runs a [[Flow]] as plain Scala over in-memory state.
   *
@@ -53,7 +57,11 @@ object Storage {
 		val inner = Ref.unsafe[IO, Map[Any,Any]](Map.empty)
 	}
 	class Depot() {
-		val inner = Ref.unsafe[IO, Vector[Any]](Vector.empty)
+		val inner = SignallingRef.of[IO, Vector[Any]](Vector.empty).unsafeRunSync()(using unsafe.IORuntime.global)
+		def stream: Stream[IO, Any] = inner.discrete.mapAccumulate(0) { (seen, values) =>
+			val additions = values.drop(seen)
+			(seen + additions.length, additions)
+		}.mapChunks { ch => ch.flatMap(tup => Chunk.from(tup._2)) }
 	}
 }
 
@@ -117,13 +125,15 @@ class Partition(interpreter: Interpreter) {
 
 	private val idList = interpreter.topologies.ids.toList
 
-	private val pstates: Map[String, PState] = idList.mapFilter { id =>
-		if (id.namespace == IdentityNamespace.PState) {
-			Some(id.name -> new PState())
-		} else {
-			None
-		}
-	}.toMap
+	private val pstates: Map[String, PState] = {
+		idList.mapFilter { id =>
+			if (id.namespace == IdentityNamespace.PState) {
+				Some(id.name -> new PState())
+			} else {
+				None
+			}
+		}.toMap
+	}
 	
 	private val depots: Map[String, Depot] = idList.mapFilter { id =>
 		if (id.namespace == IdentityNamespace.Depot) {
@@ -134,7 +144,13 @@ class Partition(interpreter: Interpreter) {
 	}.toMap
 	
 	val run: IO[Nothing] = {
-		IO.never
+		interpreter.topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { top =>
+			this.depots(top.builder.source.name).stream.foreach { input =>
+				// TODO: chunks?
+				val env = Map(top.input.vid -> input)
+				continue(top.compiled._1, List(env)).void
+			}.compile.drain *> IO.raiseError(new RuntimeException("depot consume terminated"))
+		} *> IO.never
 	}
 	
 	def put[K, V](pstate: flow.PState[K, V], key: K, value: V): IO[Unit] =
@@ -242,7 +258,7 @@ class Partition(interpreter: Interpreter) {
 					val k = env(key)
 					val a = env(arg)
 					state.inner.update { map =>
-						map.updatedWith(k)(v => fn(v, v))
+						map.updatedWith(k)(v => fn(v, a))
 					}
 				} *> continue(tail, envs)
 
