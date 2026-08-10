@@ -68,8 +68,6 @@ object Storage {
 class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 	import Interpreter._
 	val partitions = new Partitions(this, numPartitions)
-	// def partition(i: Int): Try[Partition] = partitions.get(i)
-	// def hashPartition(value: Any): Partition = ???
 
 	def run: IO[Nothing] = {
 		partitions.all.parTraverse_(p => p.run) *> IO.raiseError(new RuntimeException("IO[Nothing] completed"))
@@ -268,43 +266,5 @@ class Partition(interpreter: Interpreter) {
 					val v = env(value)
 					state.inner.update(_.appended(v))
 				} *> continue(tail, envs)
-
 		}
-
-	// /** Run one source value through an already-lowered flow.
-	//   */
-	// private def runLowered[S, A](
-	// 	nodes: List[Node],
-	// 	out: Var[A],
-	// 	source: Var[S],
-	// 	value: S,
-	// 	store: Store): Trace = {
-	// 	val hops = List.newBuilder[Any]
-	// 	val start: Env = Map(source.vid -> value, Var.unit.vid -> (()))
-	// 	val finalEnvs = run(nodes, List(start), store, hops)
-	// 	Trace(finalEnvs.map(_(out.vid)), hops.result())
-	// }
-
-	// /** Feed one input value through a flow, returning what it emitted.
-	//   */
-	// def runOne[S, A](t: TopologyBuilder[S], value: S, flow: Flow[A], store: Store = new Store): Trace = {
-	// 	val (nodes, out) = Lower(t, flow)
-	// 	runLowered(nodes, out, t.input, value, store)
-	// }
-
-	// /** Feed a sequence of input values through, sharing one store — the useful
-	//   * shape for testing stateful topologies. Lowers once, then runs per value.
-	//   */
-	// def runAll[S, A](t: TopologyBuilder[S], values: Seq[S], flow: Flow[A]): (List[Trace], Store) = {
-	// 	val store = new Store
-	// 	val (nodes, out) = Lower(t, flow)
-	// 	(values.map(v => runLowered(nodes, out, t.input, v, store)).toList, store)
-	// }
-
-	// /** Run a declared topology over a sequence of inputs, sharing one store. */
-	// def run[S, R](t: Topology[S, R], values: Seq[S], store: Store = new Store): List[Trace] = {
-	// 	val (nodes, out) = Lower(t)
-	// 	values.map(v => runLowered(nodes, out, t.input, v, store)).toList
-	// }
-
 }
