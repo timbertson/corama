@@ -9,24 +9,16 @@ private[flow] final class VarId(private[flow] val id: Int, private[flow] val hin
 	override def toString: String = s"$hint#$id"
 }
 
-/** A name standing for one runtime value of type `A`.
-  *
-  * Not constructible outside this package: names are minted, never written. That is
-  * what keeps the namespace flat-but-safe — a user cannot pick a name that collides
-  * with one [[Lower]] or [[RamaBackend]] will generate later.
-  */
 final class Var[A] private[flow] (private[flow] val vid: VarId) {
 
-	/** One value in, one value out: a Rama `each` with a pure function. */
-	def map[B](f: A => B): Flow[B] = Flow.Each1(this, f)
+	def map[B](f: A => B): Flow[B, Any] = Flow.Each1(this, f)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
-	def explode[B](f: A => Seq[B]): Flow[B] = Flow.ExplodeOp(this, f)
+	def explode[B](f: A => Seq[B]): Flow[B, Any] = Flow.ExplodeOp(this, f)
 
-	/** Keep going only when the predicate holds — a Rama `keepTrue`. */
-	def filter(p: A => Boolean): Flow[A] = Flow.FilterOp(this, p).as(this)
+	def filter(p: A => Boolean): Flow[A, Any] = Flow.FilterOp(this, p).as(this)
 
-	def void: Flow[Unit] = Flow.Pure(Var.unit)
+	def void: Flow[Unit, Any] = Flow.Pure(Var.unit)
 
 	override def toString: String = s"Var($vid)"
 	override def equals(other: Any): Boolean = other match {
@@ -37,22 +29,13 @@ final class Var[A] private[flow] (private[flow] val vid: VarId) {
 }
 
 object Var {
-	/** Virtual vars have a unique id < 0 and are never given a Rama name — the same
-	  * convention as `ramato.dsl.Var`, where `taskId` is -1 and `unit` is -2.
-	  */
+	// Virtual vars have a unique id < 0 and are never given a Rama name
 	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"))
 }
 
 final case class TopologyId(value: Int) extends AnyVal
 
-/** Allocates var ids within one topology.
-  *
-  * Ids are positions, handed out from 0 in construction order, so they are stable
-  * for a given program without any coordination. That is what lets [[RamaBackend]]
-  * render `*hint_id` directly rather than re-numbering vars in traversal order.
-  *
-  * Mutation, not threadsafe — as `ramato.dsl.VarRegistry`.
-  */
+// Allocates var ids within one topology.
 private[flow] class VarRegistry {
 	private var defined = 0
 
@@ -65,14 +48,8 @@ private[flow] class VarRegistry {
 	def count: Int = defined
 }
 
-/** Which of Rama's two topology kinds this is.
-  *
-  * Not cosmetic. A stream topology is driven by depot appends, writes PStates, and
-  * returns nothing. A query topology is invoked by a client, returns exactly one
-  * value, and may **not** write — Rama rejects that at declaration, and so does
-  * [[Lower]].
-  */
 enum TopologyKind {
+	// TODO: add MicroBatch
 	case Stream, Query
 }
 
@@ -85,11 +62,7 @@ final class TopologyBuilder[S] private[flow] (
 	private[flow] val vars = new VarRegistry()
 
 	val input: Var[S] = vars.add[S](source.name) // mint a generated var name for elements in the source
-	
-	// // only used for query topologies
-	// val output: Var[S] = vars.add[S]("out")
 
-	// def variable[A](hint: String): Var[A] = vars.add[A](hint)
 	def define[A](hint: String = "var"): Var[A] = vars.add[A](hint)
 
 	override def toString: String = s"TopologyBuilder($source)"
@@ -117,23 +90,25 @@ final class Topologies {
 
 	def depot[A](name: String): Depot[A] = Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
 
-	// define a query which returns a value
-	// TODO: automatically inject a fan-in and assignment to `topology.output`?
+	/** Declare a query topology: invoked by a client, returns exactly one value.
+	  */
 	def query[A, R](name: String)(
-		block: TopologyBuilder[A] => Flow[R]
+		block: TopologyBuilder[A] => Flow[R, QueryContext]
 	): Topology[A, R] = {
-		declare[A, R](claim(Identity(IdentityNamespace.Query, name)))(block)
+		declare[A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)))(block)
 	}
 
-	// attach a stream process to a depot, with side effects and no return value
+	/** Attach a stream topology to a depot: driven by an append, writes PStates,
+	  * returns nothing.
+	  */
 	def stream[A](depot: Depot[A])(
-		block: TopologyBuilder[A] => Flow[Unit]
+		block: TopologyBuilder[A] => Flow[Unit, StreamContext]
 	): Topology[A, Unit] = {
-		declare[A, Unit](depot.id)(block)
+		declare[A, Unit, StreamContext](depot.id)(block)
 	}
 
-	private def declare[A, R](source: Identity)(
-		block: TopologyBuilder[A] => Flow[R]
+	private def declare[A, R, C](source: Identity)(
+		block: TopologyBuilder[A] => Flow[R, C]
 	): Topology[A, R] = {
 		val b = new TopologyBuilder[A](TopologyId(built.length), source)
 		val t = Topology(b, block(b))
@@ -146,66 +121,67 @@ object Topologies {
 	def apply(): Topologies = new Topologies()
 }
 
-/** A declared topology: its builder, and the flow built against it.
-  *
-  * The two travel together because lowering needs both — the flow for the tree, the
-  * builder for the var registry the tree's names come from.
-  */
-final case class Topology[S, R](builder: TopologyBuilder[S], flow: Flow[R]) {
+final case class Topology[S, R](builder: TopologyBuilder[S], flow: Flow[R, Nothing]) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
 }
 
-sealed trait Flow[A] {
+/** A description of a fragment emitting 0..n values of type `A`, which requires a
+  * context providing `Ctx` to run in. A fragment requiring nothing is `Flow[A, Any]`.
+  */
+sealed trait Flow[A, -Ctx] {
 	import Flow._
 
-	def flatMap[B](f: Var[A] => Flow[B]): Flow[B] = Bind(this, f)
+	def flatMap[B, C](f: Var[A] => Flow[B, C]): Flow[B, Ctx & C] = Bind(this, f)
 
-	def map[B](f: Var[A] => Var[B]): Flow[B] = Bind(this, (v: Var[A]) => Pure(f(v)))
+	def map[B](f: Var[A] => Var[B]): Flow[B, Ctx] = Bind(this, (v: Var[A]) => Pure(f(v)))
 
-	def as[B](v: Var[B]): Flow[B] = Bind(this, (_: Var[A]) => Pure(v))
+	def as[B](v: Var[B]): Flow[B, Ctx] = Bind(this, (_: Var[A]) => Pure(v))
 
-	def void: Flow[Unit] = as(Var.unit)
+	def void: Flow[Unit, Ctx] = as(Var.unit)
 
-	def aggList: Flow[List[A]] = Flow.Agg(this)
+	/** Collapse this fan-out region into one list — Rama's `agg(Agg.list(...)).out(v)`.
+	  *
+	  * Requires [[Batch]]: this is the value-producing form of `agg`, legal only inside
+	  * a batch block, so a stream topology cannot use it.
+	  */
+	def aggList: Flow[List[A], Ctx & Batch] = Flow.Agg(this)
 }
 
 object Flow {
-	private[flow] case class Pure[A](v: Var[A]) extends Flow[A]
+	private[flow] case class Pure[A](v: Var[A]) extends Flow[A, Any]
 
 	// TODO: consider HList?
-	private[flow] case class Each1[I, O](in: Var[I], f: I => O) extends Flow[O]
-	private[flow] case class Each2[A, B, O](a: Var[A], b: Var[B], f: (A, B) => O) extends Flow[O]
+	private[flow] case class Each1[I, O](in: Var[I], f: I => O) extends Flow[O, Any]
+	private[flow] case class Each2[A, B, O](a: Var[A], b: Var[B], f: (A, B) => O) extends Flow[O, Any]
 
-	private[flow] case class ExplodeOp[I, O](in: Var[I], f: I => Seq[O]) extends Flow[O]
-	private[flow] case class FilterOp[I](in: Var[I], p: I => Boolean) extends Flow[Unit]
-	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit]
-	private[flow] case class Bind[A, B](fa: Flow[A], k: Var[A] => Flow[B]) extends Flow[B]
-	private[flow] case class Agg[A](inner: Flow[A]) extends Flow[List[A]]
-	
-	// PState
-	private[flow] case class Select[K, V](ps: PState[K, V], key: Var[K]) extends Flow[Option[V]]
-	private[flow] case class Update[K, V](ps: PState[K, V], key: Var[K], f: Option[V] => Option[V]) extends Flow[Unit]
-	private[flow] case class Put[K, V](ps: PState[K, V], key: Var[K], value: Var[V]) extends Flow[Unit]
-	private[flow] case class UpdateWith[K, V, A]( ps: PState[K, V], key: Var[K], arg: Var[A], f: (Option[V], A) => Option[V]) extends Flow[Unit]
-	
-	// Depot
-	private[flow] case class PartitionAppend[A](depot: Depot[A], key: Var[A]) extends Flow[Unit]
+	private[flow] case class ExplodeOp[I, O](in: Var[I], f: I => Seq[O]) extends Flow[O, Any]
+	private[flow] case class FilterOp[I](in: Var[I], p: I => Boolean) extends Flow[Unit, Any]
+	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
+	private[flow] case class Bind[A, B, C1, C2](fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
+	private[flow] case class Agg[A, C](inner: Flow[A, C]) extends Flow[List[A], C & Batch]
 
-	def pure[A](v: Var[A]): Flow[A] = Pure(v)
+	// PState. Reads are available anywhere — a query topology reads PStates, that is
+	// what it is for. Writes require `Etl`: "a PState can only be updated by the ETL
+	// topology that owns it".
+	private[flow] case class Select[K, V](ps: PState[K, V], key: Var[K]) extends Flow[Option[V], Any]
+	private[flow] case class Update[K, V](ps: PState[K, V], key: Var[K], f: Option[V] => Option[V]) extends Flow[Unit, Etl]
+	private[flow] case class Put[K, V](ps: PState[K, V], key: Var[K], value: Var[V]) extends Flow[Unit, Etl]
+	private[flow] case class UpdateWith[K, V, A]( ps: PState[K, V], key: Var[K], arg: Var[A], f: (Option[V], A) => Option[V]) extends Flow[Unit, Etl]
 
-	def map2[A, B, O](a: Var[A], b: Var[B])(f: (A, B) => O): Flow[O] = Each2(a, b, f)
+	// Depot. `Etl` for the same reason: an append is an effect on the module's state,
+	// and a query is invoked by a client to compute a value.
+	private[flow] case class PartitionAppend[A](depot: Depot[A], key: Var[A]) extends Flow[Unit, Etl]
+
+	def pure[A](v: Var[A]): Flow[A, Any] = Pure(v)
+
+	def map2[A, B, O](a: Var[A], b: Var[B])(f: (A, B) => O): Flow[O, Any] = Each2(a, b, f)
 
 	/** Move downstream execution to the partition owning `v`.
-	  *
-	  * In Rama this also ends the current event, and so the current *transaction*:
-	  * PState writes before and after are in different atomic units. That is
-	  * invisible in Rama's Java API and still invisible here — see notes in
-	  * FLOW-NOTES.md; typing it is the next piece of work, not this one.
 	  */
-	def hashPartition[A](v: Var[A]): Flow[Unit] = Partition(v)
+	def hashPartition[A](v: Var[A]): Flow[Unit, Any] = Partition(v)
 
-	def unit: Flow[Unit] = Pure(Var.unit)
+	def unit: Flow[Unit, Any] = Pure(Var.unit)
 }
 
 sealed trait IdentityNamespace
@@ -220,20 +196,15 @@ object IdentityNamespace {
 private case class Identity(namespace: IdentityNamespace, name: String)
 
 final case class PState[K, V](id: Identity) {
-	def get(key: Var[K]): Flow[Option[V]] = Flow.Select(this, key)
-	def update(key: Var[K])(f: Option[V] => Option[V]): Flow[Unit] = Flow.Update(this, key, f)
+	def get(key: Var[K]): Flow[Option[V], Any] = Flow.Select(this, key)
 
-	/** Read-modify-write against another runtime value.
-	  *
-	  * Needed because `update`'s function is a *staged* closure: it runs at
-	  * execution time and can only see the stored value, so referring to a `Var`
-	  * inside it captures the name rather than the value. Passing the var
-	  * explicitly is the fix, and mirrors Rama's `Path.term(fn, "*extraArg")`.
-	  */
-	def updateWith[A](key: Var[K], arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit] =
+	def update(key: Var[K])(f: Option[V] => Option[V]): Flow[Unit, Etl] = Flow.Update(this, key, f)
+
+	def updateWith[A](key: Var[K], arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit, Etl] =
 		Flow.UpdateWith(this, key, arg, f)
-	def put(key: Var[K], value: Var[V]): Flow[Unit] = Flow.Put(this, key, value)
-	def delete(key: Var[K]): Flow[Unit] = Flow.Update(this, key, _ => None)
+
+	def put(key: Var[K], value: Var[V]): Flow[Unit, Etl] = Flow.Put(this, key, value)
+	def delete(key: Var[K]): Flow[Unit, Etl] = Flow.Update(this, key, _ => None)
 }
 
 final case class Depot[A](id: Identity) {
@@ -241,7 +212,7 @@ final case class Depot[A](id: Identity) {
 	// matches the partitioning scheme of the depot.
 	// TODO: this could fail at runtime (or compile time?) if you're not on the right partition for a depot
 	// with deterministic partitioning.
-	def partitionAppend(value: Var[A]): Flow[Unit] = Flow.PartitionAppend(this, value)
+	def partitionAppend(value: Var[A]): Flow[Unit, Etl] = Flow.PartitionAppend(this, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +245,7 @@ private[flow] object Node {
 		*
 		* TODO: remove unnecessary var return?
 		*/
-	def compile[A](t: TopologyBuilder[?], flow: Flow[A]): (List[Node], Var[A]) = {
+	def compile[A](t: TopologyBuilder[?], flow: Flow[A, ?]): (List[Node], Var[A]) = {
 		flow match {
 			case Flow.Pure(v) => (Nil, v)
 
@@ -300,12 +271,12 @@ private[flow] object Node {
 			case p: Flow.Partition[i] =>
 				(List(Node.Partition(p.in.vid)), Var.unit.asInstanceOf[Var[A]])
 
-			case b: Flow.Bind[a, A] =>
+			case b: Flow.Bind[a, A, c1, c2] =>
 				val (n1, v1) = compile(t, b.fa)
 				val (n2, v2) = compile(t, b.k(v1))
 				(n1 ++ n2, v2)
 
-			case a: Flow.Agg[x] =>
+			case a: Flow.Agg[x, c] =>
 				val (inner, innerVar) = compile(t, a.inner)
 				val out = t.define[A]("agg")
 				(List(Node.Scope(inner, innerVar.vid, out.vid)), out)

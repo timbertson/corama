@@ -14,7 +14,7 @@ object FlowSpec extends SimpleIOSuite {
 	  * call gets its own `Topologies`, since ids are per-topology and durable names
 	  * are checked for duplicates per module.
 	  */
-	private def emitted[A](input: Int)(flow: Var[Int] => Flow[A]): IO[List[A]] = {
+	private def emitted[A](input: Int)(flow: Var[Int] => Flow[A, QueryContext]): IO[List[A]] = {
 		val ts = Topologies()
 		val q = ts.query[Int, List[A]]("q")(t => flow(t.input).aggList)
 		new Interpreter(ts).invoke(q, input)
@@ -101,7 +101,7 @@ object FlowSpec extends SimpleIOSuite {
 		// leaves implicit: Flow[Int] becomes Flow[List[Int]]. Nested inside the
 		// harness's own aggList, so the result is a list of one list.
 		emitted(4) { input =>
-			val inner: Flow[Int] = for {
+			val inner: Flow[Int, Any] = for {
 				n <- input.explode(i => List.range(0, i))
 				d <- n.map(_ * 2)
 			} yield d
@@ -122,7 +122,7 @@ object FlowSpec extends SimpleIOSuite {
 		// In Rama each hop is a separate event, and so a separate transaction. The
 		// interpreter really does move the branch to another `Partition`, so this
 		// pins that fan-out survives regrouping — the types still enforce nothing.
-		emitted(0) { input =>
+		emitted[Int](0) { input =>
 			for {
 				n <- input.explode(i => List(i, i + 1, i + 2))
 				_ <- Flow.hashPartition(n)
@@ -374,6 +374,153 @@ object FlowSpec extends SimpleIOSuite {
 	}
 
 	// -------------------------------------------------------------------------
+	// ack levels and ack returns
+	// -------------------------------------------------------------------------
+
+	test("an ack level determines the append's result type") {
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val seen = ts.pstate[Int, Int]("seen")
+		ts.stream(nums) { t =>
+			for {
+				_    <- Flow.hashPartition(t.input)
+				n    <- t.input.map(identity)
+				_    <- seen.put(n, n)
+				done <- Flow.unit
+			} yield done
+		}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			for {
+				none: Unit      <- interp.append(nums, 1, AckLevel.NoAck)
+				appendAck: Unit <- interp.append(nums, 2, AckLevel.AppendAck)
+				// Both levels only promise the record reached the log, so observing the
+				// topology's effect still needs polling — which is the whole reason to
+				// want `Ack`.
+				_ <- eventually(interp.get(seen, 1))(_.isDefined)
+				_ <- eventually(interp.get(seen, 2))(_.isDefined)
+			} yield expect.all(none == (), appendAck == ())
+		}
+	}
+
+	test("AckLevel.Ack fails loudly rather than returning nothing") {
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		ts.stream(nums)(_ => Flow.unit)
+
+		val interp = new Interpreter(ts)
+		interp.append(nums, 1, AckLevel.Ack).attempt.map { r =>
+			expect(r.left.toOption.exists(_.isInstanceOf[NotImplementedError]))
+		}
+	}
+
+	test("ack returns are read with the topology, not a name and a cast") {
+		// Rama gives back a map from topology *name* to `Object`, so reading one means
+		// knowing a name and choosing a cast. Keying by the typed `Topology` instead
+		// means the result type comes from its `R`: `str` yields `Option[String]` and
+		// `num` `Option[Int]`, with no cast written by the caller. Those two ascriptions
+		// are the assertion.
+		//
+		// Built directly rather than via `ts.stream`, because `stream` still pins
+		// `R = Unit` — carrying the ack return in a stream's `R` is the next piece of
+		// work (FLOW-NOTES.md). This is the shape it will produce.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val quiet = ts.stream(nums)(_ => Flow.unit)
+
+		def streamOf[R](id: Int)(f: Var[Int] => Flow[R, Nothing]): Topology[Int, R] = {
+			val b = new TopologyBuilder[Int](TopologyId(id), nums.id)
+			Topology(b, f(b.input))
+		}
+		val str = streamOf(10)(_.map(_.toString))
+		val num = streamOf(11)(_.map(_ * 2))
+
+		IO {
+			val returns = new AckReturns(Map(str.builder.id -> "hello", num.builder.id -> 42))
+			val fromStr: Option[String] = returns(str)
+			val fromNum: Option[Int] = returns(num)
+
+			// A query never produces an ack return, so asking with one is rejected rather
+			// than answering a silent `None`.
+			val q = ts.query[Int, Int]("q")(t => t.input.map(identity))
+			val queryRejected =
+				try { returns(q); false } catch { case _: IllegalArgumentException => true }
+
+			expect.all(
+				fromStr == Some("hello"),
+				fromNum == Some(42),
+				// A topology that returned nothing is `None`, matching Rama's "the map
+				// only contains entries for non-null streaming ack returns".
+				returns(quiet) == None,
+				queryRejected)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// contexts: what a flow requires of the topology it lands in
+	// -------------------------------------------------------------------------
+
+	test("a read-only, non-aggregating fragment runs in either kind of topology") {
+		// The payoff of making the context parameter contravariant. This fragment
+		// requires nothing, so it is a `Flow[Int, Any]` and fits everywhere — no
+		// duplication and no evidence parameter. Under a *covariant* parameter this
+		// would not typecheck, and worse, a writing flow would be accepted by `query`.
+		val ts = Topologies()
+		val counts = ts.pstate[Int, Int]("counts")
+		val nums = ts.depot[Int]("nums")
+		val seen = ts.pstate[Int, Int]("seen")
+
+		def lookup(v: Var[Int]): Flow[Int, Any] =
+			for {
+				_   <- Flow.hashPartition(v)
+				cur <- counts.get(v)
+				n   <- cur.map(_.getOrElse(0))
+			} yield n
+
+		val q = ts.query[Int, Int]("lookup")(t => lookup(t.input))
+		ts.stream(nums) { t =>
+			// Reused verbatim, then extended with a write — which is what makes this
+			// flow require `Etl` while `lookup` itself requires nothing. The extra hop is
+			// needed because `lookup` leaves the branch on the partition owning its
+			// *input*, and the write is keyed by the value it returned.
+			for {
+				n    <- lookup(t.input)
+				_    <- Flow.hashPartition(n)
+				_    <- seen.put(n, n)
+				done <- Flow.unit
+			} yield done
+		}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			for {
+				_ <- interp.put(counts, 7, 70)
+				r <- interp.invoke(q, 7)
+				_ <- interp.emit(nums, 7)
+				s <- eventually(interp.get(seen, 70))(_.isDefined)
+			} yield expect.all(r == 70, s == Some(70))
+		}
+	}
+
+	test("aggList composes mid-flow, so two rounds of aggregation are expressible") {
+		// Why `aggList` stays a middle operator rather than becoming terminal. Rama's
+		// canonical scalable query — "URL reach" — aggregates per partition, maps over
+		// the partial result, then aggregates again: `agg -> each -> agg`. Making
+		// aggregation terminal would put that shape out of reach.
+		val ts = Topologies()
+		val q = ts.query[Int, Int]("twoRounds") { t =>
+			for {
+				partial <- t.input.explode(i => List.range(0, i)).aggList
+				size    <- partial.map(_.size)
+				again   <- size.explode(n => List(n, n)).aggList
+				total   <- again.map(_.sum)
+			} yield total
+		}
+		new Interpreter(ts).invoke(q, 4).map(r => expect(r == 8))
+	}
+
+	// -------------------------------------------------------------------------
 	// naming and the Rama backend
 	// -------------------------------------------------------------------------
 
@@ -462,6 +609,12 @@ object FlowSpec extends SimpleIOSuite {
 		// Not asserting on block structure (Rama's Block has no public inspection API)
 		// — asserting that compilation of every node kind succeeds, so the reference
 		// semantics above describe something real.
+		//
+		// Note `Scope`/`agg` is exercised by the *query* below, not by the stream: a
+		// value-producing agg needs a batch block and stream topologies don't have one.
+		// An earlier version of this test did put `aggList` in the stream and passed,
+		// because `RamaBackend` will happily emit `Block.agg(...)` there — Rama would
+		// have rejected the module at declaration. That is now a compile error.
 		val ts = Topologies()
 		val counts = ts.pstate[String, Int]("counts")
 		val nums = ts.depot[Int]("nums")
@@ -478,11 +631,10 @@ object FlowSpec extends SimpleIOSuite {
 				_     <- counts.put(key, n)                           // Put
 				_     <- echo.partitionAppend(n)                      // PartitionAppend
 				_     <- prev.filter(_ => true)                       // Filter
-				all   <- n.explode(i => List(i, i)).aggList           // Scope + agg
-				done  <- all.void
+				done  <- Flow.unit
 			} yield done
 		}
-		val q = ts.query[Int, List[Int]]("q")(t => t.input.explode(i => List(i, i)).aggList)
+		val q = ts.query[Int, List[Int]]("q")(t => t.input.explode(i => List(i, i)).aggList) // Scope + agg
 
 		IO {
 			val cs = RamaBackend.compile(s)

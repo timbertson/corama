@@ -95,6 +95,23 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 		// TODO use the depot's partitioning strategy
 		this.partitions.partitionKey(value).emit(depot, value)
 
+	def append[A, R](depot: flow.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack): IO[R] =
+		level match {
+			// TODO: these branches should differ when we model replication
+			case AckLevel.NoAck     => emit(depot, value)
+			case AckLevel.AppendAck => emit(depot, value)
+
+			// Needs the append to wait for every colocated stream topology's event tree
+			// to be exhausted, and needs `ackReturn` to exist as a Flow op to collect
+			// from. Failing is the honest answer: returning `AckReturns.empty` would be
+			// indistinguishable from "every topology returned nothing" while in fact
+			// having waited for nothing at all.
+			case AckLevel.Ack =>
+				IO.raiseError(new NotImplementedError(
+					"AckLevel.Ack needs completion tracking and a Flow-level ackReturn; " +
+					"until then use AppendAck and poll, as the tests do"))
+		}
+
 	def readDepot[A](depot: flow.Depot[A]): IO[Vector[A]] =
 		this.partitions.all.toVector.flatTraverse { partition =>
 			partition.readDepot(depot)

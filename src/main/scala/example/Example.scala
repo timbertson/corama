@@ -35,7 +35,7 @@ object Example extends IOApp {
 	  * where, which is more than Rama's own API tells you, though the types still
 	  * don't *enforce* anything about what may cross a boundary.
 	  */
-	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit] =
+	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit, Etl] =
 		for {
 			ticketId <- assignment.map(_.ticketId)
 			newOwner <- assignment.map(_.assigneeId)
@@ -77,8 +77,10 @@ object Example extends IOApp {
 	  * "*ticketIds")` ... `.originPartition().agg(Agg.list("*ticket")).out("*tickets")`,
 	  * where nothing indicates that the region between the two is fanned out.
 	  */
-	def listUserTickets(userId: Var[Long]): Flow[List[Ticket]] = {
-		val perTicket: Flow[Ticket] = for {
+	def listUserTickets(userId: Var[Long]): Flow[List[Ticket], Batch] = {
+		// Read-only and no aggregation yet, so this fragment requires nothing at all —
+		// `aggList` below is what introduces the `Batch` requirement.
+		val perTicket: Flow[Ticket, Any] = for {
 			_ <- Flow.hashPartition(userId)
 			ids <- userTickets.get(userId)
 			ticketId <- ids.explode(_.getOrElse(Set.empty).toList.sorted)
