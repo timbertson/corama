@@ -6,7 +6,7 @@ import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.util.Try
 import cats.effect.IO
-import cats.effect.kernel.Ref
+import cats.effect.kernel.{Deferred, Outcome, Ref}
 import cats.effect.unsafe
 import flow.Interpreter.Env
 import scala.util.Random
@@ -57,12 +57,80 @@ object Storage {
 		val inner = Ref.unsafe[IO, Map[Any,Any]](Map.empty)
 	}
 	class Depot() {
-		val inner = SignallingRef.of[IO, Vector[Any]](Vector.empty).unsafeRunSync()(using unsafe.IORuntime.global)
-		def stream: Stream[IO, Any] = inner.discrete.mapAccumulate(0) { (seen, values) =>
+		val inner = SignallingRef.of[IO, Vector[Record]](Vector.empty).unsafeRunSync()(using unsafe.IORuntime.global)
+		def stream: Stream[IO, Record] = inner.discrete.mapAccumulate(0) { (seen, values) =>
 			val additions = values.drop(seen)
 			(seen + additions.length, additions)
 		}.mapChunks { ch => ch.flatMap(tup => Chunk.from(tup._2)) }
 	}
+}
+
+/** An appended value, plus a slot for acks to accumulate.
+  *
+  * `tracker` is `None` for `emit`, where nobody is waiting.
+  */
+private[flow] final case class Record(value: Any, tracker: Option[AckTracker])
+
+/** Watches one append's event tree, and collects what its topologies ack return.
+  *
+  * The tree is tracked by counting: the append registers one pending slot per topology
+  * subscribed to the depot, each reports when its flow has run to completion, and the
+  * last one out completes the append.
+  *
+  * The count is fixed up front rather than incremented as topologies pick the record up.
+  *
+  * `PartitionAppend` deliberately does *not* extend the tree; TODO verify this matches
+  * rama's behaviour.
+  */
+private[flow] final class AckTracker(
+	pending: Ref[IO, Int],
+	returns: Ref[IO, Map[TopologyId, List[Any]]],
+	done: Deferred[IO, Either[Throwable, Map[TopologyId, List[Any]]]]) {
+
+	/** Add a value to the return set for a specifi topology
+	  */
+	def ackReturn(topology: TopologyId, value: Any): IO[Unit] =
+		returns.update(m => m.updated(topology, m.getOrElse(topology, Nil) :+ value))
+
+	/** One topology finished; the last one out completes the append. */
+	def finish: IO[Unit] =
+		pending.updateAndGet(_ - 1).flatMap { remaining =>
+			if (remaining <= 0) returns.get.flatMap(r => done.complete(Right(r)).void) else IO.unit
+		}
+
+	/** A topology failed. Rama retries the record; here the append fails.
+	 * TODO reconsider this.
+	 */
+	def fail(err: Throwable): IO[Unit] = done.complete(Left(err)).void
+
+	def await: IO[Map[TopologyId, List[Any]]] = done.get.rethrow
+}
+
+/** An [[AckTracker]] with the identity of the topology reporting into it.
+  *
+  * `continue` executes nodes without knowing which topology it is running, and the node
+  * for `ackReturn` carries only a var. Pairing the two here keeps that so, and is what
+  * lets the sink cross a partition hop unchanged.
+  */
+private[flow] final case class AckSink(topology: TopologyId, tracker: AckTracker) {
+	def ackReturn(value: Any): IO[Unit] = tracker.ackReturn(topology, value)
+	def fail(err: Throwable): IO[Unit] = tracker.fail(err)
+	def finish: IO[Unit] = tracker.finish
+}
+
+private[flow] object AckTracker {
+
+	/** `subscribers` is how many topologies must report before the append completes.
+	  * Zero means a depot nothing consumes, which completes immediately — the append is
+	  * done once it is durable, since there is no event tree to wait for.
+	  */
+	def create(subscribers: Int): IO[AckTracker] =
+		for {
+			pending <- Ref.of[IO, Int](subscribers)
+			returns <- Ref.of[IO, Map[TopologyId, List[Any]]](Map.empty)
+			done    <- Deferred[IO, Either[Throwable, Map[TopologyId, List[Any]]]]
+			_       <- IO.whenA(subscribers == 0)(done.complete(Right(Map.empty)).void)
+		} yield new AckTracker(pending, returns, done)
 }
 
 class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
@@ -95,21 +163,23 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 		// TODO use the depot's partitioning strategy
 		this.partitions.partitionKey(value).emit(depot, value)
 
+	/** Topologies driven by this depot — the count an [[AckTracker]] waits for. */
+	private[flow] def subscribers(depot: Identity): List[Topology[?, ?]] =
+		topologies.topologies.filter(_.builder.source == depot)
+
 	def append[A, R](depot: flow.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack): IO[R] =
 		level match {
 			// TODO: these branches should differ when we model replication
 			case AckLevel.NoAck     => emit(depot, value)
 			case AckLevel.AppendAck => emit(depot, value)
 
-			// Needs the append to wait for every colocated stream topology's event tree
-			// to be exhausted, and needs `ackReturn` to exist as a Flow op to collect
-			// from. Failing is the honest answer: returning `AckReturns.empty` would be
-			// indistinguishable from "every topology returned nothing" while in fact
-			// having waited for nothing at all.
 			case AckLevel.Ack =>
-				IO.raiseError(new NotImplementedError(
-					"AckLevel.Ack needs completion tracking and a Flow-level ackReturn; " +
-					"until then use AppendAck and poll, as the tests do"))
+				for {
+					tracker <- AckTracker.create(subscribers(depot.id).length)
+					// TODO use the depot's partitioning strategy
+					_       <- partitions.partitionKey(value).append(depot, value, tracker)
+					raw     <- tracker.await
+				} yield new AckReturns(raw, topologies)
 		}
 
 	def readDepot[A](depot: flow.Depot[A]): IO[Vector[A]] =
@@ -125,6 +195,11 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 		require(source.namespace == IdentityNamespace.Query, s"${source} is not a query")
 		
 		val env: Env = Map(q.builder.input.vid -> value)
+		// `ack` is None: a query is invoked by a client and returns its value directly,
+		// so there is no append waiting on an event tree.
+		// The cast is sound by `Topologies.query`, which only accepts a `Flow[R, ...]`;
+		// `Topology` stores the flow existentially because a *stream* sources its `R`
+		// from `ackAgg` instead.
 		partitions.random.continue(q.compiled._1, List(env)).map {
 			case List(resultEnv: Env) => {
 				resultEnv.getOrElse(q.compiled._2.vid, throw new RuntimeException("output var not present in query result")).asInstanceOf[R]
@@ -160,10 +235,33 @@ class Partition(interpreter: Interpreter) {
 	
 	val run: IO[Nothing] = {
 		interpreter.topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { top =>
-			this.depots(top.builder.source.name).stream.foreach { input =>
+			this.depots(top.builder.source.name).stream.foreach { record =>
 				// TODO: chunks?
-				val env = Map(top.input.vid -> input)
-				continue(top.compiled._1, List(env)).void
+				val env = Map(top.input.vid -> record.value)
+				val ack = record.tracker.map(AckSink(top.builder.id, _))
+
+				// `continue` returning means the whole event tree for this record is
+				// exhausted — every fanned-out branch, on every partition it reached. So
+				// this is exactly where a colocated topology reports completion.
+				// `IO.defer`, because `continue` evaluates the pure parts of a flow — an
+				// `each`'s function, say — while *building* its `IO`. A user function that
+				// throws therefore throws here rather than inside the returned `IO`, and
+				// without this the raise escapes to the consuming fiber instead of reaching
+				// the tracker below.
+				IO.defer(continue(top.compiled._1, List(env), ack)).void.attempt.flatMap {
+					case Right(_) => record.tracker.traverse_(_.finish)
+
+					// One bad record must not stop the topology: Rama retries the record and
+					// keeps consuming. There is no retry here, so the failure is reported to
+					// whoever appended it and consumption continues.
+					case Left(e) =>
+						record.tracker match {
+							case Some(tracker) => tracker.fail(e)
+							// Nobody is waiting, so swallowing would lose the error entirely.
+							// Failing `run` is loud, which beats a silent no-op.
+							case None => IO.raiseError(e)
+						}
+				}
 			}.compile.drain *> IO.raiseError(new RuntimeException("depot consume terminated"))
 		} *> IO.never
 	}
@@ -183,24 +281,35 @@ class Partition(interpreter: Interpreter) {
 	}
 
 	def emit[A](depot: flow.Depot[A], value: A): IO[Unit] = {
-		this.depot(depot.id.name).inner.update(vec => vec.appended(value))
+		this.depot(depot.id.name).inner.update(vec => vec.appended(Record(value, None)))
+	}
+
+	/** As `emit`, but the record carries a tracker for the topologies it will trigger. */
+	def append[A](depot: flow.Depot[A], value: A, tracker: AckTracker): IO[Unit] = {
+		this.depot(depot.id.name).inner.update(vec => vec.appended(Record(value, Some(tracker))))
 	}
 
 	def readDepot[A](depot: flow.Depot[A]): IO[Vector[A]] = {
-		this.depot(depot.id.name).inner.get.map(vec => vec.map(_.asInstanceOf[A]))
+		this.depot(depot.id.name).inner.get.map(vec => vec.map(_.value.asInstanceOf[A]))
 	}
 
 	private def pstate(name: String) = pstates.getOrElse(name, throw new RuntimeException(s"Unknown pstate: ${name}"))
 	private def depot(name: String) = depots.getOrElse(name, throw new RuntimeException(s"Unknown depot: ${name}"))
 
-	// runs a list of nodes with the given envs. Returns the resulting list of envs
-	private [flow] def continue(nodes: List[Node], envs: List[Env]): IO[List[Env]] =
+	/** Runs a list of nodes with the given envs. Returns the resulting list of envs.
+	  *
+	  * `ack` is where `Node.AckReturn` reports, and is `None` for a query or for a record
+	  * appended with `emit` — nobody is waiting on either. It is passed along untouched
+	  * everywhere else, including across a partition hop, since Rama routes an ack return
+	  * to the *appender* rather than to the task that produced it.
+	  */
+	private [flow] def continue(nodes: List[Node], envs: List[Env], ack: Option[AckSink] = None): IO[List[Env]] =
 		nodes match {
 			case Nil => IO.pure(envs)
 
 			case Node.Each(fn, ins, out) :: tail =>
 				val results = envs.map(env => env.updated(out, fn(ins.map(env(_)))))
-				continue(tail, results)
+				continue(tail, results, ack)
 
 			case Node.Explode(fn, in, out) :: tail =>
 				val exploded = envs.flatMap { env =>
@@ -212,17 +321,17 @@ class Partition(interpreter: Interpreter) {
 						env.updated(out, value)
 					}
 				}
-				continue(tail, exploded)
-				
+				continue(tail, exploded, ack)
+
 
 			case Node.Filter(fn, in, _) :: tail =>
 				// The flag var exists for Rama's `keepTrue`; here the predicate prunes
 				// directly, so nothing needs binding.
-				continue(tail, envs.filter(env => fn(env(in))))
+				continue(tail, envs.filter(env => fn(env(in))), ack)
 
 			case Node.Partition(in) :: tail => {
 				interpreter.partitions.groupByPartitions(envs, env => env(in)).toList.flatTraverse { case (partition, penvs) =>
-					partition.continue(tail, penvs)
+					partition.continue(tail, penvs, ack)
 				}
 			}
 
@@ -230,11 +339,11 @@ class Partition(interpreter: Interpreter) {
 				envs.traverse { env =>
 					// for each env, we execute the sub-block and add its result to `out` in the
 					// single resulting env
-					continue(inner, List(env)).map { innerEnvs =>
+					continue(inner, List(env), ack).map { innerEnvs =>
 						env.updated(out, innerEnvs.map(inner => inner(collectFrom)))
 					}
 				}.flatMap { outputEnvs =>
-					continue(tail, outputEnvs)
+					continue(tail, outputEnvs, ack)
 				}
 			}
 
@@ -246,7 +355,7 @@ class Partition(interpreter: Interpreter) {
 						env.updated(out, value)
 					}
 				}.flatMap { updatedEnvs =>
-					continue(tail, updatedEnvs)
+					continue(tail, updatedEnvs, ack)
 				}
 
 			case Node.Update(ps, key, fn) :: tail =>
@@ -256,7 +365,7 @@ class Partition(interpreter: Interpreter) {
 					state.inner.update { map =>
 						map.updatedWith(k)(fn)
 					}
-				} *> continue(tail, envs)
+				} *> continue(tail, envs, ack)
 
 			case Node.Put(ps, key, value) :: tail =>
 				val state = pstate(ps.name)
@@ -265,7 +374,7 @@ class Partition(interpreter: Interpreter) {
 					state.inner.update { map =>
 						map.updated(k, env(value))
 					}
-				} *> continue(tail, envs)
+				} *> continue(tail, envs, ack)
 
 			case Node.UpdateWith(ps, key, arg, fn) :: tail =>
 				val state = pstate(ps.name)
@@ -275,13 +384,22 @@ class Partition(interpreter: Interpreter) {
 					state.inner.update { map =>
 						map.updatedWith(k)(v => fn(v, a))
 					}
-				} *> continue(tail, envs)
+				} *> continue(tail, envs, ack)
 
 			case Node.PartitionAppend(dep, value) :: tail =>
 				val state = depot(dep.name)
 				envs.traverse_ { env =>
 					val v = env(value)
-					state.inner.update(_.appended(v))
-				} *> continue(tail, envs)
+					// `None`: the new record starts its own event tree rather than extending
+					// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
+					state.inner.update(_.appended(Record(v, None)))
+				} *> continue(tail, envs, ack)
+
+			case Node.AckReturn(value) :: tail =>
+				// Once per branch. A flow that fans out reaches this many times, and it is
+				// the declared `AckAgg` that decides what the appender sees.
+				envs.traverse_ { env =>
+					ack.traverse_(_.ackReturn(env(value)))
+				} *> continue(tail, envs, ack)
 		}
 }

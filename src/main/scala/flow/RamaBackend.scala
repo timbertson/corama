@@ -1,7 +1,8 @@
 package flow
 
 import com.rpl.rama.{Agg, Block, Path}
-import com.rpl.rama.ops.{RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
+import com.rpl.rama.module.StreamSourceOptions
+import com.rpl.rama.ops.{RamaAccumulatorAgg1, RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
 
 /** Compiles the [[Node]] AST to a `com.rpl.rama.Block`.
   */
@@ -93,6 +94,9 @@ object RamaBackend {
 		case Node.PartitionAppend(dep, value) =>
 			Block.depotPartitionAppend(compileIdentity(dep), compileVar(value))
 
+		case Node.AckReturn(value) =>
+			Block.ackReturn(compileVar(value))
+
 		case Node.UpdateWith(ps, key, arg, fn) =>
 			// Rama's 2-arity `term`: the extra var is passed as a path argument, which
 			// is how a runtime value reaches a read-modify-write.
@@ -105,11 +109,6 @@ object RamaBackend {
 	private def compileNodes(nodes: List[Node]): Block.Impl =
 		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
 
-	// /** Compile a topology to a Rama block.
-	//   */
-	// def compileToBlock(t: Topology[?, ?]): Block.Impl =
-	// 	compileNodes(t.compiled.map(_._1))
-
 	/** What a declared topology compiles to, plus the names Rama needs positionally.
 	  *
 	  * `in` is where the input value must be bound: for a stream that's
@@ -117,7 +116,20 @@ object RamaBackend {
 	  * of `topologies.query(name, in)`. `out` is present only for a query — Rama's
 	  * `.out("*result")` — because a stream has no result to name.
 	  */
-	final case class Compiled(source: Identity, in: Var[?], out: Option[Var[?]], block: Block.Impl)
+	final case class Compiled(
+		source: Identity,
+		in: Var[?],
+		out: Option[Var[?]],
+		block: Block.Impl,
+		sourceOptions: Option[StreamSourceOptions.Impl])
+
+	/** How an [[AckAgg]] is declared to Rama: a source option, not part of the block.
+	  */
+	private def compileAckAgg(agg: AckAgg[?, ?]): StreamSourceOptions.Impl =
+		StreamSourceOptions.ackReturnAgg(new RamaAccumulatorAgg1[Any, Any] {
+			def initVal(): Any = agg.initAny
+			def accumulate(acc: Any, value: Any): Any = agg.accumulateAny(acc, value)
+		})
 
 	/** Compile a declared topology, reporting the names its input and result are bound to.
 	  */
@@ -127,6 +139,6 @@ object RamaBackend {
 			case IdentityNamespace.Query => Some(result)
 			case _ => None
 		}
-		Compiled(t.builder.source, t.input, out, compileNodes(nodes))
+		Compiled(t.builder.source, t.input, out, compileNodes(nodes), t.ackAgg.map(compileAckAgg))
 	}
 }

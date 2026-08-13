@@ -78,6 +78,8 @@ final class Topologies {
 
 	def topologies: List[Topology[?, ?]] = built.reverse
 
+	private[flow] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
+
 	private def claim(identity: Identity): Identity = {
 		if (ids.contains(identity)) {
 			throw new RuntimeException(s"Multiple definition of $identity")
@@ -95,23 +97,43 @@ final class Topologies {
 	def query[A, R](name: String)(
 		block: TopologyBuilder[A] => Flow[R, QueryContext]
 	): Topology[A, R] = {
-		declare[A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)))(block)
+		declare[A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), None)(block)
 	}
 
 	/** Attach a stream topology to a depot: driven by an append, writes PStates,
 	  * returns nothing.
+	  *
+	  * The context provided is `StreamContext[Nothing]`, so [[Flow.ackReturn]] does not
+	  * compile here — there is no declared aggregator for a value to reach.
 	  */
 	def stream[A](depot: Depot[A])(
-		block: TopologyBuilder[A] => Flow[Unit, StreamContext]
+		block: TopologyBuilder[A] => Flow[Unit, StreamContext[Nothing]]
 	): Topology[A, Unit] = {
-		declare[A, Unit, StreamContext](depot.id)(block)
+		declare[A, Unit, StreamContext[Nothing]](depot.id, None)(block)
 	}
 
-	private def declare[A, R, C](source: Identity)(
-		block: TopologyBuilder[A] => Flow[R, C]
+	/** Attach a stream topology that hands a value back to whoever appended.
+	  *
+	  * The aggregator determines the topology's `R`: a flow emits 0..n ack returns across
+	  * however many partitions its branches reached, and [[AckAgg]] says how those become
+	  * the one value an `AckLevel.Ack` append reads out of [[AckReturns]]. Rama declares
+	  * it the same way, as `StreamSourceOptions.ackReturnAgg`.
+	  *
+	  * The flow must `ackReturn` values of type `O`, since that is all the context
+	  * provides — a mismatch is a type error rather than the `IncorrectAckReturn` Rama
+	  * raises at runtime.
+	  */
+	def stream[A, O, R](depot: Depot[A], agg: AckAgg[O, R])(
+		block: TopologyBuilder[A] => Flow[Unit, StreamContext[O]]
+	): Topology[A, R] = {
+		declare[A, R, StreamContext[O]](depot.id, Some(agg))(block)
+	}
+
+	private def declare[A, R, C](source: Identity, agg: Option[AckAgg[?, R]])(
+		block: TopologyBuilder[A] => Flow[?, C]
 	): Topology[A, R] = {
 		val b = new TopologyBuilder[A](TopologyId(built.length), source)
-		val t = Topology(b, block(b))
+		val t = Topology[A, R](b, block(b), agg)
 		built = t :: built
 		t
 	}
@@ -121,7 +143,18 @@ object Topologies {
 	def apply(): Topologies = new Topologies()
 }
 
-final case class Topology[S, R](builder: TopologyBuilder[S], flow: Flow[R, Nothing]) {
+/** A declared topology, and how it produces its `R`.
+  *
+  * `R` is no longer the flow's own element type, because the two kinds source it
+  * differently: a query returns the value its flow ends on, while a stream returns
+  * whatever `ackAgg` makes of the flow's ack returns (and a stream without one returns
+  * `Unit`). So the flow is stored existentially and `R` is tied down at the declaration
+  * site instead — by `query`'s `Flow[R, QueryContext]`, or by `ackAgg`.
+  */
+final case class Topology[S, R](
+	builder: TopologyBuilder[S],
+	flow: Flow[?, Nothing],
+	ackAgg: Option[AckAgg[?, R]] = None) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
 }
@@ -173,6 +206,8 @@ object Flow {
 	// and a query is invoked by a client to compute a value.
 	private[flow] case class PartitionAppend[A](depot: Depot[A], key: Var[A]) extends Flow[Unit, Etl]
 
+	private[flow] case class AckReturn[O](value: Var[O]) extends Flow[Unit, AckReturning[O]]
+
 	def pure[A](v: Var[A]): Flow[A, Any] = Pure(v)
 
 	def map2[A, B, O](a: Var[A], b: Var[B])(f: (A, B) => O): Flow[O, Any] = Each2(a, b, f)
@@ -180,6 +215,13 @@ object Flow {
 	/** Move downstream execution to the partition owning `v`.
 	  */
 	def hashPartition[A](v: Var[A]): Flow[Unit, Any] = Partition(v)
+
+	/** Works from any partition — Rama routes the value to the appender rather than to
+	  * the origin task, which is what makes this usable after a `hashPartition`. Note it
+	  * does not end the flow: execution continues, and a fanned-out flow can reach this
+	  * more than once, which is what [[AckAgg]] exists to resolve.
+	  */
+	def ackReturn[O](v: Var[O]): Flow[Unit, AckReturning[O]] = AckReturn(v)
 
 	def unit: Flow[Unit, Any] = Pure(Var.unit)
 }
@@ -239,6 +281,7 @@ private[flow] object Node {
 	case class Put(pstate: Identity, key: VarId, value: VarId) extends Node
 	case class UpdateWith(pstate: Identity, key: VarId, arg: VarId, fn: (Option[Any], Any) => Option[Any]) extends Node
 	case class PartitionAppend(depot: Identity, arg: VarId) extends Node
+	case class AckReturn(value: VarId) extends Node
 
 
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
@@ -302,6 +345,9 @@ private[flow] object Node {
 
 			case Flow.PartitionAppend(depot, value) =>
 				(List(Node.PartitionAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])
+
+			case Flow.AckReturn(value) =>
+				(List(Node.AckReturn(value.vid)), Var.unit.asInstanceOf[Var[A]])
 		}
 	}
 }

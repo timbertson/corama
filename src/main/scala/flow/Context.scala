@@ -34,19 +34,31 @@ object Context
   */
 sealed trait Batch
 
-/** Requires an ETL topology that owns the PStates being written — a stream or
-  * microbatch topology, never a query.
+/** Requires an ETL topology — a stream or microbatch topology, never a query.
   */
 sealed trait Etl
 
-/** What a query topology provides: batch, but no writes. */
+/** A query topology provides batch (but no writes) */
 sealed trait QueryContext extends Batch
 
-/** What a stream topology provides: writes, but no batch block.
+/** Requires a topology whose ack returns are values of type `O`.
   *
-  * The asymmetry with [[QueryContext]] is Rama's, not ours.
+  * Invariant in `O` deliberately, and that is the whole mechanism: a flow that
+  * `ackReturn`s an `Int` requires `AckReturning[Int]`, which only a topology declared
+  * with an `AckAgg[Int, ?]` provides. Two `ackReturn`s of different types in one flow
+  * intersect to `AckReturning[Int] & AckReturning[String]`, which nothing provides — so
+  * that fails to compile too, which is right: Rama has one ack-return aggregator per
+  * topology, so the values reaching it must share a type.
   */
-sealed trait StreamContext extends Etl
+sealed trait AckReturning[O]
+
+/** What a stream topology provides: writes and ack returns of type `O`, but no batch
+  * block.
+  *
+  * `O` is `Nothing` for a stream declared without an aggregator, so `ackReturn`
+  * results in a compile error.
+  */
+sealed trait StreamContext[O] extends Etl with AckReturning[O]
 
 /** What a microbatch topology provides.
   *

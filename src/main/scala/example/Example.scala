@@ -1,6 +1,5 @@
 package flow
 
-import scala.concurrent.duration._
 import cats.syntax.all._
 import cats.effect._
 
@@ -28,14 +27,13 @@ object Example extends IOApp {
 	val ticketAssignment: Depot[Assignment] = topologies.depot("ticketAssignment")
 
 	/** Propagate an assignment: update the ticket, add to the new owner's set,
-	  * remove from the previous owner's.
+	  * remove from the previous owner's. Ack returns whoever owned it before.
 	  *
-	  * In Rama this spans three partitions and therefore three separate
-	  * transactions — one per `hashPartition`. The `Flow.hashPartition` calls mark
-	  * where, which is more than Rama's own API tells you, though the types still
-	  * don't *enforce* anything about what may cross a boundary.
+	  * The `AckReturning[Option[Long]]` in the requirement is what `Flow.ackReturn`
+	  * below contributes: this fragment only goes in a topology declared to aggregate
+	  * ack returns of that type.
 	  */
-	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit, Etl] =
+	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit, Etl & AckReturning[Option[Long]]] =
 		for {
 			ticketId <- assignment.map(_.ticketId)
 			newOwner <- assignment.map(_.assigneeId)
@@ -50,6 +48,13 @@ object Example extends IOApp {
 			_ <- fullTickets.updateWith(ticketId, newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
+
+			// Report the previous owner to whoever appended. Note this runs on the
+			// ticket's partition, not the appender's — Rama routes an ack return to the
+			// appender regardless, which is what makes it usable after a `hashPartition`.
+			// Unreached when the ticket doesn't exist, since the filter above pruned the
+			// branch; the appender sees `None` for the topology in that case.
+			_ <- Flow.ackReturn(previousOwner)
 
 			// Partition by the new owner: add the ticket to their set. Note this write
 			// is in a *different* transaction from the one above — the boundary is the
@@ -95,17 +100,11 @@ object Example extends IOApp {
 		perTicket.aggList
 	}
 
-	/** The two topologies of this module — one of each kind, as in `Main.scala`.
-	  *
-	  * `listUserTickets` is a **query**: it reads two PStates, aggs back to one value
-	  * and returns it to whoever asked (Main.scala:233, `topologies.query("userTickets",
-	  * "*request").out("*result")`). `propagateAssignment` is a **stream**: driven by a
-	  * depot append, writes PStates, returns nothing (Main.scala:205).
-	  */
 	val userTicketsQuery: Topology[Long, List[Ticket]] =
 		topologies.query[Long, List[Ticket]]("userTickets")(t => listUserTickets(t.input))
 
-	topologies.stream[Assignment](ticketAssignment)(t => propagateAssignment(t.input))
+	val assigning: Topology[Assignment, List[Option[Long]]] =
+		topologies.stream(ticketAssignment, AckAgg.all[Option[Long]])(t => propagateAssignment(t.input))
 
 	override def run(args: List[String]): IO[ExitCode] = {
 		println("flow.Example")
@@ -135,10 +134,19 @@ object Example extends IOApp {
 				
 
 				// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
-				_ <- interp.emit(ticketAssignment, Assignment(1L, 222L))
-				// TODO: wait for (colocated?) topologies to complete
-				_ <- IO.sleep(200.millis)
-				// Alternatively, add some nice helpers which waitUntilCondition...
+				// `append` with the default `AckLevel.Ack` returns only once every
+				// colocated topology has run this record to completion — across all three
+				// partitions this flow hops between — so the reads below need no polling.
+				acks <- interp.append(ticketAssignment, Assignment(1L, 222L))
+
+				// And the ack *return* carries a value back: who owned the ticket before.
+				// Typed from the topology's own `R`, with no name lookup and no cast at the
+				// call site. Doubly optional, and the two mean different things: the outer
+				// is "this topology ack returned at all", the inner is this flow's own
+				// "the ticket had a previous owner".
+				previous = acks.get(assigning)
+				_ = println(s"  reassigned ticket 1, previously owned by: $previous")
+				_ = assert(previous == Some(Some(111L)), s"ack return: $previous")
 
 				_ <- interp.get(userTickets, 222L).map { result =>
 					assert(result == Some(Set(3L, 1L)), s"new owner: ${result}")
@@ -151,8 +159,7 @@ object Example extends IOApp {
 				}
 
 				// Reassigning to the same owner must not remove the ticket.
-				_ <- interp.emit(ticketAssignment, Assignment(1L, 222L))
-				_ <- IO.sleep(200.millis)
+				_ <- interp.append(ticketAssignment, Assignment(1L, 222L))
 				_ <- interp.get(userTickets, 222L).map { result =>
 					assert(result == Some(Set(3L, 1L)), s"self-reassign: ${result}")
 				}

@@ -1,6 +1,7 @@
 package flow
 
 import scala.concurrent.duration._
+import cats.Semigroup
 import cats.syntax.all._
 import cats.effect.IO
 import weaver.SimpleIOSuite
@@ -20,8 +21,11 @@ object FlowSpec extends SimpleIOSuite {
 		new Interpreter(ts).invoke(q, input)
 	}
 
-	/** Poll until the predicate holds. Stream topologies are driven by a depot append
-	  * consumed on another fiber, so there is no completion signal to await.
+	/** Poll until the predicate holds.
+	  *
+	  * Needed for tests driven by `emit`, which is fire-and-forget: the record is consumed
+	  * on another fiber and nothing tracks it. `append` with `AckLevel.Ack` does have a
+	  * completion signal, and the tests that use it assert without polling.
 	  */
 	private def eventually[A](io: IO[A])(p: A => Boolean): IO[A] = {
 		def loop: IO[A] = io.flatMap(a => if (p(a)) IO.pure(a) else IO.sleep(10.millis) *> loop)
@@ -404,56 +408,280 @@ object FlowSpec extends SimpleIOSuite {
 		}
 	}
 
-	test("AckLevel.Ack fails loudly rather than returning nothing") {
+	test("AckLevel.Ack waits for the topology, so no polling is needed") {
+		// The point of the level. `AppendAck` returns once the record is durable, which is
+		// why every other stream test here has to poll; `Ack` returns once the event tree
+		// is exhausted, so the write is already visible on the next line.
 		val ts = Topologies()
 		val nums = ts.depot[Int]("nums")
-		ts.stream(nums)(_ => Flow.unit)
+		val seen = ts.pstate[Int, Int]("seen")
+		ts.stream(nums) { t =>
+			for {
+				n    <- t.input.map(_ * 10)
+				_    <- Flow.hashPartition(n)
+				_    <- seen.put(n, n)
+				done <- Flow.unit
+			} yield done
+		}
 
 		val interp = new Interpreter(ts)
-		interp.append(nums, 1, AckLevel.Ack).attempt.map { r =>
-			expect(r.left.toOption.exists(_.isInstanceOf[NotImplementedError]))
+		interp.running {
+			for {
+				_ <- interp.append(nums, 4, AckLevel.Ack)
+				// No `eventually`: if the ack didn't wait, this read races the topology.
+				v <- interp.get(seen, 40)
+			} yield expect(v == Some(40))
+		}
+	}
+
+	test("an ack completes even when the flow fans out across partitions") {
+		// Completion is "the whole event tree is exhausted", not "the source block
+		// returned". This flow explodes into 4 branches and each hops to the partition
+		// owning its own value, so waiting only for the origin task would report far too
+		// early — all 4 writes must be visible.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val seen = ts.pstate[Int, Int]("seen")
+		ts.stream(nums) { t =>
+			for {
+				i    <- t.input.explode(n => List.range(0, n))
+				_    <- Flow.hashPartition(i)
+				_    <- seen.put(i, i)
+				done <- Flow.unit
+			} yield done
+		}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			for {
+				_  <- interp.append(nums, 4, AckLevel.Ack)
+				vs <- List(0, 1, 2, 3).traverse(interp.get(seen, _))
+			} yield expect(vs == List(Some(0), Some(1), Some(2), Some(3)))
+		}
+	}
+
+	test("an ack waits for every topology on the depot, not just the first") {
+		// Two topologies consume one depot. The append must wait for both, so an
+		// under-count would let the faster one complete it while the slower was still
+		// running — the slow write is delayed past where the ack claims completion.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val fast = ts.pstate[Int, Int]("fast")
+		val slow = ts.pstate[Int, Int]("slow")
+
+		ts.stream(nums)(t => fast.put(t.input, t.input).void)
+		ts.stream(nums) { t =>
+			for {
+				// Enough hops to lose a race against the other topology if the count were
+				// wrong; `IO.sleep` isn't reachable from inside a flow.
+				_    <- List.range(0, 50).foldLeft(Flow.unit)((acc, _) => acc.flatMap(_ => Flow.hashPartition(t.input)))
+				_    <- slow.put(t.input, t.input)
+				done <- Flow.unit
+			} yield done
+		}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			for {
+				_ <- interp.append(nums, 1, AckLevel.Ack)
+				f <- interp.get(fast, 1)
+				s <- interp.get(slow, 1)
+			} yield expect.all(f == Some(1), s == Some(1))
+		}
+	}
+
+	test("an append with no subscribed topology still completes") {
+		// Nothing consumes this depot, so the event tree is empty. The append has to
+		// return rather than wait for a topology that will never report.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			interp.append(nums, 1, AckLevel.Ack).timeout(3.seconds).attempt.map { r =>
+				expect(r.isRight)
+			}
 		}
 	}
 
 	test("ack returns are read with the topology, not a name and a cast") {
 		// Rama gives back a map from topology *name* to `Object`, so reading one means
-		// knowing a name and choosing a cast. Keying by the typed `Topology` instead
-		// means the result type comes from its `R`: `str` yields `Option[String]` and
-		// `num` `Option[Int]`, with no cast written by the caller. Those two ascriptions
-		// are the assertion.
-		//
-		// Built directly rather than via `ts.stream`, because `stream` still pins
-		// `R = Unit` — carrying the ack return in a stream's `R` is the next piece of
-		// work (FLOW-NOTES.md). This is the shape it will produce.
+		// knowing a name and choosing a cast. Keying by the typed `Topology` instead means
+		// the result type comes from its `R`, which the declared `AckAgg` determines:
+		// `doubled` yields `Option[Int]` and `described` `Option[String]`, with no cast
+		// written by the caller. Those two ascriptions are the assertion.
 		val ts = Topologies()
 		val nums = ts.depot[Int]("nums")
-		val quiet = ts.stream(nums)(_ => Flow.unit)
 
-		def streamOf[R](id: Int)(f: Var[Int] => Flow[R, Nothing]): Topology[Int, R] = {
-			val b = new TopologyBuilder[Int](TopologyId(id), nums.id)
-			Topology(b, f(b.input))
+		val doubled: Topology[Int, Int] =
+			ts.stream(nums, AckAgg.unique[Int])(t => t.input.map(_ * 2).flatMap(Flow.ackReturn))
+
+		val described: Topology[Int, String] =
+			ts.stream(nums, AckAgg.unique[String])(t => t.input.map(n => s"saw $n").flatMap(Flow.ackReturn))
+
+		// A stream declared without an aggregator returns nothing, which is `None` rather
+		// than a value — matching Rama's "the map only contains entries for non-null
+		// streaming ack returns".
+		val quiet: Topology[Int, Unit] = ts.stream(nums)(_ => Flow.unit)
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			interp.append(nums, 21, AckLevel.Ack).map { returns =>
+				val fromNum: Option[Int] = returns(doubled)
+				val fromStr: Option[String] = returns(described)
+
+				// A query never produces an ack return, so asking with one is rejected
+				// rather than answering a silent `None`.
+				val q = ts.query[Int, Int]("q")(t => t.input.map(identity))
+				val queryRejected =
+					try { returns(q); false } catch { case _: IllegalArgumentException => true }
+
+				expect.all(
+					fromNum == Some(42),
+					fromStr == Some("saw 21"),
+					returns(quiet) == None,
+					queryRejected)
+			}
 		}
-		val str = streamOf(10)(_.map(_.toString))
-		val num = streamOf(11)(_.map(_ * 2))
+	}
 
-		IO {
-			val returns = new AckReturns(Map(str.builder.id -> "hello", num.builder.id -> 42))
-			val fromStr: Option[String] = returns(str)
-			val fromNum: Option[Int] = returns(num)
+	test("the ack aggregator decides what a fanned-out flow hands back") {
+		// A flow reaching `ackReturn` once per branch has 0..n values to reduce, and Rama
+		// makes that a declaration-site choice — so this asserts the reduce happens across
+		// branches that ack returned from *different partitions*, which is the case Rama's
+		// docs call out ("the many ack return values are coming from random tasks").
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
 
-			// A query never produces an ack return, so asking with one is rejected rather
-			// than answering a silent `None`.
-			val q = ts.query[Int, Int]("q")(t => t.input.map(identity))
-			val queryRejected =
-				try { returns(q); false } catch { case _: IllegalArgumentException => true }
+		val everything: Topology[Int, List[Int]] =
+			ts.stream(nums, AckAgg.all[Int]) { t =>
+				for {
+					i    <- t.input.explode(n => List.range(0, n))
+					_    <- Flow.hashPartition(i)
+					done <- Flow.ackReturn(i)
+				} yield done
+			}
 
-			expect.all(
-				fromStr == Some("hello"),
-				fromNum == Some(42),
-				// A topology that returned nothing is `None`, matching Rama's "the map
-				// only contains entries for non-null streaming ack returns".
-				returns(quiet) == None,
-				queryRejected)
+		// Same flow, reduced rather than collected. `sum` is a real choice; picking one
+		// arbitrarily is not, which is why there is no `AckAgg.last` to write here.
+		val summed: Topology[Int, Int] =
+			ts.stream(nums, AckAgg.reduce[Int]) { t =>
+				for {
+					i    <- t.input.explode(n => List.range(0, n))
+					_    <- Flow.hashPartition(i)
+					done <- Flow.ackReturn(i)
+				} yield done
+			}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			interp.append(nums, 3, AckLevel.Ack).map { returns =>
+				expect.all(
+					returns(everything).map(_.sorted) == Some(List(0, 1, 2)),
+					returns(summed) == Some(3))
+			}
+		}
+	}
+
+	test("an ack aggregator is any Semigroup, not one of a fixed set") {
+		// `AckAgg` used to be a sealed pair of cases because `RamaBackend` matched on it to
+		// pick `Agg.last`/`Agg.list`. Going through `Monoid[Option[R]]` — rendered to Rama as
+		// one `RamaAccumulatorAgg1` — means an aggregator the library never heard of both
+		// runs here and compiles there, which is what the two assertions cover.
+		//
+		// This one is hand-written and changes type on the way through: keep the longest
+		// ack return, as a String.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+
+		given Semigroup[String] = Semigroup.instance((a, b) => if (a.length >= b.length) a else b)
+		val longest: Topology[Int, String] =
+			ts.stream(nums, AckAgg.reduceMap[Int, String](i => "x" * i)) { t =>
+				for {
+					i    <- t.input.explode(n => List.range(1, n + 1))
+					_    <- Flow.hashPartition(i)
+					done <- Flow.ackReturn(i)
+				} yield done
+			}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			interp.append(nums, 4, AckLevel.Ack).map { returns =>
+				expect.all(
+					returns(longest) == Some("xxxx"),
+					RamaBackend.compile(longest).sourceOptions.isDefined)
+			}
+		}
+	}
+
+	test("AckAgg.unique rejects a second ack return instead of picking one") {
+		// This is the aggregator that has no Rama counterpart, and the reason there is no
+		// `AckAgg.last`: last-wins would answer this same flow arbitrarily, and `Interp`'s
+		// deterministic order means it would answer *consistently* here and differently on a
+		// cluster. `unique` says the flow was supposed to ack return once, so two is an error.
+		//
+		// It surfaces when the ack return is *read*, not when the append completes, because
+		// that is where the aggregator runs: values are collected per topology and reduced
+		// on the way out (see `AckReturns`). So the append itself succeeds — the writes did
+		// happen — and only asking for the value fails.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val t = ts.stream(nums, AckAgg.unique[Int]) { t =>
+			for {
+				i    <- t.input.explode(n => List.range(0, n))
+				done <- Flow.ackReturn(i)
+			} yield done
+		}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			for {
+				// One branch is fine — `unique` is about more than one, not about fan-out
+				// upstream of the `ackReturn`.
+				ok <- interp.append(nums, 1, AckLevel.Ack).map(_(t))
+
+				// Two branches: the append still completes, and asking for the value throws.
+				returns <- interp.append(nums, 2, AckLevel.Ack)
+				two = Either.catchNonFatal(returns(t))
+			} yield expect.all(
+				ok == Some(0),
+				two.isLeft,
+				two.left.toOption.exists(_.getMessage.contains("more than one ack return")))
+		}
+	}
+
+	test("a flow that never reaches ackReturn hands back nothing") {
+		// `Some(Nil)` would say "the topology ran and returned an empty list"; the truth is
+		// that no branch survived to ack return anything at all.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val t = ts.stream(nums, AckAgg.all[Int]) { t =>
+			for {
+				n    <- t.input.map(identity)
+				_    <- n.filter(_ => false)
+				done <- Flow.ackReturn(n)
+			} yield done
+		}
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			interp.append(nums, 1, AckLevel.Ack).map(returns => expect(returns(t) == None))
+		}
+	}
+
+	test("a failing topology fails the append rather than hanging it") {
+		// Rama retries the record and the appender waits; here there is no retry, so the
+		// honest outcome is a failed append. Silently completing would report success for
+		// work that did not happen.
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		ts.stream(nums)(t => t.input.map[Int](_ => throw new RuntimeException("boom")).void)
+
+		val interp = new Interpreter(ts)
+		interp.running {
+			interp.append(nums, 1, AckLevel.Ack).timeout(3.seconds).attempt.map { r =>
+				expect(r.left.toOption.exists(_.getMessage.contains("boom")))
+			}
 		}
 	}
 
@@ -619,7 +847,7 @@ object FlowSpec extends SimpleIOSuite {
 		val counts = ts.pstate[String, Int]("counts")
 		val nums = ts.depot[Int]("nums")
 		val echo = ts.depot[Int]("echo")
-		val s = ts.stream(nums) { t =>
+		val s = ts.stream(nums, AckAgg.unique[Int]) { t =>
 			for {
 				n     <- t.input.explode(i => List(i, i + 1))        // Explode
 				_     <- Flow.hashPartition(n)                        // Partition
@@ -631,6 +859,7 @@ object FlowSpec extends SimpleIOSuite {
 				_     <- counts.put(key, n)                           // Put
 				_     <- echo.partitionAppend(n)                      // PartitionAppend
 				_     <- prev.filter(_ => true)                       // Filter
+				_     <- Flow.ackReturn(n)                            // AckReturn
 				done  <- Flow.unit
 			} yield done
 		}
@@ -647,7 +876,18 @@ object FlowSpec extends SimpleIOSuite {
 				RamaBackend.compileVar(cs.in) == "*nums_0",
 				cs.out == None,
 				RamaBackend.compileVar(cq.in) == "*q_0",
-				cq.out.map(RamaBackend.compileVar) == Some("*agg_2"))
+				cq.out.map(RamaBackend.compileVar) == Some("*agg_2"),
+				// An ack aggregator is a *source option* in Rama, not part of the block, so
+				// it is reported separately for the caller to pass to `.source(depot, opts)`.
+				cs.sourceOptions.isDefined,
+				cq.sourceOptions == None)
 		}
+	}
+
+	test("a stream without an ack aggregator reports no source options") {
+		val ts = Topologies()
+		val nums = ts.depot[Int]("nums")
+		val s = ts.stream(nums)(_ => Flow.unit)
+		IO(expect(RamaBackend.compile(s).sourceOptions == None))
 	}
 }
