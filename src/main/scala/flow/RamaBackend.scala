@@ -121,14 +121,20 @@ object RamaBackend {
 		in: Var[?],
 		out: Option[Var[?]],
 		block: Block.Impl,
-		sourceOptions: Option[StreamSourceOptions.Impl])
+		sourceOptions: StreamSourceOptions.Impl)
 
 	/** How an [[AckAgg]] is declared to Rama: a source option, not part of the block.
 	  */
 	private def compileAckAgg(agg: AckAgg[?, ?]): StreamSourceOptions.Impl =
 		StreamSourceOptions.ackReturnAgg(new RamaAccumulatorAgg1[Any, Any] {
-			def initVal(): Any = agg.initAny
-			def accumulate(acc: Any, value: Any): Any = agg.accumulateAny(acc, value)
+			def initVal(): Any = null
+			def accumulate(acc: Any, value: Any): Any = {
+				if (acc == null) {
+					agg.mapAny(value)
+				} else {
+					agg.mapCombineAny(acc, value)
+				}
+			}
 		})
 
 	/** Compile a declared topology, reporting the names its input and result are bound to.
@@ -139,6 +145,6 @@ object RamaBackend {
 			case IdentityNamespace.Query => Some(result)
 			case _ => None
 		}
-		Compiled(t.builder.source, t.input, out, compileNodes(nodes), t.ackAgg.map(compileAckAgg))
+		Compiled(t.builder.source, t.input, out, compileNodes(nodes), compileAckAgg(t.ackAgg))
 	}
 }

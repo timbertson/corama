@@ -49,20 +49,16 @@ object Example extends IOApp {
 				cur.map(_.copy(assignee = Some(owner)))
 			}
 
-			// Report the previous owner to whoever appended. Note this runs on the
-			// ticket's partition, not the appender's — Rama routes an ack return to the
-			// appender regardless, which is what makes it usable after a `hashPartition`.
-			// Unreached when the ticket doesn't exist, since the filter above pruned the
-			// branch; the appender sees `None` for the topology in that case.
-			_ <- Flow.ackReturn(previousOwner)
-
-			// Partition by the new owner: add the ticket to their set. Note this write
-			// is in a *different* transaction from the one above — the boundary is the
-			// hashPartition, which nothing in the types currently enforces.
+			// Partition by the new owner: add the ticket to their set.
+			// This write is in a different transaction (in terms of pstate upates)
 			_ <- Flow.hashPartition(newOwner)
 			_ <- userTickets.updateWith(newOwner, ticketId) { (prev, tid) =>
 				Some(prev.getOrElse(Set.empty) + tid)
 			}
+
+			// Report the previous owner to whoever appended. This runs on the ticket's
+			// partition, but the result is routed back to the appender.
+			_ <- Flow.ackReturn(previousOwner)
 
 			// And remove from the previous owner, when there was a different one.
 			hop <- Flow.map2(previousOwner, newOwner)((prev, now) => prev.filter(_ != now))
@@ -77,20 +73,15 @@ object Example extends IOApp {
 
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
 	  * own partition, then collapse the results back into a single list.
-	  *
-	  * This is the shape `aggList` exists for. Rama writes it as `.each(EXPLODE,
-	  * "*ticketIds")` ... `.originPartition().agg(Agg.list("*ticket")).out("*tickets")`,
-	  * where nothing indicates that the region between the two is fanned out.
 	  */
 	def listUserTickets(userId: Var[Long]): Flow[List[Ticket], Batch] = {
-		// Read-only and no aggregation yet, so this fragment requires nothing at all —
-		// `aggList` below is what introduces the `Batch` requirement.
 		val perTicket: Flow[Ticket, Any] = for {
 			_ <- Flow.hashPartition(userId)
 			ids <- userTickets.get(userId)
-			ticketId <- ids.explode(_.getOrElse(Set.empty).toList.sorted)
 
-			// Each ticket lives on its own partition.
+			// Each ticket lives on its own partition. Explode
+			// fans out each ID
+			ticketId <- ids.explode(_.getOrElse(Set.empty).toList.sorted)
 			_ <- Flow.hashPartition(ticketId)
 			full <- fullTickets.get(ticketId)
 			_ <- full.filter(_.isDefined)
@@ -104,7 +95,7 @@ object Example extends IOApp {
 		topologies.query[Long, List[Ticket]]("userTickets")(t => listUserTickets(t.input))
 
 	val assigning: Topology[Assignment, List[Option[Long]]] =
-		topologies.stream(ticketAssignment, AckAgg.all[Option[Long]])(t => propagateAssignment(t.input))
+		topologies.stream(ticketAssignment, AckAgg.list[Option[Long]])(t => propagateAssignment(t.input))
 
 	override def run(args: List[String]): IO[ExitCode] = {
 		println("flow.Example")
@@ -124,8 +115,6 @@ object Example extends IOApp {
 				_ <- interp.put(userTickets, 111L, Set(1L, 2L))
 				_ <- interp.put(userTickets, 222, Set(3L))
 
-				// A query is *invoked* and returns one value, so there's no trace to unwrap and
-				// no chance of silently reading the first of several emissions.
 				listed <- interp.invoke(userTicketsQuery, 111L)
 				_ = println(s"  user 111 tickets: $listed")
 
@@ -134,19 +123,12 @@ object Example extends IOApp {
 				
 
 				// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
-				// `append` with the default `AckLevel.Ack` returns only once every
-				// colocated topology has run this record to completion — across all three
-				// partitions this flow hops between — so the reads below need no polling.
 				acks <- interp.append(ticketAssignment, Assignment(1L, 222L))
 
 				// And the ack *return* carries a value back: who owned the ticket before.
-				// Typed from the topology's own `R`, with no name lookup and no cast at the
-				// call site. Doubly optional, and the two mean different things: the outer
-				// is "this topology ack returned at all", the inner is this flow's own
-				// "the ticket had a previous owner".
-				previous = acks.get(assigning)
+				previous <- IO.fromTry(acks.unique(assigning))
 				_ = println(s"  reassigned ticket 1, previously owned by: $previous")
-				_ = assert(previous == Some(Some(111L)), s"ack return: $previous")
+				_ = assert(previous == Some(111L), s"ack return: $previous")
 
 				_ <- interp.get(userTickets, 222L).map { result =>
 					assert(result == Some(Set(3L, 1L)), s"new owner: ${result}")
@@ -165,16 +147,5 @@ object Example extends IOApp {
 				}
 			} yield ExitCode.Success
 		}
-
-
-		// // And both compile to real Rama blocks, each reporting the names Rama needs
-		// // positionally: the query's `.out("*result")`, the stream's `.source(...).out(...)`.
-		// val q = RamaBackend.compileTopology(userTicketsQuery)
-		// val s = RamaBackend.compileTopology(ticketAssignment)
-		// assert(q.block != null && s.block != null)
-		// println(s"  query ${q.name}:   ${q.in} -> ${q.out.get}")
-		// println(s"  stream ${s.name}: ${s.in} (out: ${s.out})")
-
-		// println("  ok — interpreted and compiled to Rama")
 	}
 }

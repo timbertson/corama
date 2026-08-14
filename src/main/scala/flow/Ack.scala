@@ -2,6 +2,12 @@ package flow
 
 import cats.{Monoid, Semigroup}
 import cats.syntax.all._
+import cats.Functor
+import cats.Applicative
+import scala.util.Try
+import scala.util.Failure
+import scala.util.Success
+import cats.data.NonEmptyList
 
 sealed trait AckLevel[R]
 
@@ -18,55 +24,43 @@ object AckLevel {
 }
 
 /** How a stream topology's ack returns are combined.
-  *
-  * A stream flow emits 0..n values — one per branch, on whichever partition the branch
-  * ended up on — each is a separate `ackReturn`.
-	* The aggregator defines how those values are returned to the appender.
-	*
-	* // TODO is `prepare` necessary?
-  */
+ *
+ * `prepare` always happens locally.
+ * `combine` happens locally to combine multiple local results,
+ * and again when combining results from multiple partitions.
+ */
 final class AckAgg[O, R] private[flow] (
-	private[flow] val prepare: O => R,
-	private[flow] val monoid: Monoid[Option[R]]) {
+	private[flow] val map: O => R,
+	// private[flow] val zero: R,
+	private[flow] val combine: (R, R) => R
+) {
 
-	private[flow] def combine(values: List[O]): Option[R] =
-		monoid.combineAll(values.map(o => Some(prepare(o))))
+	private[flow] def merge(values: NonEmptyList[O]): R = values.map(map).reduceLeft(combine)
 
-	/** Erased forms, for the interpreter and the Rama backend — an ack-returned value is
-	  * an `Any` by the time either sees it.
-	  *
-	  * `null` stands for the zero on the Rama side, since `initVal` has to produce a
-	  * concrete `Object`
-	  */
-	private[flow] def combineAny(values: List[Any]): Option[R] = combine(values.asInstanceOf[List[O]])
+	private[flow] def mergeAny(values: List[Any]): Option[R] =
+		NonEmptyList.fromList(values.asInstanceOf[List[O]]).map(merge)
 
-	private[flow] def initAny: Any = null
-
-	private[flow] def accumulateAny(acc: Any, value: Any): Any =
-		monoid.combine(
-			Option(acc).asInstanceOf[Option[R]],
-			Some(prepare(value.asInstanceOf[O]))
-		) match {
-			case Some(r) => r
-			case None => null
-		}
+	private[flow] def mapAny(value: Any): R = map(value.asInstanceOf[O])
+	private[flow] def mapCombineAny(acc: Any, value: Any): R = combine(acc.asInstanceOf[R], mapAny(value))
 }
 
 object AckAgg {
+	def apply[O, R](map: O => R, combine: (R, R) => R): AckAgg[O, R] = new AckAgg(map, combine)
 
-	/** Map each ack return into the result type, then combine. */
-	def reduceMap[O, R](f: O => R)(using Semigroup[R]): AckAgg[O, R] =
-		new AckAgg(f, Monoid[Option[R]])
+	// Collect act returns into a sequence (monoid)
+	def collect[A, M[_]](using app: Applicative[M], m: Monoid[M[A]]): AckAgg[A, M[A]] = {
+		new AckAgg[A, M[A]](app.pure, m.combine)
+	}
 
-	/** Combine ack returns using their own type's `Semigroup`.
-	  *
-	  * So `AckAgg.reduce[Int]` sums, which is the ack-return example Rama's own docs use,
-	  * and it arrives for free rather than as another case here.
-	  */
-	def reduce[R](using Semigroup[R]): AckAgg[R, R] = reduceMap(identity)
+	// convenience overload of collect to hardcode the List type
+	def list[O]: AckAgg[O, List[O]] = collect
 
-	/** Every ack return, in no specific order */
-	def all[O]: AckAgg[O, List[O]] = reduceMap(List(_))
+	// return nothing, accumulate nothing
+	def unit: AckAgg[Unit, Unit] = apply(_ => (), (_, _) => ())
+
+	// raise if attempted, used for `query` topologies.
+	// TODO is there a type-safe way?
+	def undefined[O, R]: AckAgg[O, R] = apply(_ => ???, (_, _) => ???)
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.
@@ -79,7 +73,8 @@ final class AckReturns private[flow] (
 	private val topologies: Topologies) {
 
 	// TODO: assert topology is a Stream, not a Microbatch
-	def raw[S, R](t: Topology[S, R]): Option[R] = {
+	def result[S, R](t: Topology[S, R]): Option[R] = {
+		// TODO: make this impossible via types?
 		require(
 			t.builder.source.namespace == IdentityNamespace.Depot,
 			s"${t.builder.source} is not a stream topology, so it cannot produce an ack return")
@@ -88,16 +83,20 @@ final class AckReturns private[flow] (
 			s"${t.builder.source} was not declared in the module this append went to")
 
 		val raw = values.getOrElse(t.builder.id, Nil)
-		t.ackAgg match {
-			case Some(agg) => agg.combineAny(raw)
-
-			// No declared aggregator, so `R` is `Unit` and the flow had no way to call
-			// `ackReturn` — nothing to hand back, and nothing was collected.
-			case None => None.asInstanceOf[Option[R]]
-		}
+		t.ackAgg.mergeAny(raw)
 	}
 
-	// TODO: def unique() which returns Try[O]. Fails if there was no response, or more than one response.
+	// if the result is already a monoid, we can collapse the Option into empty
+	def results[S, R : Monoid](t: Topology[S, R]): R = {
+		result(t).getOrElse(Monoid[R].empty)
+	}
+
+	def unique[S, T, R <: Seq[T]](t: Topology[S, R]): Try[T] = {
+		result(t) match {
+			case Some(seq) if seq.length == 1 => Success(seq.head)
+			case other => Failure(new RuntimeException(s"Expected ${t.builder.source} to produce 1 element, but received ${other.map(_.length).getOrElse(0)}"))
+		}
+	}
 
 	override def toString: String = s"AckReturns(${values.size})"
 }

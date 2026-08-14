@@ -97,7 +97,7 @@ final class Topologies {
 	def query[A, R](name: String)(
 		block: TopologyBuilder[A] => Flow[R, QueryContext]
 	): Topology[A, R] = {
-		declare[A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), None)(block)
+		declare[A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), AckAgg.undefined)(block)
 	}
 
 	/** Attach a stream topology to a depot: driven by an append, writes PStates,
@@ -109,7 +109,7 @@ final class Topologies {
 	def stream[A](depot: Depot[A])(
 		block: TopologyBuilder[A] => Flow[Unit, StreamContext[Nothing]]
 	): Topology[A, Unit] = {
-		declare[A, Unit, StreamContext[Nothing]](depot.id, None)(block)
+		declare[A, Unit, StreamContext[Nothing]](depot.id, AckAgg.unit)(block)
 	}
 
 	/** Attach a stream topology that hands a value back to whoever appended.
@@ -126,10 +126,10 @@ final class Topologies {
 	def stream[A, O, R](depot: Depot[A], agg: AckAgg[O, R])(
 		block: TopologyBuilder[A] => Flow[Unit, StreamContext[O]]
 	): Topology[A, R] = {
-		declare[A, R, StreamContext[O]](depot.id, Some(agg))(block)
+		declare[A, R, StreamContext[O]](depot.id, agg)(block)
 	}
 
-	private def declare[A, R, C](source: Identity, agg: Option[AckAgg[?, R]])(
+	private def declare[A, R, C](source: Identity, agg: AckAgg[?, R])(
 		block: TopologyBuilder[A] => Flow[?, C]
 	): Topology[A, R] = {
 		val b = new TopologyBuilder[A](TopologyId(built.length), source)
@@ -145,8 +145,7 @@ object Topologies {
 
 /** A declared topology, and how it produces its `R`.
   *
-  * `R` is no longer the flow's own element type, because the two kinds source it
-  * differently: a query returns the value its flow ends on, while a stream returns
+  * `R` is returned in two ways: a query returns the value its flow ends on, while a stream returns
   * whatever `ackAgg` makes of the flow's ack returns (and a stream without one returns
   * `Unit`). So the flow is stored existentially and `R` is tied down at the declaration
   * site instead — by `query`'s `Flow[R, QueryContext]`, or by `ackAgg`.
@@ -154,7 +153,7 @@ object Topologies {
 final case class Topology[S, R](
 	builder: TopologyBuilder[S],
 	flow: Flow[?, Nothing],
-	ackAgg: Option[AckAgg[?, R]] = None) {
+	ackAgg: AckAgg[?, R]) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
 }
