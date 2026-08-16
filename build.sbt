@@ -1,5 +1,6 @@
 ThisBuild / scalaVersion := "3.4.2"
 ThisBuild / fork := true
+Compile / mainClass := Some("flow.Example")
 
 resolvers ++= Seq(
   "nexus-releases" at "https://nexus.redplanetlabs.com/repository/maven-public-releases",

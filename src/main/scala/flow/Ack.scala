@@ -23,7 +23,8 @@ object AckLevel {
 	case object Ack extends AckLevel[AckReturns]
 }
 
-/** How a stream topology's ack returns are combined.
+/** How return values are combined. This is used for both
+ * streaming ack returns, and also for query returns.
  *
  * `prepare` always happens locally.
  * `combine` happens locally to combine multiple local results,
@@ -57,10 +58,6 @@ object AckAgg {
 
 	// return nothing, accumulate nothing
 	def unit: AckAgg[Unit, Unit] = apply(_ => (), (_, _) => ())
-
-	// raise if attempted, used for `query` topologies.
-	// TODO is there a type-safe way?
-	def undefined[O, R]: AckAgg[O, R] = apply(_ => ???, (_, _) => ???)
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.

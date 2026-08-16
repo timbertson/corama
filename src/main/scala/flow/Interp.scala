@@ -335,12 +335,25 @@ class Partition(interpreter: Interpreter) {
 				}
 			}
 
-			case Node.Scope(inner, collectFrom, out) :: tail => {
+			case Node.AggList(block, collectFrom, out) :: tail => {
 				envs.traverse { env =>
 					// for each env, we execute the sub-block and add its result to `out` in the
 					// single resulting env
-					continue(inner, List(env), ack).map { innerEnvs =>
-						env.updated(out, innerEnvs.map(inner => inner(collectFrom)))
+					continue(block, List(env), ack).map { innerEnvs =>
+						env.updated(out, innerEnvs.map(block => block(collectFrom)))
+					}
+				}.flatMap { outputEnvs =>
+					continue(tail, outputEnvs, ack)
+				}
+			}
+
+			case Node.Agg(block, agg, collectFrom, out) :: tail => {
+				envs.traverse { env =>
+					continue(block, List(env), ack).map { innerEnvs =>
+						env.updated(out, innerEnvs.foldLeft(Option.empty[Any]) { (acc, innerEnv) =>
+							val item = innerEnv(collectFrom)
+							acc.fold(Some(agg.mapAny(item)))(acc => Some(agg.mapCombineAny(acc, item)))
+						})
 					}
 				}.flatMap { outputEnvs =>
 					continue(tail, outputEnvs, ack)

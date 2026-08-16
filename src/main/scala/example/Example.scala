@@ -74,8 +74,8 @@ object Example extends IOApp {
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
 	  * own partition, then collapse the results back into a single list.
 	  */
-	def listUserTickets(userId: Var[Long]): Flow[List[Ticket], Batch] = {
-		val perTicket: Flow[Ticket, Any] = for {
+	def listUserTickets(userId: Var[Long]): Flow[Ticket, Any] = {
+		for {
 			_ <- Flow.hashPartition(userId)
 			ids <- userTickets.get(userId)
 
@@ -87,12 +87,10 @@ object Example extends IOApp {
 			_ <- full.filter(_.isDefined)
 			ticket <- full.map(_.get.ticket)
 		} yield ticket
-
-		perTicket.aggList
 	}
 
 	val userTicketsQuery: Topology[Long, List[Ticket]] =
-		topologies.query[Long, List[Ticket]]("userTickets")(t => listUserTickets(t.input))
+		topologies.query[Long, Ticket, List[Ticket]]("userTickets", AckAgg.list[Ticket])(t => listUserTickets(t.input))
 
 	val assigning: Topology[Assignment, List[Option[Long]]] =
 		topologies.stream(ticketAssignment, AckAgg.list[Option[Long]])(t => propagateAssignment(t.input))

@@ -1,12 +1,45 @@
 package flow
 
 import com.rpl.rama.{Agg, Block, Path}
+import com.rpl.rama
 import com.rpl.rama.module.StreamSourceOptions
 import com.rpl.rama.ops.{RamaAccumulatorAgg1, RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
+import com.rpl.rama.RamaModule.Setup
+import com.rpl.rama.RamaModule
+import flow.IdentityNamespace.Query
+import com.rpl.rama.module.StreamTopology
+import com.rpl.rama.ops.RamaAccumulatorAgg
 
-/** Compiles the [[Node]] AST to a `com.rpl.rama.Block`.
-  */
+class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
+	import RamaBackend._
+	def install(topologies: flow.Topologies): Unit = {
+		// TODO: would you ever need multiple stream topologies?
+		val streamTopology = ramaTopologies.stream("main")
+
+		topologies.ids.foreach { id =>
+			id.namespace match {
+				// TODO schema + partitioning config
+				case flow.IdentityNamespace.PState => streamTopology.pstate(compileIdentity(id), classOf[Object])
+				case flow.IdentityNamespace.Depot => setup.declareDepot(compileIdentity(id), rama.Depot.random())
+				case _ => ()
+			}
+		}
+
+		topologies.topologies.foreach { t =>
+			val id = t.builder.source
+			val compiled = compileNodes(t.compiled._1)
+			val block = t.builder.source.namespace match {
+				case IdentityNamespace.Depot => Some(streamTopology.source(compileIdentity(id)))
+				case IdentityNamespace.Query => Some(ramaTopologies.query(compileIdentity(id)))
+				case IdentityNamespace.PState => None
+			}
+			block.foreach(_.out(compileVar(t.input)).`macro`(compiled))
+		}
+	}
+}
+
 object RamaBackend {
+	def apply(setup: RamaModule.Setup, topologies: RamaModule.Topologies) = new RamaBackend(setup, topologies)
 
 	private def fn1[A, B](f: A => B): RamaFunction1[A, B] = new RamaFunction1[A, B] {
 		def invoke(a: A): B = f(a)
@@ -70,12 +103,15 @@ object RamaBackend {
 
 		case Node.Partition(in) => Block.hashPartition(compileVar(in))
 
-		case Node.Scope(inner, collectFrom, out) =>
-			// Rama's `agg` collapses an implicit region; here the region is exactly the
-			// nested block, which is what makes `aggList`'s type change meaningful.
+		case Node.AggList(block, collectFrom, out) =>
 			Block.create()
-				.`macro`(compileNodes(inner))
+				.`macro`(compileNodes(block))
 				.`macro`(Block.agg(Agg.list(compileVar(collectFrom))).out(compileVar(out)))
+
+		case Node.Agg(block, agg, collectFrom, out) =>
+			Block.create()
+				.`macro`(compileNodes(block))
+				.`macro`(Block.agg(Agg.accumulator(compileQueryAgg(agg), compileVar(collectFrom))).out(compileVar(out)))
 
 		case Node.Select(ps, key, out) =>
 			Block.localSelect(compileIdentity(ps), Path.key(compileVar(key))).out(compileVar(out))
@@ -123,8 +159,7 @@ object RamaBackend {
 		block: Block.Impl,
 		sourceOptions: StreamSourceOptions.Impl)
 
-	/** How an [[AckAgg]] is declared to Rama: a source option, not part of the block.
-	  */
+	// compile ackAgg for a stream
 	private def compileAckAgg(agg: AckAgg[?, ?]): StreamSourceOptions.Impl =
 		StreamSourceOptions.ackReturnAgg(new RamaAccumulatorAgg1[Any, Any] {
 			def initVal(): Any = null
@@ -137,14 +172,23 @@ object RamaBackend {
 			}
 		})
 
-	/** Compile a declared topology, reporting the names its input and result are bound to.
-	  */
-	def compile[S, R](t: Topology[S, R]): Compiled = {
-		val (nodes, result) = t.compiled
-		val out = t.builder.source.namespace match {
-			case IdentityNamespace.Query => Some(result)
-			case _ => None
+	// compile ackAgg for a query
+	private def compileQueryAgg[O, R](agg: AckAgg[O, R]): RamaAccumulatorAgg1[Option[R], O] = {
+		new RamaAccumulatorAgg1[Option[R], O] {
+			private var current: Option[R] = None
+			override def initVal(): Option[R] = None
+			override def accumulate(current: Option[R], value: O): Option[R] = {
+				Some(current.fold(agg.map(value)) { current => agg.combine(current, agg.map(value)) })
+			}
 		}
-		Compiled(t.builder.source, t.input, out, compileNodes(nodes), compileAckAgg(t.ackAgg))
 	}
+
+	// def compile[S, R](t: Topology[S, R]): Compiled = {
+	// 	val (nodes, result) = t.compiled
+	// 	val out = t.builder.source.namespace match {
+	// 		case IdentityNamespace.Query => Some(result)
+	// 		case _ => None
+	// 	}
+	// 	Compiled(t.builder.source, t.input, out, compileNodes(nodes), compileAckAgg(t.ackAgg))
+	// }
 }
