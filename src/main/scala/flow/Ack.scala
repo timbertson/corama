@@ -55,12 +55,8 @@ final class AckReturns private[flow] (
 	private val values: Map[TopologyId, List[Any]],
 	private val topologies: Topologies) {
 
-	// TODO: assert topology is a Stream, not a Microbatch
-	def result[S, R](t: Topology[S, R]): R = {
-		// TODO: make this impossible via types?
-		require(
-			t.builder.source.namespace == IdentityNamespace.Depot,
-			s"${t.builder.source} is not a stream topology, so it cannot produce an ack return")
+	def result[S, R](stream: StreamTopology[S, R]): R = {
+		val t = stream.topology
 		require(
 			topologies.declared(t),
 			s"${t.builder.source} was not declared in the module this append went to")
@@ -68,12 +64,12 @@ final class AckReturns private[flow] (
 		values.getOrElse(t.builder.id, Nil).foldLeft(t.agg.zero)(t.agg.combineAny)
 	}
 
-	def unique[S, T, M <: Seq[T]](t: Topology[S, M]): Try[T] = {
-		val seq = result[S, M](t)
+	def unique[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[T] = {
+		val seq = result[S, M](stream)
 		if (seq.length == 1) {
 			Success(seq.head)
 		} else {
-			Failure(new RuntimeException(s"Expected ${t.builder.source} to produce 1 element, but received ${seq.length}"))
+			Failure(new RuntimeException(s"Expected ${stream.topology.builder.source} to produce 1 element, but received ${seq.length}"))
 		}
 	}
 

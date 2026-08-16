@@ -104,9 +104,9 @@ final class Topologies {
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
 	def query[Input, Output](name: String, agg: Agg[Output])(
-		block: TopologyBuilder[Input] => Flow[Output, QueryReturning[Output]],
-	): Topology[Input, Output] = {
-		declare[Input, Output, QueryReturning[Output]](claim(Identity(IdentityNamespace.Query, name)), agg)(block)
+		block: TopologyBuilder[Input] => Flow[Output, QueryContext],
+	): QueryTopology[Input, Output] = {
+		QueryTopology(declare[Input, Output, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg)(block))
 	}
 
 	/** Attach a stream topology to a depot: driven by an append, writes PStates,
@@ -130,8 +130,8 @@ final class Topologies {
 	  */
 	def stream[A, O](depot: Depot[A], agg: Agg[O])(
 		block: TopologyBuilder[A] => Flow[Unit, StreamContext[O]]
-	): Topology[A, O] = {
-		declare[A, O, StreamContext[O]](depot.id, agg)(block)
+	): StreamTopology[A, O] = {
+		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg)(block))
 	}
 
 	private def declare[A, R, C](source: Identity, agg: Agg[R])(
@@ -162,6 +162,11 @@ final case class Topology[S, R](
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
 }
+
+// wrappers for the different types of topology
+final case class QueryTopology[S, R] private[flow](topology: Topology[S, R])
+
+final case class StreamTopology[S, R] private[flow](topology: Topology[S, R])
 
 /** A description of a fragment emitting 0..n values of type `A`, which requires a
   * context providing `Ctx` to run in. A fragment requiring nothing is `Flow[A, Any]`.

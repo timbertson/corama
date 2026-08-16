@@ -39,7 +39,7 @@ sealed trait Batch
 sealed trait Etl
 
 /** A query topology provides batch (but no writes) */
-sealed trait QueryReturning[O] extends Batch
+sealed trait QueryContext extends Batch
 
 /** Requires a topology whose ack returns are values of type `O`.
   *

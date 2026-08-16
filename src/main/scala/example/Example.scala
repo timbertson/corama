@@ -91,10 +91,10 @@ object Example extends IOApp {
 		} yield tickets
 	}
 
-	val userTicketsQuery: Topology[Long, List[Ticket]] =
+	val userTicketsQuery: QueryTopology[Long, List[Ticket]] =
 		topologies.query[Long, List[Ticket]]("userTickets", Agg.list[Ticket])(t => listUserTickets(t.input))
 
-	val assigning: Topology[Assignment, List[Option[Long]]] =
+	val assigning: StreamTopology[Assignment, List[Option[Long]]] =
 		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(t => propagateAssignment(t.input))
 
 	override def run(args: List[String]): IO[ExitCode] = {
@@ -115,6 +115,7 @@ object Example extends IOApp {
 				_ <- interp.put(userTickets, 111L, Set(1L, 2L))
 				_ <- interp.put(userTickets, 222, Set(3L))
 
+				_ = println("Getting user tickets")
 				listed <- interp.invoke(userTicketsQuery, 111L)
 				_ = println(s"  user 111 tickets: $listed")
 

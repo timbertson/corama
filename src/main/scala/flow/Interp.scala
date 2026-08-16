@@ -189,22 +189,13 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 
 	/** Invoke a query topology, as a client would.
 	  */
-	def invoke[S, R](q: Topology[S, R], value: S): IO[R] = {
-		// TODO: wrap a QueryTopology(topology) instead of asserting
-		val source = q.builder.source
-		require(source.namespace == IdentityNamespace.Query, s"${source} is not a query")
-		
-		val env: Env = Map(q.builder.input.vid -> value)
-		// `ack` is None: a query is invoked by a client and returns its value directly,
-		// so there is no append waiting on an event tree.
-		// The cast is sound by `Topologies.query`, which only accepts a `Flow[R, ...]`;
-		// `Topology` stores the flow existentially because a *stream* sources its `R`
-		// from `ackAgg` instead.
-		partitions.random.continue(q.compiled._1, List(env)).map {
-			case List(resultEnv: Env) => {
-				resultEnv.getOrElse(q.compiled._2.vid, throw new RuntimeException("output var not present in query result")).asInstanceOf[R]
+	def invoke[S, R](q: QueryTopology[S, R], value: S): IO[R] = {
+		val topology = q.topology
+		val env: Env = Map(topology.builder.input.vid -> value)
+		partitions.random.continue(topology.compiled._1, List(env)).map { resultEnvs =>
+			resultEnvs.foldLeft(topology.agg.zero) { (acc, resultEnv) =>
+				topology.agg.combineAny(acc, resultEnv.getOrElse(topology.compiled._2.vid, throw new RuntimeException("output var not present in query result")))
 			}
-			case other => throw new IllegalStateException(s"query '${q.builder.source}' emitted ${other.length} values, expected exactly 1: $other")
 		}
 	}
 }
