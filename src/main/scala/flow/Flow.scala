@@ -2,6 +2,7 @@ package flow
 
 import cats.Functor
 import cats.Applicative
+import scala.annotation.unused
 
 private[flow] final class VarId(private[flow] val id: Int, private[flow] val hint: String) {
 	override def equals(other: Any): Boolean = other match {
@@ -13,6 +14,8 @@ private[flow] final class VarId(private[flow] val id: Int, private[flow] val hin
 }
 
 final class Var[A] private[flow] (private[flow] val vid: VarId) {
+
+	def foreach[B](f: A => Unit): Flow[Unit, Any] = Flow.Each1(this, f)
 
 	def map[B](f: A => B): Flow[B, Any] = Flow.Each1(this, f)
 
@@ -97,9 +100,9 @@ final class Topologies {
 		identity
 	}
 
-	def pstate[K, V](name: String): PState[K, V] = PState[K, V](claim(Identity(IdentityNamespace.PState, name)))
+	def pstate[K, V](name: String, @unused /* TODO */ schame: Any = ()): PState[K, V] = PState[K, V](claim(Identity(IdentityNamespace.PState, name)))
 
-	def depot[A](name: String): Depot[A] = Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
+	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] = Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
 
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
@@ -114,6 +117,8 @@ final class Topologies {
 	  *
 	  * The context provided is `StreamContext[Nothing]`, so [[Flow.ackReturn]] does not
 	  * compile here — there is no declared aggregator for a value to reach.
+	  *
+		* TODO: does the block need to accept TopologyBuilder, or is Flow[A] / Var[A] enough?
 	  */
 	def stream[A](depot: Depot[A])(
 		block: TopologyBuilder[A] => Flow[Unit, StreamContext[Nothing]]
@@ -254,9 +259,11 @@ private case class Identity(namespace: IdentityNamespace, name: String)
 final case class PState[K, V](id: Identity) {
 	def get(key: Var[K]): Flow[Option[V], Any] = Flow.Select(this, key)
 
+	def getOrElse(key: Var[K], dfl: V): Flow[V, Any] = Flow.Select(this, key).flatMap(v => v.map(_.getOrElse(dfl)))
+
 	def update(key: Var[K])(f: Option[V] => Option[V]): Flow[Unit, Etl] = Flow.Update(this, key, f)
 
-	def updateWith[A](key: Var[K], arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit, Etl] =
+	def update[A](key: Var[K], arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit, Etl] =
 		Flow.UpdateWith(this, key, arg, f)
 
 	def put(key: Var[K], value: Var[V]): Flow[Unit, Etl] = Flow.Put(this, key, value)

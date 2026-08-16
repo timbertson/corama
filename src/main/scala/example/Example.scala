@@ -2,6 +2,7 @@ package flow
 
 import cats.syntax.all._
 import cats.effect._
+import java.lang.{Long => JLong}
 
 /** A slice of `example.HelloWorldModule` rewritten in [[Flow]], as an API check.
   *
@@ -45,7 +46,7 @@ object Example extends IOApp {
 			existing <- fullTickets.get(ticketId)
 			_ <- existing.filter(_.isDefined)
 			previousOwner <- existing.map(_.flatMap(_.assignee))
-			_ <- fullTickets.updateWith(ticketId, newOwner) { (cur, owner) =>
+			_ <- fullTickets.update(ticketId, newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
 			previousOwnerList <- previousOwner.into[List]
@@ -53,7 +54,7 @@ object Example extends IOApp {
 			// Partition by the new owner: add the ticket to their set.
 			// This write is in a different transaction (in terms of pstate upates)
 			_ <- Flow.hashPartition(newOwner)
-			_ <- userTickets.updateWith(newOwner, ticketId) { (prev, tid) =>
+			_ <- userTickets.update(newOwner, ticketId) { (prev, tid) =>
 				Some(prev.getOrElse(Set.empty) + tid)
 			}
 
@@ -66,7 +67,7 @@ object Example extends IOApp {
 			_ <- hop.filter(_.isDefined)
 			oldOwner <- hop.map(_.get)
 			_ <- Flow.hashPartition(oldOwner)
-			_ <- userTickets.updateWith(oldOwner, ticketId) { (prev, tid) =>
+			_ <- userTickets.update(oldOwner, ticketId) { (prev, tid) =>
 				prev.map(_ - tid)
 			}
 			done <- Flow.unit
