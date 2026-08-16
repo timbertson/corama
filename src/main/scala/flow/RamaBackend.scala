@@ -160,35 +160,19 @@ object RamaBackend {
 		sourceOptions: StreamSourceOptions.Impl)
 
 	// compile ackAgg for a stream
-	private def compileAckAgg(agg: AckAgg[?, ?]): StreamSourceOptions.Impl =
+	private def compileAckAgg(agg: flow.Agg[?]): StreamSourceOptions.Impl =
 		StreamSourceOptions.ackReturnAgg(new RamaAccumulatorAgg1[Any, Any] {
-			def initVal(): Any = null
+			def initVal(): Any = agg.zero
 			def accumulate(acc: Any, value: Any): Any = {
-				if (acc == null) {
-					agg.mapAny(value)
-				} else {
-					agg.mapCombineAny(acc, value)
-				}
+				agg.combineAny(acc, value)
 			}
 		})
 
 	// compile ackAgg for a query
-	private def compileQueryAgg[O, R](agg: AckAgg[O, R]): RamaAccumulatorAgg1[Option[R], O] = {
-		new RamaAccumulatorAgg1[Option[R], O] {
-			private var current: Option[R] = None
-			override def initVal(): Option[R] = None
-			override def accumulate(current: Option[R], value: O): Option[R] = {
-				Some(current.fold(agg.map(value)) { current => agg.combine(current, agg.map(value)) })
-			}
+	private def compileQueryAgg[O](agg: flow.Agg[O]): RamaAccumulatorAgg1[O, O] = {
+		new RamaAccumulatorAgg1[O, O] {
+			override def initVal(): O = agg.zero
+			override def accumulate(current: O, value: O): O = agg.combine(current, value)
 		}
 	}
-
-	// def compile[S, R](t: Topology[S, R]): Compiled = {
-	// 	val (nodes, result) = t.compiled
-	// 	val out = t.builder.source.namespace match {
-	// 		case IdentityNamespace.Query => Some(result)
-	// 		case _ => None
-	// 	}
-	// 	Compiled(t.builder.source, t.input, out, compileNodes(nodes), compileAckAgg(t.ackAgg))
-	// }
 }

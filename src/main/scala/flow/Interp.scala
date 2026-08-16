@@ -350,9 +350,8 @@ class Partition(interpreter: Interpreter) {
 			case Node.Agg(block, agg, collectFrom, out) :: tail => {
 				envs.traverse { env =>
 					continue(block, List(env), ack).map { innerEnvs =>
-						env.updated(out, innerEnvs.foldLeft(Option.empty[Any]) { (acc, innerEnv) =>
-							val item = innerEnv(collectFrom)
-							acc.fold(Some(agg.mapAny(item)))(acc => Some(agg.mapCombineAny(acc, item)))
+						env.updated(out, innerEnvs.foldLeft(agg.zero) { (acc, innerEnv) =>
+							agg.combineAny(acc, innerEnv(collectFrom))
 						})
 					}
 				}.flatMap { outputEnvs =>

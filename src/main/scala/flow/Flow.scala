@@ -1,5 +1,8 @@
 package flow
 
+import cats.Functor
+import cats.Applicative
+
 private[flow] final class VarId(private[flow] val id: Int, private[flow] val hint: String) {
 	override def equals(other: Any): Boolean = other match {
 		case that: VarId => that.id == id
@@ -12,6 +15,8 @@ private[flow] final class VarId(private[flow] val id: Int, private[flow] val hin
 final class Var[A] private[flow] (private[flow] val vid: VarId) {
 
 	def map[B](f: A => B): Flow[B, Any] = Flow.Each1(this, f)
+
+	def into[F[_]](using f: Applicative[F]): Flow[F[A], Any] = Flow.Each1(this, f.pure)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
 	def explode[B](f: A => Seq[B]): Flow[B, Any] = Flow.ExplodeOp(this, f)
@@ -98,8 +103,8 @@ final class Topologies {
 
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
-	def query[Input, Item, Output](name: String, agg: AckAgg[Item, Output])(
-		block: TopologyBuilder[Input] => Flow[Item, QueryReturning[Output]],
+	def query[Input, Output](name: String, agg: Agg[Output])(
+		block: TopologyBuilder[Input] => Flow[Output, QueryReturning[Output]],
 	): Topology[Input, Output] = {
 		declare[Input, Output, QueryReturning[Output]](claim(Identity(IdentityNamespace.Query, name)), agg)(block)
 	}
@@ -113,7 +118,7 @@ final class Topologies {
 	def stream[A](depot: Depot[A])(
 		block: TopologyBuilder[A] => Flow[Unit, StreamContext[Nothing]]
 	): Topology[A, Unit] = {
-		declare[A, Unit, StreamContext[Nothing]](depot.id, AckAgg.unit)(block)
+		declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit)(block)
 	}
 
 	/** Attach a stream topology that hands a value back to whoever appended.
@@ -123,13 +128,13 @@ final class Topologies {
 	  * the one value an `AckLevel.Ack` append reads out of [[AckReturns]]. Rama declares
 	  * it the same way, as `StreamSourceOptions.ackReturnAgg`.
 	  */
-	def stream[A, O, R](depot: Depot[A], agg: AckAgg[O, R])(
+	def stream[A, O](depot: Depot[A], agg: Agg[O])(
 		block: TopologyBuilder[A] => Flow[Unit, StreamContext[O]]
-	): Topology[A, R] = {
-		declare[A, R, StreamContext[O]](depot.id, agg)(block)
+	): Topology[A, O] = {
+		declare[A, O, StreamContext[O]](depot.id, agg)(block)
 	}
 
-	private def declare[A, R, C](source: Identity, agg: AckAgg[?, R])(
+	private def declare[A, R, C](source: Identity, agg: Agg[R])(
 		block: TopologyBuilder[A] => Flow[?, C]
 	): Topology[A, R] = {
 		val b = new TopologyBuilder[A](TopologyId(built.length), source)
@@ -153,7 +158,7 @@ object Topologies {
 final case class Topology[S, R](
 	builder: TopologyBuilder[S],
 	flow: Flow[?, Nothing],
-	ackAgg: AckAgg[?, R]) {
+	agg: Agg[R]) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
 }
@@ -175,7 +180,7 @@ sealed trait Flow[A, -Ctx] {
 	// TODO: remove?
 	def aggList: Flow[List[A], Ctx & Batch] = Flow.AggList(this)
 
-	def agg[B](agg: AckAgg[A, B]): Flow[B, Ctx & Batch] = Flow.Agg(this, agg)
+	def agg[B](agg: flow.Agg[B]): Flow[B, Ctx & Batch] = Flow.Agg(this, agg)
 
 	// def query[R](agg: AckAgg[A, R]) = {
 	// 	new Query[A, R, Ctx](this, agg)
@@ -196,7 +201,7 @@ object Flow {
 	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
 	private[flow] case class Bind[A, B, C1, C2](fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
 	private[flow] case class AggList[A, C](block: Flow[A, C]) extends Flow[List[A], C & Batch]
-	private[flow] case class Agg[A, B, C](block: Flow[A, C], agg: AckAgg[A, B]) extends Flow[B, C & Batch]
+	private[flow] case class Agg[A, B, C](block: Flow[A, C], agg: flow.Agg[B]) extends Flow[B, C & Batch]
 
 	// PState. Reads are available anywhere — a query topology reads PStates, that is
 	// what it is for. Writes require `Etl`: "a PState can only be updated by the ETL
@@ -281,7 +286,7 @@ private[flow] object Node {
 	// TODO: this is a special case of Agg, is it necessary?
 	case class AggList(block: List[Node], collectFrom: VarId, out: VarId) extends Node
 
-	case class Agg(block: List[Node], agg: AckAgg[?,?], collectFrom: VarId, out: VarId) extends Node
+	case class Agg(block: List[Node], agg: flow.Agg[?], collectFrom: VarId, out: VarId) extends Node
 
 	case class Select(pstate: Identity, key: VarId, out: VarId) extends Node
 	case class Update(pstate: Identity, key: VarId, fn: Option[Any] => Option[Any]) extends Node

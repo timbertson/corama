@@ -23,54 +23,40 @@ object AckLevel {
 	case object Ack extends AckLevel[AckReturns]
 }
 
-/** How return values are combined. This is used for both
- * streaming ack returns, and also for query returns.
- *
- * `prepare` always happens locally.
- * `combine` happens locally to combine multiple local results,
- * and again when combining results from multiple partitions.
- */
-final class AckAgg[O, R] private[flow] (
-	private[flow] val map: O => R,
-	// private[flow] val zero: R,
-	private[flow] val combine: (R, R) => R
+final class Agg[A] private[flow] (
+	private[flow] val zero: A,
+	private[flow] val combine: (A, A) => A
 ) {
-
-	private[flow] def merge(values: NonEmptyList[O]): R = values.map(map).reduceLeft(combine)
-
-	private[flow] def mergeAny(values: List[Any]): Option[R] =
-		NonEmptyList.fromList(values.asInstanceOf[List[O]]).map(merge)
-
-	private[flow] def mapAny(value: Any): R = map(value.asInstanceOf[O])
-	private[flow] def mapCombineAny(acc: Any, value: Any): R = combine(acc.asInstanceOf[R], mapAny(value))
+	private[flow] def merge(values: List[A]): A = values.foldLeft(zero)(combine)
+	private[flow] def mergeAny(values: List[Any]): A = merge(values.asInstanceOf[List[A]])
+	private[flow] def combineAny(a: Any, b: Any): A = combine(a.asInstanceOf[A], b.asInstanceOf[A])
 }
 
-object AckAgg {
-	def apply[O, R](map: O => R, combine: (R, R) => R): AckAgg[O, R] = new AckAgg(map, combine)
+object Agg {
+	def apply[A](zero: A, combine: (A, A) => A): Agg[A] = new Agg(zero, combine)
 
 	// Collect act returns into a sequence (monoid)
-	def collect[A, M[_]](using app: Applicative[M], m: Monoid[M[A]]): AckAgg[A, M[A]] = {
-		new AckAgg[A, M[A]](app.pure, m.combine)
+	def collect[A, M[_]](using app: Applicative[M], m: Monoid[M[A]]): Agg[M[A]] = {
+		new Agg[M[A]](m.empty, m.combine)
 	}
 
 	// convenience overload of collect to hardcode the List type
-	def list[O]: AckAgg[O, List[O]] = collect
+	def list[A]: Agg[List[A]] = collect
 
 	// return nothing, accumulate nothing
-	def unit: AckAgg[Unit, Unit] = apply(_ => (), (_, _) => ())
+	def unit: Agg[Unit] = apply((), (_, _) => ())
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.
   *
-  * Values arrive as a list per topology — one entry per branch that reached `ackReturn` —
-  * and are reduced by that topology's own [[AckAgg]] on the way out.
+  * Values arrive as a list per topology. TODO: could these be pre-combined with agg?
   */
 final class AckReturns private[flow] (
 	private val values: Map[TopologyId, List[Any]],
 	private val topologies: Topologies) {
 
 	// TODO: assert topology is a Stream, not a Microbatch
-	def result[S, R](t: Topology[S, R]): Option[R] = {
+	def result[S, R](t: Topology[S, R]): R = {
 		// TODO: make this impossible via types?
 		require(
 			t.builder.source.namespace == IdentityNamespace.Depot,
@@ -79,19 +65,15 @@ final class AckReturns private[flow] (
 			topologies.declared(t),
 			s"${t.builder.source} was not declared in the module this append went to")
 
-		val raw = values.getOrElse(t.builder.id, Nil)
-		t.ackAgg.mergeAny(raw)
+		values.getOrElse(t.builder.id, Nil).foldLeft(t.agg.zero)(t.agg.combineAny)
 	}
 
-	// if the result is already a monoid, we can collapse the Option into empty
-	def results[S, R : Monoid](t: Topology[S, R]): R = {
-		result(t).getOrElse(Monoid[R].empty)
-	}
-
-	def unique[S, T, R <: Seq[T]](t: Topology[S, R]): Try[T] = {
-		result(t) match {
-			case Some(seq) if seq.length == 1 => Success(seq.head)
-			case other => Failure(new RuntimeException(s"Expected ${t.builder.source} to produce 1 element, but received ${other.map(_.length).getOrElse(0)}"))
+	def unique[S, T, M <: Seq[T]](t: Topology[S, M]): Try[T] = {
+		val seq = result[S, M](t)
+		if (seq.length == 1) {
+			Success(seq.head)
+		} else {
+			Failure(new RuntimeException(s"Expected ${t.builder.source} to produce 1 element, but received ${seq.length}"))
 		}
 	}
 

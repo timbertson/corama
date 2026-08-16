@@ -33,7 +33,7 @@ object Example extends IOApp {
 	  * below contributes: this fragment only goes in a topology declared to aggregate
 	  * ack returns of that type.
 	  */
-	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit, Etl & AckReturning[Option[Long]]] =
+	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit, Etl & AckReturning[List[Option[Long]]]] =
 		for {
 			ticketId <- assignment.map(_.ticketId)
 			newOwner <- assignment.map(_.assigneeId)
@@ -48,6 +48,7 @@ object Example extends IOApp {
 			_ <- fullTickets.updateWith(ticketId, newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
+			previousOwnerList <- previousOwner.into[List]
 
 			// Partition by the new owner: add the ticket to their set.
 			// This write is in a different transaction (in terms of pstate upates)
@@ -58,7 +59,7 @@ object Example extends IOApp {
 
 			// Report the previous owner to whoever appended. This runs on the ticket's
 			// partition, but the result is routed back to the appender.
-			_ <- Flow.ackReturn(previousOwner)
+			_ <- Flow.ackReturn(previousOwnerList)
 
 			// And remove from the previous owner, when there was a different one.
 			hop <- Flow.map2(previousOwner, newOwner)((prev, now) => prev.filter(_ != now))
@@ -74,7 +75,7 @@ object Example extends IOApp {
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
 	  * own partition, then collapse the results back into a single list.
 	  */
-	def listUserTickets(userId: Var[Long]): Flow[Ticket, Any] = {
+	def listUserTickets(userId: Var[Long]): Flow[List[Ticket], Any] = {
 		for {
 			_ <- Flow.hashPartition(userId)
 			ids <- userTickets.get(userId)
@@ -86,14 +87,15 @@ object Example extends IOApp {
 			full <- fullTickets.get(ticketId)
 			_ <- full.filter(_.isDefined)
 			ticket <- full.map(_.get.ticket)
-		} yield ticket
+			tickets <- ticket.into[List]
+		} yield tickets
 	}
 
 	val userTicketsQuery: Topology[Long, List[Ticket]] =
-		topologies.query[Long, Ticket, List[Ticket]]("userTickets", AckAgg.list[Ticket])(t => listUserTickets(t.input))
+		topologies.query[Long, List[Ticket]]("userTickets", Agg.list[Ticket])(t => listUserTickets(t.input))
 
 	val assigning: Topology[Assignment, List[Option[Long]]] =
-		topologies.stream(ticketAssignment, AckAgg.list[Option[Long]])(t => propagateAssignment(t.input))
+		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(t => propagateAssignment(t.input))
 
 	override def run(args: List[String]): IO[ExitCode] = {
 		println("flow.Example")
