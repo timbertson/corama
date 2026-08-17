@@ -22,7 +22,12 @@ final class Var[A] private[flow] (private[flow] val vid: VarId) {
 
 	def foreach[B](f: A => Unit): Flow[Unit, Any] = Flow.Each1(this, f)
 
+	// TODO more structured way of handling multiple arguments (vars)?
 	def map[B](f: A => B): Flow[B, Any] = Flow.Each1(this, f)
+
+	def each(f: A => Unit): Flow[Unit, Any] = Flow.Each1(this, f)
+
+	def mapWith[B, C](b: Var[B])(f: (A, B) => C): Flow[C, Any] = Flow.Each2(this, b, f)
 
 	def into[F[_]](using f: Applicative[F]): Flow[F[A], Any] = Flow.Each1(this, f.pure)
 
@@ -46,8 +51,8 @@ object Var {
 	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"))
 
 	extension [A](v: Var[Option[A]]) {
-		def fold[B, C1, C2](ifNone: Flow[B, C1])(ifSome: Var[A] => Flow[B, C2]): Flow[B, C1 & C2] =
-			Flow.If[B, Any, C1, C2](
+		def fold[B, C](ifNone: Flow[B, C])(ifSome: Var[A] => Flow[B, C]): Flow[B, C] =
+			Flow.If[B, Any, C, C](
 				v.map(_.isEmpty),
 				ifNone,
 				v.map(_.get).flatMap(ifSome)
@@ -244,7 +249,13 @@ object Flow {
 
 	private[flow] case class AckReturn[O](value: Var[O]) extends Flow[Unit, AckReturning[O]]
 
-	def pure[A](v: Var[A]): Flow[A, Any] = Pure(v)
+	def of[A](v: Var[A]): Flow[A, Any] = Pure(v)
+
+	def pure[A](value: A): Flow[A, Any] = {
+		// TODO this can probably be optimised
+		Flow.Each0(() => value)
+	}
+
 
 	def foreach[O](f: () => O): Flow[O, Any] = Each0(f)
 

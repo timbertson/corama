@@ -6,6 +6,7 @@ import com.rpl.rama.RamaModule
 import com.rpl.rama
 import dsl.JLong
 import scala.annotation.unused
+import flow.Example.ticketAssignment
 
 class RamaExample extends RamaModule {
 	// import RamaModule._
@@ -24,8 +25,8 @@ class RamaExample extends RamaModule {
 
 	// user-initiated mutations
 	val userRegistration = topologies.depot[User]("userRegistration", rama.Depot.hashBy(classOf[UserPartitionKey]))
-	topologies.depot[TicketAssignment]("ticketAssignment", rama.Depot.hashBy(classOf[AssignmentPartitioner]))
-	topologies.depot[UserNameChange]("userNameChange", rama.Depot.hashBy(classOf[UserNameChangePartitioner]))
+	val ticketAssignment = topologies.depot[TicketAssignment]("ticketAssignment", rama.Depot.hashBy(classOf[AssignmentPartitioner]))
+	val userNameChange = topologies.depot[UserNameChange]("userNameChange", rama.Depot.hashBy(classOf[UserNameChangePartitioner]))
 
 	// internal
 	val mergedUserChange = topologies.depot[User]("mergedUserChange", rama.Depot.hashBy(classOf[UserPartitionKey]))
@@ -61,66 +62,58 @@ class RamaExample extends RamaModule {
 		for {
 			userId <- user.map(_.id)
 			existing <- users.get(userId)
-			result <- existing.fold {
+			result <- existing.fold[Either[UserAlreadyExists, Unit], flow.Etl] {
 				// no existing user
 				for {
-					_ <- users.put(userId, user)
 					_ <- mergedUserChange.localAppend(user)
-				} yield Var.unit
+					result <- Flow.pure(Right(()) : Either[UserAlreadyExists, Unit])
+				} yield result
 			} { (existing: Var[?]) =>
-				userId.map(uid => Left(UserAlreadyExists))
+				userId.map(uid => Left(new UserAlreadyExists(uid)))
 			}
-		} yield result
+			_ <- Flow.ackReturn(result)
+		} yield Var.unit
 	}
 
-		// .each(Ops.CURRENT_TASK_ID).out("*taskId")
-		// .each(Ops.PRINTLN, "*user", "on task", "*taskId")
-		// .each((t: User) => t.id, "*user").out("*id")
+	val nameChangeStream = topologies.stream(userNameChange, Agg.error[NoSuchUser]) { t =>
+		val change = t.input
+		for {
+			userId <- change.map(_.userId)
+			existing <- users.get(userId)
+			result <- existing.fold {
+				userId.map { uid =>
+					Left(NoSuchUser(uid))
+				}
+			} { existing =>
+				for {
+					user <- existing.mapWith(change) { (existing, change) =>
+						existing.copy(name = change.name)
+					}
+					_ <- mergedUserChange.localAppend(user)
+					// TODO it's a bit awkward to return something
+					result <- Flow.pure[Either[NoSuchUser, Unit]](Right(()))
+				} yield result
+			}
+			_ <- Flow.ackReturn(result)
+		} yield Var.unit
+	}
 
-		// .localSelect("$$user", Path.key("*id")).out("*existing")
-		// .ifTrue(new Expr(Ops.EQUAL, null, "*existing"),
-		// 	Block.localTransform("$$user",
-		// 			Path.key("*id").termVal("*user")
-		// 	)
-		// 	.depotPartitionAppend("*mergedUserChange", "*user")
-		// 	.ackReturn(null)
-		// 	, // else
-		// 	Block
-		// 		.each(UserAlreadyExists.apply, "*id").out("*error")
-		// 		.ackReturn("*error")
-		// )
-
-	// s.source("*userNameChange").out("*change")
-	// 	.each(Ops.CURRENT_TASK_ID).out("*taskId")
-	// 	.each(Ops.PRINTLN, "*change", "on task", "*taskId")
-	// 	.each((t: UserNameChange) => t.userId, "*change").out("*userId")
-
-	// 	.localSelect("$$user", Path.key("*userId")).out("*prev")
-	// 	.ifTrue(new Expr(Ops.IS_NOT_NULL, "*prev"),
-	// 		Block.each(
-	// 			(prev: User, change: UserNameChange) => {
-	// 				prev.copy(name = change.name)
-	// 			}, "*prev", "*change").out("*user")
-	// 			.localTransform("$$user",
-	// 				Path.key("*userId").termVal("*user")
-	// 			)
-	// 			.depotPartitionAppend("*mergedUserChange", "*user").out("*appendResult")
-	// 			.ackReturn("*appendResult")
-	// 		, // else
-	// 		Block
-	// 			.each(NoSuchUser.apply, "*userId").out("*error")
-	// 			.ackReturn("*error")
-	// 	)
-
-	// // When user changes (from either userRegistration or userNameChange),
-	// // update the user view in $$userTickets
-	// s.source("*mergedUserChange").out("*user")
-	// 	.each(Ops.PRINTLN, "Applying merged user change", "*user")
-	// 	.each((t: User) => t.id, "*user").out("*id")
-	// 	.each((id: JLong) => println(s"updating user $id in userTickets"), "*id")
-	// 	.localTransform("$$userTickets",
-	// 		Path.key("*id", "user").termVal("*user")
-	// 	)
+	// When user changes (from either userRegistration or userNameChange),
+	// update the user view in $$userTickets
+	topologies.stream(mergedUserChange) { t =>
+		val user = t.input
+		for {
+			userId <- user.map(_.id)
+			_ <- user.each { user => println(s"Applying merged user change: $user") }
+			// store the new user
+			_ <- users.put(userId, user)
+			// TODO?
+			// _ <- userId.each { id => println(s"Updating user $id in userTickets") }
+			// _ <- userTickets.update(userId, user) { (maybeUserTickets, user) =>
+			// 	maybeUserTickets.map(_.copy(user = user))
+			// }
+		} yield Var.unit
+	}
 
 	// s.source("*ticketAssignment").out("*assignment")
 	// 	.each(Ops.CURRENT_TASK_ID).out("*taskId")
