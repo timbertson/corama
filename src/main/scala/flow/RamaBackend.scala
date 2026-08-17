@@ -1,5 +1,6 @@
 package flow
 
+import cats.syntax.all._
 import com.rpl.rama.{Agg, Block, Path}
 import com.rpl.rama
 import com.rpl.rama.module.StreamSourceOptions
@@ -9,6 +10,7 @@ import com.rpl.rama.RamaModule
 import flow.IdentityNamespace.Query
 import com.rpl.rama.module.StreamTopology
 import com.rpl.rama.ops.RamaAccumulatorAgg
+import com.rpl.rama.ops.RamaFunction0
 
 class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
 	import RamaBackend._
@@ -45,6 +47,10 @@ object RamaBackend {
 		def invoke(a: A): B = f(a)
 	}
 
+	private def fn0[A](f: () => A): RamaFunction0[A] = new RamaFunction0[A] {
+		def invoke(): A = f()
+	}
+
 	// generate a rama varname for the given identity
 	private def compileIdentity(id: Identity) = {
 		id.namespace match {
@@ -65,8 +71,12 @@ object RamaBackend {
 
 	private def eachStep(fn: List[Any] => Any, ins: List[String], out: String): Block.Impl =
 		ins match {
-			case List(a) =>
+			case Nil => {
+				Block.each(fn0[Any](() => fn(Nil))).out(out)
+			}
+			case List(a) => {
 				Block.each(fn1[Any, Any](x => fn(List(x))), a).out(out)
+			}
 			case List(a, b) =>
 				val f2 = new RamaFunction2[Any, Any, Any] {
 					def invoke(x: Any, y: Any): Any = fn(List(x, y))
@@ -101,7 +111,23 @@ object RamaBackend {
 			eachStep(arg => fn(arg).asInstanceOf[Any], List(compileVar(in)), flagName)
 				.`macro`(Block.keepTrue(flagName))
 
+		case Node.If(cond, ifBlock, elseBlock, _) => {
+			Block.ifTrue(
+				compileVar(cond),
+				Block.create().`macro`(compileNodes(ifBlock)),
+				Block.create().`macro`(compileNodes(elseBlock)),
+			)
+		}
+
 		case Node.Partition(in) => Block.hashPartition(compileVar(in))
+
+		case Node.Assign(in, out) =>
+			println(s"Assigning ${in} -> ${out}")
+			if (in === Var.unit.vid) {
+				Block.each(() => ()).out(compileVar(out))
+			} else {
+				Block.each(identity, compileVar(in)).out(compileVar(out))
+			}
 
 		case Node.AggList(block, collectFrom, out) =>
 			Block.create()
@@ -111,10 +137,13 @@ object RamaBackend {
 		case Node.Agg(block, agg, collectFrom, out) =>
 			Block.create()
 				.`macro`(compileNodes(block))
-				.`macro`(Block.agg(Agg.accumulator(compileQueryAgg(agg), compileVar(collectFrom))).out(compileVar(out)))
+				.`macro`(Block.agg(Agg.accumulator(compileAgg(agg), compileVar(collectFrom))).out(compileVar(out)))
 
 		case Node.Select(ps, key, out) =>
-			Block.localSelect(compileIdentity(ps), Path.key(compileVar(key))).out(compileVar(out))
+			Block.localSelect(compileIdentity(ps), Path.key(compileVar(key)))
+				.out(compileVar(out))
+				.each(Option.apply, compileVar(out)) // localselect returns null when not found
+				.out(compileVar(out))
 
 		case Node.Update(ps, key, fn) =>
 			// Rama models read-modify-write as a `term` on the path: the function
@@ -145,31 +174,7 @@ object RamaBackend {
 	private def compileNodes(nodes: List[Node]): Block.Impl =
 		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
 
-	/** What a declared topology compiles to, plus the names Rama needs positionally.
-	  *
-	  * `in` is where the input value must be bound: for a stream that's
-	  * `topologies.stream(name).source(depot).out(in)`, for a query it is the `"*arg"`
-	  * of `topologies.query(name, in)`. `out` is present only for a query — Rama's
-	  * `.out("*result")` — because a stream has no result to name.
-	  */
-	final case class Compiled(
-		source: Identity,
-		in: Var[?],
-		out: Option[Var[?]],
-		block: Block.Impl,
-		sourceOptions: StreamSourceOptions.Impl)
-
-	// compile ackAgg for a stream
-	private def compileAckAgg(agg: flow.Agg[?]): StreamSourceOptions.Impl =
-		StreamSourceOptions.ackReturnAgg(new RamaAccumulatorAgg1[Any, Any] {
-			def initVal(): Any = agg.zero
-			def accumulate(acc: Any, value: Any): Any = {
-				agg.combineAny(acc, value)
-			}
-		})
-
-	// compile ackAgg for a query
-	private def compileQueryAgg[O](agg: flow.Agg[O]): RamaAccumulatorAgg1[O, O] = {
+	private def compileAgg[O](agg: flow.Agg[O]): RamaAccumulatorAgg1[O, O] = {
 		new RamaAccumulatorAgg1[O, O] {
 			override def initVal(): O = agg.zero
 			override def accumulate(current: O, value: O): O = agg.combine(current, value)

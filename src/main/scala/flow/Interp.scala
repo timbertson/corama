@@ -314,11 +314,24 @@ class Partition(interpreter: Interpreter) {
 				}
 				continue(tail, exploded, ack)
 
+			case Node.Assign(in, out) :: tail =>
+				continue(tail, envs.map { env =>
+					env.updated(out, env(in))
+				})
 
 			case Node.Filter(fn, in, _) :: tail =>
 				// The flag var exists for Rama's `keepTrue`; here the predicate prunes
 				// directly, so nothing needs binding.
 				continue(tail, envs.filter(env => fn(env(in))), ack)
+
+			case Node.If(cond, ifBranch, elseBranch, out) :: tail =>
+				envs.flatTraverse { env =>
+					if (env(cond).asInstanceOf[Boolean]) {
+						continue(ifBranch ++ tail, List(env))
+					} else {
+						continue(elseBranch ++ tail, List(env))
+					}
+				}
 
 			case Node.Partition(in) :: tail => {
 				interpreter.partitions.groupByPartitions(envs, env => env(in)).toList.flatTraverse { case (partition, penvs) =>

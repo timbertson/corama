@@ -23,15 +23,15 @@ class RamaExample extends RamaModule {
 	val upstreamTicket = topologies.depot[Ticket]("upstreamTicket", rama.Depot.hashBy(classOf[TicketIdExtractor]))
 
 	// user-initiated mutations
-	topologies.depot[User]("userRegistration", rama.Depot.hashBy(classOf[UserPartitionKey]))
+	val userRegistration = topologies.depot[User]("userRegistration", rama.Depot.hashBy(classOf[UserPartitionKey]))
 	topologies.depot[TicketAssignment]("ticketAssignment", rama.Depot.hashBy(classOf[AssignmentPartitioner]))
 	topologies.depot[UserNameChange]("userNameChange", rama.Depot.hashBy(classOf[UserNameChangePartitioner]))
 
 	// internal
-	topologies.depot[User]("mergedUserChange", rama.Depot.hashBy(classOf[UserPartitionKey]))
+	val mergedUserChange = topologies.depot[User]("mergedUserChange", rama.Depot.hashBy(classOf[UserPartitionKey]))
 	topologies.depot[PropagateTicketAssignment]("propagateTicketAssignment", rama.Depot.hashBy(classOf[PropagateTicketAssignmentKey]))
 
-	topologies.pstate[JLong, User]("user", rama.PState.mapSchema(classOf[JLong], classOf[User]))
+	val users = topologies.pstate[JLong, User]("user", rama.PState.mapSchema(classOf[JLong], classOf[User]))
 
 	// tickets is a set of IDs, subindexed so it can be arbitrarily large
 	val userTickets = topologies.pstate[JLong, List[JLong]]("userTickets", rama.PState.mapSchema(classOf[JLong],
@@ -46,35 +46,49 @@ class RamaExample extends RamaModule {
 	// upstream ticket changes update the fullTicket view
 	topologies.stream[Ticket](upstreamTicket) { t =>
 		val ticket = t.input
-		Var.unit
 		for {
-			_ <- ticket.foreach(println)
-			// id <- ticket.map(_.id)
-			// _ <- fullTicket.update(id, ticket) { (full, upstream) =>
-			// 	println(s"upserting $upstream into $full")
-			// 	Some(full.fold(FullTicket(upstream, None, None))(_.copy(upstream = upstream)))
-			// }
+			id <- ticket.map(_.id)
+			_ <- fullTicket.update(id, ticket) { (full, upstream) =>
+				println(s"upserting $upstream into $full")
+				Some(full.fold(FullTicket(upstream, None, None))(_.copy(upstream = upstream)))
+			}
 		} yield Var.unit
 	}
 
-	// // creates a user (further updates have no effect)
-	// s.source("*userRegistration").out("*user")
-	// 	.each(Ops.CURRENT_TASK_ID).out("*taskId")
-	// 	.each(Ops.PRINTLN, "*user", "on task", "*taskId")
-	// 	.each((t: User) => t.id, "*user").out("*id")
+	// creates a user (further updates have no effect)
+	val registrationStream = topologies.stream(userRegistration, Agg.error[UserAlreadyExists]) { t =>
+		val user = t.input
+		for {
+			userId <- user.map(_.id)
+			existing <- users.get(userId)
+			result <- existing.fold {
+				// no existing user
+				for {
+					_ <- users.put(userId, user)
+					_ <- mergedUserChange.localAppend(user)
+				} yield Var.unit
+			} { (existing: Var[?]) =>
+				userId.map(uid => Left(UserAlreadyExists))
+			}
+		} yield result
+	}
 
-	// 	.localSelect("$$user", Path.key("*id")).out("*existing")
-	// 	.ifTrue(new Expr(Ops.EQUAL, null, "*existing"),
-	// 		Block.localTransform("$$user",
-	// 				Path.key("*id").termVal("*user")
-	// 		)
-	// 		.depotPartitionAppend("*mergedUserChange", "*user")
-	// 		.ackReturn(null)
-	// 		, // else
-	// 		Block
-	// 			.each(UserAlreadyExists.apply, "*id").out("*error")
-	// 			.ackReturn("*error")
-	// 	)
+		// .each(Ops.CURRENT_TASK_ID).out("*taskId")
+		// .each(Ops.PRINTLN, "*user", "on task", "*taskId")
+		// .each((t: User) => t.id, "*user").out("*id")
+
+		// .localSelect("$$user", Path.key("*id")).out("*existing")
+		// .ifTrue(new Expr(Ops.EQUAL, null, "*existing"),
+		// 	Block.localTransform("$$user",
+		// 			Path.key("*id").termVal("*user")
+		// 	)
+		// 	.depotPartitionAppend("*mergedUserChange", "*user")
+		// 	.ackReturn(null)
+		// 	, // else
+		// 	Block
+		// 		.each(UserAlreadyExists.apply, "*id").out("*error")
+		// 		.ackReturn("*error")
+		// )
 
 	// s.source("*userNameChange").out("*change")
 	// 	.each(Ops.CURRENT_TASK_ID).out("*taskId")

@@ -45,6 +45,14 @@ object Agg {
 
 	// return nothing, accumulate nothing
 	def unit: Agg[Unit] = apply((), (_, _) => ())
+
+	def error[E]: Agg[Either[E, Unit]] = new Agg(Right(()), { (curr, next) =>
+		curr.flatMap(_ => next)
+	})
+
+	def either[E, T](initial: T): Agg[Either[E, T]] = new Agg(Right(initial), { (curr, next) =>
+		curr.flatMap(_ => next)
+	})
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.

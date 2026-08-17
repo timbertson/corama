@@ -3,6 +3,7 @@ package flow
 import cats.Functor
 import cats.Applicative
 import scala.annotation.unused
+import cats.Eq
 
 private[flow] final class VarId(private[flow] val id: Int, private[flow] val hint: String) {
 	override def equals(other: Any): Boolean = other match {
@@ -11,6 +12,10 @@ private[flow] final class VarId(private[flow] val id: Int, private[flow] val hin
 	}
 	override def hashCode: Int = id
 	override def toString: String = s"$hint#$id"
+}
+
+object VarId {
+	implicit val eq: Eq[VarId] = Eq.fromUniversalEquals
 }
 
 final class Var[A] private[flow] (private[flow] val vid: VarId) {
@@ -39,6 +44,15 @@ final class Var[A] private[flow] (private[flow] val vid: VarId) {
 object Var {
 	// Virtual vars have a unique id < 0 and are never given a Rama name
 	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"))
+
+	extension [A](v: Var[Option[A]]) {
+		def fold[B, C1, C2](ifNone: Flow[B, C1])(ifSome: Var[A] => Flow[B, C2]): Flow[B, C1 & C2] =
+			Flow.If[B, Any, C1, C2](
+				v.map(_.isEmpty),
+				ifNone,
+				v.map(_.get).flatMap(ifSome)
+			)
+	}
 }
 
 final case class TopologyId(value: Int) extends AnyVal
@@ -48,6 +62,7 @@ private[flow] class VarRegistry {
 	private var defined = 0
 
 	def add[A](hint: String): Var[A] = {
+		// println(s"Adding var: $hint")
 		val v = new Var[A](new VarId(defined, hint))
 		defined += 1
 		v
@@ -203,6 +218,7 @@ object Flow {
 	private[flow] case class Pure[A](v: Var[A]) extends Flow[A, Any]
 
 	// TODO: consider HList?
+	private[flow] case class Each0[O](f: () => O) extends Flow[O, Any]
 	private[flow] case class Each1[I, O](in: Var[I], f: I => O) extends Flow[O, Any]
 	private[flow] case class Each2[A, B, O](a: Var[A], b: Var[B], f: (A, B) => O) extends Flow[O, Any]
 
@@ -210,6 +226,7 @@ object Flow {
 	private[flow] case class FilterOp[I](in: Var[I], p: I => Boolean) extends Flow[Unit, Any]
 	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
 	private[flow] case class Bind[A, B, C1, C2](fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
+	private[flow] case class If[A, Ccond, C1, C2](cond: Flow[Boolean, Ccond], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C1 & C2]
 	private[flow] case class AggList[A, C](block: Flow[A, C]) extends Flow[List[A], C & Batch]
 	private[flow] case class Agg[A, B, C](block: Flow[A, C], agg: flow.Agg[B]) extends Flow[B, C & Batch]
 
@@ -228,6 +245,8 @@ object Flow {
 	private[flow] case class AckReturn[O](value: Var[O]) extends Flow[Unit, AckReturning[O]]
 
 	def pure[A](v: Var[A]): Flow[A, Any] = Pure(v)
+
+	def foreach[O](f: () => O): Flow[O, Any] = Each0(f)
 
 	def map2[A, B, O](a: Var[A], b: Var[B])(f: (A, B) => O): Flow[O, Any] = Each2(a, b, f)
 
@@ -275,7 +294,7 @@ final case class Depot[A](id: Identity) {
 	// matches the partitioning scheme of the depot.
 	// TODO: this could fail at runtime (or compile time?) if you're not on the right partition for a depot
 	// with deterministic partitioning.
-	def partitionAppend(value: Var[A]): Flow[Unit, Etl] = Flow.PartitionAppend(this, value)
+	def localAppend(value: Var[A]): Flow[Unit, Etl] = Flow.PartitionAppend(this, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,12 +307,16 @@ private[flow] object Node {
 
 	case class Explode(fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
 
+	case class Assign(in: VarId, out: VarId) extends Node
+
 	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
 	  * it. Unused by `interp` backend.
 		*/
 	case class Filter(fn: Any => Boolean, in: VarId, flag: VarId) extends Node
 
 	case class Partition(in: VarId) extends Node
+
+	case class If(cond: VarId, ifBlock: List[Node], elseBlock: List[Node], out: VarId) extends Node
 
 	// TODO: this is a special case of Agg, is it necessary?
 	case class AggList(block: List[Node], collectFrom: VarId, out: VarId) extends Node
@@ -312,29 +335,40 @@ private[flow] object Node {
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*
 		* TODO: remove unnecessary var return?
+		*
+		* NOTE: for the rama backend, _always_ extract `f` to a value first. Otherwise
+		*       the closure captures Var[T], which isn't serializable.
 		*/
 	def compile[A](t: TopologyBuilder[?], flow: Flow[A, ?]): (List[Node], Var[A]) = {
 		flow match {
 			case Flow.Pure(v) => (Nil, v)
+			case e: Flow.Each0[A] =>
+				val out = t.define[A]("each")
+				val f = e.f
+				(List(Node.Each(_ => f(), List(), out.vid)), out)
 
 			case e: Flow.Each1[i, A] =>
 				val out = t.define[A]("each")
-				(List(Node.Each(args => e.f(args.head.asInstanceOf[i]), List(e.in.vid), out.vid)), out)
+				val f = e.f
+				(List(Node.Each(args => f(args.head.asInstanceOf[i]), List(e.in.vid), out.vid)), out)
 
 			case e: Flow.Each2[a, b, A] =>
 				val out = t.define[A]("each")
-				val fn = (args: List[Any]) => e.f(args(0).asInstanceOf[a], args(1).asInstanceOf[b])
+				val f = e.f
+				val fn = (args: List[Any]) => f(args(0).asInstanceOf[a], args(1).asInstanceOf[b])
 				(List(Node.Each(fn, List(e.a.vid, e.b.vid), out.vid)), out)
 
 			case e: Flow.ExplodeOp[i, A] =>
 				val out = t.define[A]("exploded")
-				val fn = (arg: Any) => e.f(arg.asInstanceOf[i]).asInstanceOf[Seq[Any]]
+				val f = e.f
+				val fn = (arg: Any) => f(arg.asInstanceOf[i]).asInstanceOf[Seq[Any]]
 				(List(Node.Explode(fn, e.in.vid, out.vid)), out)
 
-			case f: Flow.FilterOp[i] =>
-				val fn = (arg: Any) => f.p(arg.asInstanceOf[i])
-				val flag = t.define[Boolean](s"${f.in.vid.hint}_keep")
-				(List(Node.Filter(fn, f.in.vid, flag.vid)), Var.unit.asInstanceOf[Var[A]])
+			case e: Flow.FilterOp[i] =>
+				val p = e.p
+				val fn = (arg: Any) => p(arg.asInstanceOf[i])
+				val flag = t.define[Boolean](s"${e.in.vid.hint}_keep")
+				(List(Node.Filter(fn, e.in.vid, flag.vid)), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
 				(List(Node.Partition(p.in.vid)), Var.unit.asInstanceOf[Var[A]])
@@ -343,6 +377,20 @@ private[flow] object Node {
 				val (n1, v1) = compile(t, b.fa)
 				val (n2, v2) = compile(t, b.k(v1))
 				(n1 ++ n2, v2)
+
+			case i: Flow.If[a, ccond, c1, c2] =>
+				val out = t.define[a]("ifOut")
+				val (condBlock, vCond) = compile(t, i.cond)
+				val (ifBlock, vIf) = compile(t, i.ifBlock)
+				val (elseBlock, vElse) = compile(t, i.elseBlock)
+				val bodyNodes = List(Node.If(
+					vCond.vid,
+					ifBlock.appended(Node.Assign(vIf.vid, out.vid)),
+					elseBlock.appended(Node.Assign(vElse.vid, out.vid)),
+					out.vid
+				))
+
+				(condBlock ++ bodyNodes, out)
 
 			case a: Flow.AggList[x, c] =>
 				val (block, innerVar) = compile(t, a.block)
@@ -359,7 +407,8 @@ private[flow] object Node {
 				(List(Node.Select(s.ps.id, s.key.vid, out.vid)), out)
 
 			case u: Flow.Update[k, v] =>
-				val fn = (cur: Option[Any]) => u.f(cur.asInstanceOf[Option[v]]).asInstanceOf[Option[Any]]
+				val f = u.f
+				val fn = (cur: Option[Any]) => f(cur.asInstanceOf[Option[v]]).asInstanceOf[Option[Any]]
 				(List(Node.Update(u.ps.id, u.key.vid, fn)), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Put(ps, key, value) =>
