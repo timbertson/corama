@@ -19,17 +19,25 @@ object VarId {
 }
 
 final class Var[A] private[flow] (private[flow] val vid: VarId) {
+	private def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
 
-	def foreach[B](f: A => Unit): Flow[Unit, Any] = Flow.Each1(this, f)
+	def map[B](f: A => B): Flow[B, Any] = Flow.MapN(List(this.asAny), {
+		case List(a) => f(a.asInstanceOf[A])
+			case _ => ??? // impossible
+	})
+	def zipMap[B, C](b: Var[B])(f: (A, B) => C): Flow[C, Any] = Flow.MapN(List(this.asAny, b.asAny), {
+		case List(a,b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
+		case _ => ??? // impossible
+	})
 
-	// TODO more structured way of handling multiple arguments (vars)?
-	def map[B](f: A => B): Flow[B, Any] = Flow.Each1(this, f)
+	def zipMap[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D): Flow[D, Any] = Flow.MapN(List(this.asAny, b.asAny, c.asAny), {
+		case List(a,b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
+		case _ => ??? // impossible
+	})
 
-	def each(f: A => Unit): Flow[Unit, Any] = Flow.Each1(this, f)
+	def foreach(f: A => Unit) = map[Unit](f)
 
-	def mapWith[B, C](b: Var[B])(f: (A, B) => C): Flow[C, Any] = Flow.Each2(this, b, f)
-
-	def into[F[_]](using f: Applicative[F]): Flow[F[A], Any] = Flow.Each1(this, f.pure)
+	def into[F[_]](using f: Applicative[F]): Flow[F[A], Any] = this.map(f.pure)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
 	def explode[B](f: A => Seq[B]): Flow[B, Any] = Flow.ExplodeOp(this, f)
@@ -198,10 +206,9 @@ final case class StreamTopology[S, R] private[flow](topology: Topology[S, R])
   */
 sealed trait Flow[A, -Ctx] {
 	import Flow._
-
 	def flatMap[B, C](f: Var[A] => Flow[B, C]): Flow[B, Ctx & C] = Bind(this, f)
 
-	def map[B](f: Var[A] => Var[B]): Flow[B, Ctx] = Bind(this, (v: Var[A]) => Pure(f(v)))
+	def map[B](f: Var[A] => Var[B]): Flow[B, Ctx] = Bind(this, a => Flow.Pure(f(a)))
 
 	def as[B](v: Var[B]): Flow[B, Ctx] = Bind(this, (_: Var[A]) => Pure(v))
 
@@ -222,15 +229,13 @@ sealed trait Flow[A, -Ctx] {
 object Flow {
 	private[flow] case class Pure[A](v: Var[A]) extends Flow[A, Any]
 
-	// TODO: consider HList?
-	private[flow] case class Each0[O](f: () => O) extends Flow[O, Any]
-	private[flow] case class Each1[I, O](in: Var[I], f: I => O) extends Flow[O, Any]
-	private[flow] case class Each2[A, B, O](a: Var[A], b: Var[B], f: (A, B) => O) extends Flow[O, Any]
+	private[flow] case class Bind[A, B, C1, C2](fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
+	private[flow] case class MapN[O](ins: List[Var[Any]], f: List[Any] => O) extends Flow[O, Any]
 
 	private[flow] case class ExplodeOp[I, O](in: Var[I], f: I => Seq[O]) extends Flow[O, Any]
 	private[flow] case class FilterOp[I](in: Var[I], p: I => Boolean) extends Flow[Unit, Any]
 	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
-	private[flow] case class Bind[A, B, C1, C2](fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
+
 	private[flow] case class If[A, Ccond, C1, C2](cond: Flow[Boolean, Ccond], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C1 & C2]
 	private[flow] case class AggList[A, C](block: Flow[A, C]) extends Flow[List[A], C & Batch]
 	private[flow] case class Agg[A, B, C](block: Flow[A, C], agg: flow.Agg[B]) extends Flow[B, C & Batch]
@@ -253,13 +258,10 @@ object Flow {
 
 	def pure[A](value: A): Flow[A, Any] = {
 		// TODO this can probably be optimised
-		Flow.Each0(() => value)
+		Flow.MapN(Nil, _ => value)
 	}
 
-
-	def foreach[O](f: () => O): Flow[O, Any] = Each0(f)
-
-	def map2[A, B, O](a: Var[A], b: Var[B])(f: (A, B) => O): Flow[O, Any] = Each2(a, b, f)
+	def foreach[O](f: () => O): Flow[O, Any] = MapN(Nil, _ => f())
 
 	/** Move downstream execution to the partition owning `v`.
 	  */
@@ -314,7 +316,7 @@ final case class Depot[A](id: Identity) {
 
 private[flow] sealed trait Node
 private[flow] object Node {
-	case class Each(fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
+	case class MapN(fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
 
 	case class Explode(fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
 
@@ -353,21 +355,10 @@ private[flow] object Node {
 	def compile[A](t: TopologyBuilder[?], flow: Flow[A, ?]): (List[Node], Var[A]) = {
 		flow match {
 			case Flow.Pure(v) => (Nil, v)
-			case e: Flow.Each0[A] =>
-				val out = t.define[A]("each")
+			case e: Flow.MapN[A] =>
+				val out = t.define[A]("map")
 				val f = e.f
-				(List(Node.Each(_ => f(), List(), out.vid)), out)
-
-			case e: Flow.Each1[i, A] =>
-				val out = t.define[A]("each")
-				val f = e.f
-				(List(Node.Each(args => f(args.head.asInstanceOf[i]), List(e.in.vid), out.vid)), out)
-
-			case e: Flow.Each2[a, b, A] =>
-				val out = t.define[A]("each")
-				val f = e.f
-				val fn = (args: List[Any]) => f(args(0).asInstanceOf[a], args(1).asInstanceOf[b])
-				(List(Node.Each(fn, List(e.a.vid, e.b.vid), out.vid)), out)
+				(List(Node.MapN(args => f(args), List(), out.vid)), out)
 
 			case e: Flow.ExplodeOp[i, A] =>
 				val out = t.define[A]("exploded")

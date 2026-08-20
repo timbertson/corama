@@ -86,12 +86,12 @@ class RamaExample extends RamaModule {
 				}
 			} { existing =>
 				for {
-					user <- existing.mapWith(change) { (existing, change) =>
+					user <- existing.zipMap(change) { (existing, change) =>
 						existing.copy(name = change.name)
 					}
 					_ <- mergedUserChange.localAppend(user)
 					// TODO it's a bit awkward to return something
-					result <- Flow.pure[Either[NoSuchUser, Unit]](Right(()))
+					result <- Flow.pure(NameChangeResult(Right(())))
 				} yield result
 			}
 			_ <- Flow.ackReturn(result)
@@ -104,11 +104,11 @@ class RamaExample extends RamaModule {
 		val user = t.input
 		for {
 			userId <- user.map(_.id)
-			_ <- user.each { user => println(s"Applying merged user change: $user") }
+			_ <- user.foreach { user => println(s"Applying merged user change: $user") }
 			// store the new user
 			_ <- users.put(userId, user)
 			// TODO?
-			// _ <- userId.each { id => println(s"Updating user $id in userTickets") }
+			// _ <- userId.foreach { id => println(s"Updating user $id in userTickets") }
 			// _ <- userTickets.update(userId, user) { (maybeUserTickets, user) =>
 			// 	maybeUserTickets.map(_.copy(user = user))
 			// }

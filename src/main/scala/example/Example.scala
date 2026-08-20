@@ -63,7 +63,7 @@ object Example extends IOApp {
 			_ <- Flow.ackReturn(previousOwnerList)
 
 			// And remove from the previous owner, when there was a different one.
-			hop <- Flow.map2(previousOwner, newOwner)((prev, now) => prev.filter(_ != now))
+			hop <- previousOwner.zipMap(newOwner)((prev, now) => prev.filter(_ != now))
 			_ <- hop.filter(_.isDefined)
 			oldOwner <- hop.map(_.get)
 			_ <- Flow.hashPartition(oldOwner)

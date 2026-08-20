@@ -103,7 +103,7 @@ object RamaBackend {
 	}
 
 	private def compileNode(node: Node): Block.Impl = node match {
-		case Node.Each(fn, ins, out)    => eachStep(fn, ins.map(compileVar), compileVar(out))
+		case Node.MapN(fn, ins, out)    => eachStep(fn, ins.map(compileVar), compileVar(out))
 		case Node.Explode(fn, in, out) => explodeStep(fn, compileVar(in), compileVar(out))
 
 		case Node.Filter(fn, in, flag) =>

@@ -298,7 +298,7 @@ class Partition(interpreter: Interpreter) {
 		nodes match {
 			case Nil => IO.pure(envs)
 
-			case Node.Each(fn, ins, out) :: tail =>
+			case Node.MapN(fn, ins, out) :: tail =>
 				val results = envs.map(env => env.updated(out, fn(ins.map(env(_)))))
 				continue(tail, results, ack)
 
