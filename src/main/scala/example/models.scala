@@ -81,3 +81,28 @@ class ApplyNameChange extends RamaFunction2[User, UserNameChange, User] {
 	}
 }
 
+// Wrapper types for Either values used in ack returns
+// These extend RamaSerializable so they can be serialized by Rama
+case class RegistrationResult(value: Either[UserAlreadyExists, Unit]) extends RamaSerializable
+
+object RegistrationResult {
+	def agg: flow.Agg[RegistrationResult] = {
+		flow.Agg.result(
+			RegistrationResult(Right(())),
+			_.value.isLeft,
+			(_, next) => next
+		)
+	}
+}
+
+case class NameChangeResult(value: Either[NoSuchUser, Unit]) extends RamaSerializable
+
+object NameChangeResult {
+	def agg: flow.Agg[NameChangeResult] = {
+		flow.Agg.result(
+			NameChangeResult(Right(())),
+			_.value.isLeft,
+			(_, next) => next
+		)
+	}
+}

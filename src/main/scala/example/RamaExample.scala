@@ -57,32 +57,32 @@ class RamaExample extends RamaModule {
 	}
 
 	// creates a user (further updates have no effect)
-	val registrationStream = topologies.stream(userRegistration, Agg.error[UserAlreadyExists]) { t =>
+	val registrationStream = topologies.stream(userRegistration, RegistrationResult.agg) { t =>
 		val user = t.input
 		for {
 			userId <- user.map(_.id)
 			existing <- users.get(userId)
-			result <- existing.fold[Either[UserAlreadyExists, Unit], flow.Etl] {
+			result <- existing.fold[RegistrationResult, flow.Etl] {
 				// no existing user
 				for {
 					_ <- mergedUserChange.localAppend(user)
-					result <- Flow.pure(Right(()) : Either[UserAlreadyExists, Unit])
+					result <- Flow.pure[RegistrationResult](RegistrationResult(Right(())))
 				} yield result
 			} { (existing: Var[?]) =>
-				userId.map(uid => Left(new UserAlreadyExists(uid)))
+				userId.map[RegistrationResult](uid => RegistrationResult(Left(new UserAlreadyExists(uid))))
 			}
 			_ <- Flow.ackReturn(result)
 		} yield Var.unit
 	}
 
-	val nameChangeStream = topologies.stream(userNameChange, Agg.error[NoSuchUser]) { t =>
+	val nameChangeStream = topologies.stream(userNameChange, NameChangeResult.agg) { t =>
 		val change = t.input
 		for {
 			userId <- change.map(_.userId)
 			existing <- users.get(userId)
-			result <- existing.fold {
-				userId.map { uid =>
-					Left(NoSuchUser(uid))
+			result <- existing.fold[NameChangeResult, flow.Etl] {
+				userId.map[NameChangeResult] { uid =>
+					NameChangeResult(Left(NoSuchUser(uid)))
 				}
 			} { existing =>
 				for {
@@ -280,16 +280,16 @@ object RamaExample {
 				TicketAssignment(3, 111),
 			)
 
-			// (4L to 30L).foreach { id =>
-			// 	upstreamTicketDepot.append(Ticket(id, requester = "Troubles McGee", description = s"Spam #$id"))
-			// 	// sorry 111, you get all the goods
-			// 	appendTo(assignmentsDepot, TicketAssignment(id, 111))
-			// 	// assignmentsDepot.append(TicketAssignment(id, 111))
-			// }
+			(4L to 30L).foreach { id =>
+				upstreamTicketDepot.append(Ticket(id, requester = "Troubles McGee", description = s"Spam #$id"))
+				// sorry 111, you get all the goods
+				appendTo(assignmentsDepot, TicketAssignment(id, 111))
+				// assignmentsDepot.append(TicketAssignment(id, 111))
+			}
 
-			// appendTo(cluster.clusterDepot(moduleName, "*userNameChange"),
-			// 	UserNameChange(111, name = "Ex-Agent Smith"),
-			// )
+			appendTo(cluster.clusterDepot(moduleName, "*userNameChange"),
+				UserNameChange(111, name = "Ex-Agent Smith"),
+			)
 			
 			println("Ticket 1: " + cluster.clusterPState(moduleName, "$$fullTicket").selectOne[Ticket](rama.Path.key(long2Long(1L))))
 			println("Ticket 2: " + cluster.clusterPState(moduleName, "$$fullTicket").selectOne[Ticket](rama.Path.key(long2Long(2L))))

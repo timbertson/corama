@@ -53,6 +53,11 @@ object Agg {
 	def either[E, T](initial: T): Agg[Either[E, T]] = new Agg(Right(initial), { (curr, next) =>
 		curr.flatMap(_ => next)
 	})
+
+	// Generic result aggregator that stops on first failure
+	def result[R](success: R, isFail: R => Boolean, combine: (R, R) => R): Agg[R] = new Agg(success, { (curr, next) =>
+		if (isFail(curr)) curr else next
+	})
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.
