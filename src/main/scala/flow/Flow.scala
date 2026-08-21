@@ -23,19 +23,14 @@ object VarId {
 final class Var[A] private[flow] (private[flow] val vid: VarId) {
 	private def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
 
-	def map[B](f: A => B): Flow[B, Any] = Flow.MapN(List(this.asAny), {
-		case List(a) => f(a.asInstanceOf[A])
-			case _ => ??? // impossible
-	})
-	def zipMap[B, C](b: Var[B])(f: (A, B) => C): Flow[C, Any] = Flow.MapN(List(this.asAny, b.asAny), {
-		case List(a,b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
-		case _ => ??? // impossible
-	})
+	def map : Var.Map[A] = new Var.Map(this)
 
-	def zipMap[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D): Flow[D, Any] = Flow.MapN(List(this.asAny, b.asAny, c.asAny), {
-		case List(a,b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
-		case _ => ??? // impossible
-	})
+	// TODO this could probably be optimised
+	def mapFilter[B](f: A => Option[B]): Flow[B, Any] = for {
+		opt <- this.map(f)
+		_ <- opt.filter(_.isDefined)
+		result <- opt.map(_.get)
+	} yield result
 
 	def foreach(f: A => Unit) = map[Unit](f)
 
@@ -44,7 +39,7 @@ final class Var[A] private[flow] (private[flow] val vid: VarId) {
 	/** Fan out: emit one value per element, running everything downstream per element. */
 	def explode[B](f: A => Seq[B]): Flow[B, Any] = Flow.ExplodeOp(this, f)
 
-	def filter(p: A => Boolean): Flow[A, Any] = Flow.FilterOp(this, p).as(this)
+	def filter: Var.Filter[A] = new Var.Filter(this)
 
 	def void: Flow[Unit, Any] = Flow.Pure(Var.unit)
 
@@ -67,6 +62,32 @@ object Var {
 				ifNone,
 				v.map(_.get).flatMap(ifSome)
 			)
+	}
+
+	class Map[A](v: Var[A]) {
+		def apply[B](f: A => B): Flow[B, Any] = Flow.MapN(List(v.asAny), {
+			case List(v) => f(v.asInstanceOf[A])
+				case _ => ??? // impossible
+		})
+
+		def zip[B, C](b: Var[B])(f: (A, B) => C): Flow[C, Any] = Flow.MapN(List(v.asAny, b.asAny), {
+			case List(a, b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
+			case _ => ??? // impossible
+		})
+
+		def zip[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D): Flow[D, Any] = Flow.MapN(List(v.asAny, b.asAny, c.asAny), {
+			case List(a, b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
+			case _ => ??? // impossible
+		})
+	}
+
+	class Filter[A](v: Var[A]) {
+		def apply(p: A => Boolean): Flow[A, Any] = Flow.FilterOp(v, p).as(v)
+
+		def zip[B](b: Var[B])(p: (A, B) => Boolean): Flow[A, Any] = for {
+			bool <- v.map.zip(b)(p)
+			_ <- bool.filter(identity)
+		} yield v
 	}
 }
 
@@ -163,11 +184,12 @@ final class Topologies {
 	  * the one value an `AckLevel.Ack` append reads out of [[AckReturns]]. Rama declares
 	  * it the same way, as `StreamSourceOptions.ackReturnAgg`.
 	  */
-	// TODO: can we just return O, instead of requiring `ackReturn`?
 	def stream[A, O](depot: Depot[A], agg: Agg[O])(
-		block: Var[A] => Flow[Unit, StreamContext[O]]
+		block: Var[A] => Flow[O, StreamContext[O]]
 	): StreamTopology[A, O] = {
-		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg)(block))
+		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg) { input =>
+			block(input).flatMap(Flow.ackReturn)
+		})
 	}
 
 	private def declare[A, R, C](source: Identity, agg: Agg[R])(
@@ -296,13 +318,17 @@ final case class PState[K, V](id: Identity) {
 
 	def getOrElse(key: Var[K], dfl: V): Flow[V, Any] = Flow.Select(this, key).flatMap(v => v.map(_.getOrElse(dfl)))
 
-	def update(key: Var[K])(f: Option[V] => Option[V]): Flow[Unit, Etl] = Flow.Update(this, key, f)
-
-	def update[A](key: Var[K], arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit, Etl] =
-		Flow.UpdateWith(this, key, arg, f)
+	def update(key: Var[K]): PState.Update[K, V] = new PState.Update(this, key)
 
 	def put(key: Var[K], value: Var[V]): Flow[Unit, Etl] = Flow.Put(this, key, value)
 	def delete(key: Var[K]): Flow[Unit, Etl] = Flow.Update(this, key, _ => None)
+}
+
+object PState {
+	class Update[K, V](pstate: PState[K,V], key: Var[K]) {
+		def apply(f: Option[V] => Option[V]): Flow[Unit, Etl] = Flow.Update(pstate, key, f)
+		def zip[A](arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit, Etl] = Flow.UpdateWith(pstate, key, arg, f)
+	}
 }
 
 final case class Depot[A](id: Identity) {

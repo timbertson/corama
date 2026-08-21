@@ -1,13 +1,17 @@
 package example
 
+import cats.Eq
+import cats.syntax.all._
 import cats.data.Op
 import flow._
 import com.rpl.rama.RamaModule
 import com.rpl.rama
 import dsl.JLong
 import scala.annotation.unused
+import flow.Example.assigning
 
 class RamaExample extends RamaModule {
+	implicit val eqLong: Eq[JLong] = Eq.fromUniversalEquals
 	// import RamaModule._
 	import RamaExample._
 
@@ -47,7 +51,7 @@ class RamaExample extends RamaModule {
 	topologies.stream_(upstreamTicket) { ticket =>
 		for {
 			id <- ticket.map(_.id)
-			_ <- fullTicket.update(id, ticket) { (full, upstream) =>
+			_ <- fullTicket.update(id).zip(ticket) { (full, upstream) =>
 				println(s"upserting $upstream into $full")
 				Some(full.fold(FullTicket(upstream, None, None))(_.copy(upstream = upstream)))
 			}
@@ -68,8 +72,7 @@ class RamaExample extends RamaModule {
 			} { (existing: Var[?]) =>
 				userId.map(uid => Result.failure(s"User already exists: $uid"))
 			}
-			_ <- Flow.ackReturn(result)
-		} yield Var.unit
+		} yield result
 	}
 
 	val nameChangeStream = topologies.stream(userNameChange, Result.agg[Unit]) { change =>
@@ -82,7 +85,7 @@ class RamaExample extends RamaModule {
 				}
 			} { existing =>
 				for {
-					user <- existing.zipMap(change) { (existing, change) =>
+					user <- existing.map.zip(change) { (existing, change) =>
 						existing.copy(name = change.name)
 					}
 					_ <- mergedUserChange.localAppend(user)
@@ -90,8 +93,7 @@ class RamaExample extends RamaModule {
 					result <- Flow.pure[Result[Unit]](Result.unit)
 				} yield result
 			}
-			_ <- Flow.ackReturn(result)
-		} yield Var.unit
+		} yield result
 	}
 
 	// When user changes (from either userRegistration or userNameChange),
@@ -131,7 +133,7 @@ class RamaExample extends RamaModule {
 						// Dispatch an event keyed on the ticket ID, serializing the
 						// old assignee ID so it can't be lost in the case of a retried transaction
 						for {
-							message <- ticket.zipMap(userId) { (ticket, assignee) =>
+							message <- ticket.map.zip(userId) { (ticket, assignee) =>
 								PropagateTicketAssignment(ticket.upstream.id, assignee = assignee, prevAssignee = ticket.assignee)
 							}
 							_ <- propagateTicketAssignment.localAppend(message)
@@ -140,36 +142,40 @@ class RamaExample extends RamaModule {
 					}
 				} yield result
 			}
-			_ <- Flow.ackReturn(result)
-		} yield Var.unit
+		} yield result
 	}
 
-	// s.source("*propagateTicketAssignment").out("*assignment")
-	// 	.each(Ops.PRINTLN, "Propagating assignment", "*assignment")
-	// 	.each((x: PropagateTicketAssignment) => x.ticketId, "*assignment").out("*ticketId")
-	// 	.each((x: PropagateTicketAssignment) => x.assignee, "*assignment").out("*newUserId")
-	// 	.each((x: PropagateTicketAssignment) => x.prevAssignee.orNull, "*assignment").out("*oldUserId")
+	topologies.stream_(propagateTicketAssignment) { assignment =>
+		for {
+			_ <- assignment.foreach(a => println(s"Propagating assignment $a"))
+			ticketId <- assignment.map(_.ticketId)
+			newUserId <- assignment.map(_.assignee)
+			oldUserId <- assignment.map(_.prevAssignee)
 
-	// 	// Update fullTicket, it's the source of truth for who owns a ticket
-	// 	.localTransform("$$fullTicket", Path.key("*ticketId").term(new SetTicketAssignee(), "*newUserId"))
-		
-	// 	// now update new user
-	// 	.hashPartition("*newUserId")
-	// 	.localTransform("$$userTickets",
-	// 		// add to set
-	// 		Path.key("*newUserId", "ticketIds").voidSetElem().termVal("*ticketId")
-	// 	)
+			// Update fullTicket, it's the source of truth for who owns a ticket
+			_ <- fullTicket.update(ticketId).zip(newUserId) { (ticket, newUserId) =>
+				ticket.map(_.copy(assignee = Some(newUserId)))
+			}
+			
+			// now update new user
+			_ <- Flow.hashPartition(newUserId)
 
-	// 	// and remove from old user, if defined (and different from new user)
-	// 	.keepTrue(new Expr(Ops.AND,
-	// 		new Expr(Ops.IS_NOT_NULL, "*oldUserId"),
-	// 		new Expr(Ops.NOT_EQUAL, "*newUserId", "*oldUserId")
-	// 	))
-	// 	.hashPartition("*oldUserId")
-	// 	.localTransform("$$userTickets",
-	// 		// remove from set
-	// 		Path.key("*oldUserId", "ticketIds").setElem("*ticketId").termVoid()
-	// 	)
+			// TODO: update userTickets.ticketIds as a set, not userTickets as a single object
+			// Rama uses: Path.key("*newUserId", "ticketIds").voidSetElem().termVal("*ticketId")
+			_ <- userTickets.update(newUserId).zip(ticketId) { (userTickets: Option[List[JLong]], ticketId) =>
+				Some(userTickets.getOrElse(List.empty[JLong]).appended(ticketId))
+			}
+			
+			// now remove from old user, if defined (and different from new user)
+			oldUserId <- oldUserId.mapFilter(identity)
+			_ <- oldUserId.filter.zip(newUserId)((a, b) => a =!= b)
+			_ <- Flow.hashPartition(oldUserId)
+			// TODO act as a sub-collection, not a raw set
+			_ <- userTickets.update(oldUserId).zip(ticketId) { (tickets, ticketId) =>
+				Some(tickets.getOrElse(List.empty[JLong]).filter(_ =!= ticketId))
+			}
+		} yield Var.unit
+	}
 
 	// val userTicketsPageSize = 10
 	// topologies.query[UserTicketsRequest, List[Ticket]]("userTickets", Agg.list) { t =>

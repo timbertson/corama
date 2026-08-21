@@ -34,7 +34,7 @@ object Example extends IOApp {
 	  * below contributes: this fragment only goes in a topology declared to aggregate
 	  * ack returns of that type.
 	  */
-	def propagateAssignment(assignment: Var[Assignment]): Flow[Unit, Etl & AckReturning[List[Option[Long]]]] =
+	def propagateAssignment(assignment: Var[Assignment]) =
 		for {
 			ticketId <- assignment.map(_.ticketId)
 			newOwner <- assignment.map(_.assigneeId)
@@ -46,7 +46,7 @@ object Example extends IOApp {
 			existing <- fullTickets.get(ticketId)
 			_ <- existing.filter(_.isDefined)
 			previousOwner <- existing.map(_.flatMap(_.assignee))
-			_ <- fullTickets.update(ticketId, newOwner) { (cur, owner) =>
+			_ <- fullTickets.update(ticketId).zip(newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
 			previousOwnerList <- previousOwner.into[List]
@@ -54,23 +54,19 @@ object Example extends IOApp {
 			// Partition by the new owner: add the ticket to their set.
 			// This write is in a different transaction (in terms of pstate upates)
 			_ <- Flow.hashPartition(newOwner)
-			_ <- userTickets.update(newOwner, ticketId) { (prev, tid) =>
+			_ <- userTickets.update(newOwner).zip(ticketId) { (prev, tid) =>
 				Some(prev.getOrElse(Set.empty) + tid)
 			}
 
-			// Report the previous owner to whoever appended. This runs on the ticket's
-			// partition, but the result is routed back to the appender.
-			_ <- Flow.ackReturn(previousOwnerList)
-
 			// And remove from the previous owner, when there was a different one.
-			hop <- previousOwner.zipMap(newOwner)((prev, now) => prev.filter(_ != now))
+			hop <- previousOwner.map.zip(newOwner)((prev, now) => prev.filter(_ != now))
 			_ <- hop.filter(_.isDefined)
 			oldOwner <- hop.map(_.get)
 			_ <- Flow.hashPartition(oldOwner)
-			_ <- userTickets.update(oldOwner, ticketId) { (prev, tid) =>
+			_ <- userTickets.update(oldOwner).zip(ticketId) { (prev, tid) =>
 				prev.map(_ - tid)
 			}
-		} yield Var.unit
+		} yield previousOwnerList
 
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
 	  * own partition, then collapse the results back into a single list.
