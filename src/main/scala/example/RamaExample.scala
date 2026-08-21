@@ -6,7 +6,6 @@ import com.rpl.rama.RamaModule
 import com.rpl.rama
 import dsl.JLong
 import scala.annotation.unused
-import flow.Example.ticketAssignment
 
 class RamaExample extends RamaModule {
 	// import RamaModule._
@@ -30,7 +29,7 @@ class RamaExample extends RamaModule {
 
 	// internal
 	val mergedUserChange = topologies.depot[User]("mergedUserChange", rama.Depot.hashBy(classOf[UserPartitionKey]))
-	topologies.depot[PropagateTicketAssignment]("propagateTicketAssignment", rama.Depot.hashBy(classOf[PropagateTicketAssignmentKey]))
+	val propagateTicketAssignment = topologies.depot[PropagateTicketAssignment]("propagateTicketAssignment", rama.Depot.hashBy(classOf[PropagateTicketAssignmentKey]))
 
 	val users = topologies.pstate[JLong, User]("user", rama.PState.mapSchema(classOf[JLong], classOf[User]))
 
@@ -45,8 +44,7 @@ class RamaExample extends RamaModule {
 	val fullTicket = topologies.pstate[JLong, FullTicket]("fullTicket", rama.PState.mapSchema(classOf[JLong], classOf[FullTicket]))
 
 	// upstream ticket changes update the fullTicket view
-	topologies.stream[Ticket](upstreamTicket) { t =>
-		val ticket = t.input
+	topologies.stream_(upstreamTicket) { ticket =>
 		for {
 			id <- ticket.map(_.id)
 			_ <- fullTicket.update(id, ticket) { (full, upstream) =>
@@ -57,32 +55,30 @@ class RamaExample extends RamaModule {
 	}
 
 	// creates a user (further updates have no effect)
-	val registrationStream = topologies.stream(userRegistration, RegistrationResult.agg) { t =>
-		val user = t.input
+	val registrationStream = topologies.stream(userRegistration, Result.agg[Unit]) { user =>
 		for {
 			userId <- user.map(_.id)
 			existing <- users.get(userId)
-			result <- existing.fold[RegistrationResult, flow.Etl] {
+			result <- existing.fold[Result.Void, flow.Etl] {
 				// no existing user
 				for {
 					_ <- mergedUserChange.localAppend(user)
-					result <- Flow.pure[RegistrationResult](RegistrationResult(Right(())))
+					result <- Flow.pure(Result.empty[Unit])
 				} yield result
 			} { (existing: Var[?]) =>
-				userId.map[RegistrationResult](uid => RegistrationResult(Left(new UserAlreadyExists(uid))))
+				userId.map(uid => Result.failure(s"User already exists: $uid"))
 			}
 			_ <- Flow.ackReturn(result)
 		} yield Var.unit
 	}
 
-	val nameChangeStream = topologies.stream(userNameChange, NameChangeResult.agg) { t =>
-		val change = t.input
+	val nameChangeStream = topologies.stream(userNameChange, Result.agg[Unit]) { change =>
 		for {
 			userId <- change.map(_.userId)
 			existing <- users.get(userId)
-			result <- existing.fold[NameChangeResult, flow.Etl] {
-				userId.map[NameChangeResult] { uid =>
-					NameChangeResult(Left(NoSuchUser(uid)))
+			result <- existing.fold[Result.Void, flow.Etl] {
+				userId.map { uid =>
+					Result.failure(s"No such user: $uid")
 				}
 			} { existing =>
 				for {
@@ -91,7 +87,7 @@ class RamaExample extends RamaModule {
 					}
 					_ <- mergedUserChange.localAppend(user)
 					// TODO it's a bit awkward to return something
-					result <- Flow.pure(NameChangeResult(Right(())))
+					result <- Flow.pure[Result[Unit]](Result.unit)
 				} yield result
 			}
 			_ <- Flow.ackReturn(result)
@@ -100,14 +96,12 @@ class RamaExample extends RamaModule {
 
 	// When user changes (from either userRegistration or userNameChange),
 	// update the user view in $$userTickets
-	topologies.stream(mergedUserChange) { t =>
-		val user = t.input
+	topologies.stream_(mergedUserChange) { user =>
 		for {
 			userId <- user.map(_.id)
 			_ <- user.foreach { user => println(s"Applying merged user change: $user") }
 			// store the new user
 			_ <- users.put(userId, user)
-			// TODO?
 			// _ <- userId.foreach { id => println(s"Updating user $id in userTickets") }
 			// _ <- userTickets.update(userId, user) { (maybeUserTickets, user) =>
 			// 	maybeUserTickets.map(_.copy(user = user))
@@ -115,38 +109,40 @@ class RamaExample extends RamaModule {
 		} yield Var.unit
 	}
 
-	// s.source("*ticketAssignment").out("*assignment")
-	// 	.each(Ops.CURRENT_TASK_ID).out("*taskId")
-	// 	.each(Ops.PRINTLN, "Assignment:", "*assignment", "on task", "*taskId")
-	// 	.each((value: TicketAssignment) => value.assigneeId, "*assignment").out("*userId")
-	// 	.each((value: TicketAssignment) => value.ticketId, "*assignment").out("*ticketId")
+	topologies.stream(ticketAssignment, Result.agg[Unit]) { assignment =>
+		for {
+			_ <- assignment.foreach(a => println(s"Assignment: $a"))
+			userId <- assignment.map(_.assigneeId)
+			ticketId <- assignment.map(_.ticketId)
 
-	// 	// assignment is partitioned by (new) assigneeId. First validate the new assignee
-	// 	.localSelect("$$userTickets", Path.key("*userId", "user")).out("*newAssignee")
-	// 	.ifTrue(new Expr(Ops.EQUAL, null, "*newAssignee"),
-	// 		Block.each(NoSuchUser.apply, "*userId").out("*error")
-	// 			.ackReturn("*error")
-	// 	, // else
-	// 		Block.hashPartition("*ticketId")
-	// 		// then grab the current view of the ticket
-	// 		.each(Ops.CURRENT_TASK_ID).out("*taskId")
-	// 		.each(Ops.PRINTLN, "Finding ticket", "*ticketId", "on task", "*taskId")
-	// 		.localSelect("$$fullTicket", Path.key("*ticketId")).out("*prevTicket")
-	// 		.ifTrue(new Expr(Ops.EQUAL, null, "*prevTicket"),
-	// 			// if ticket == null
-	// 				Block.each(NoSuchTicket.apply, "*ticketId").out("*error")
-	// 					.ackReturn("*error")
-	// 			, // else
-
-	// 				// At this point we know the new user and ticket are both valid.
-	// 				// Dispatch an event keyed on the ticket ID, serializing the
-	// 				// old assignee ID so it can't be lost in the case of a retried transaction
-	// 				Block.each((t: FullTicket, newAssignee: JLong) =>
-	// 					PropagateTicketAssignment(t.upstream.id, assignee = newAssignee, prevAssignee = t.assignee)
-	// 				, "*prevTicket", "*userId").out("*message")
-	// 				.depotPartitionAppend("*propagateTicketAssignment", "*message")
-	// 		)
-	// 	)
+			// assignment is partitioned by (new) assigneeId. First validate the new assignee
+			newAssignee <- users.get(userId)
+			result <- newAssignee.fold[Result.Void, StreamContext[Result.Void]] {
+				userId.map(userId => Result.failure(s"No such user: $userId"))
+			} { newAssignee =>
+				for {
+					_ <- Flow.hashPartition(ticketId)
+					_ <- ticketId.foreach(t => println(s"Finding ticket $t"))
+					prevTicket <- fullTicket.get(ticketId)
+					result <- prevTicket.fold {
+						ticketId.map(ticketId => Result.failure[Unit](s"No such ticket: $ticketId"))
+					} { ticket =>
+						// At this point we know the new user and ticket are both valid.
+						// Dispatch an event keyed on the ticket ID, serializing the
+						// old assignee ID so it can't be lost in the case of a retried transaction
+						for {
+							message <- ticket.zipMap(userId) { (ticket, assignee) =>
+								PropagateTicketAssignment(ticket.upstream.id, assignee = assignee, prevAssignee = ticket.assignee)
+							}
+							_ <- propagateTicketAssignment.localAppend(message)
+							ok <- Flow.pure(Result.unit)
+						} yield ok
+					}
+				} yield result
+			}
+			_ <- Flow.ackReturn(result)
+		} yield Var.unit
+	}
 
 	// s.source("*propagateTicketAssignment").out("*assignment")
 	// 	.each(Ops.PRINTLN, "Propagating assignment", "*assignment")

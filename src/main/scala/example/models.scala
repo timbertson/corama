@@ -16,6 +16,7 @@ import java.util.Arrays
 import java.lang.{Long => JLong}
 import com.strobel.collections.ListBuffer
 import java.time.Instant
+import algebra.Monoid
 
 
 case class Ticket(id: JLong, requester: String, description: String) extends RamaSerializable
@@ -78,31 +79,5 @@ class SetTicketAssignee extends RamaFunction2[FullTicket, JLong, FullTicket] {
 class ApplyNameChange extends RamaFunction2[User, UserNameChange, User] {
 	override def invoke(current: User, change: UserNameChange): User = {
 		current.copy(name = change.name)
-	}
-}
-
-// Wrapper types for Either values used in ack returns
-// These extend RamaSerializable so they can be serialized by Rama
-case class RegistrationResult(value: Either[UserAlreadyExists, Unit]) extends RamaSerializable
-
-object RegistrationResult {
-	def agg: flow.Agg[RegistrationResult] = {
-		flow.Agg.result(
-			RegistrationResult(Right(())),
-			_.value.isLeft,
-			(_, next) => next
-		)
-	}
-}
-
-case class NameChangeResult(value: Either[NoSuchUser, Unit]) extends RamaSerializable
-
-object NameChangeResult {
-	def agg: flow.Agg[NameChangeResult] = {
-		flow.Agg.result(
-			NameChangeResult(Right(())),
-			_.value.isLeft,
-			(_, next) => next
-		)
 	}
 }

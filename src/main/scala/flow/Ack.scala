@@ -54,10 +54,10 @@ object Agg {
 		curr.flatMap(_ => next)
 	})
 
-	// Generic result aggregator that stops on first failure
-	def result[R](success: R, isFail: R => Boolean, combine: (R, R) => R): Agg[R] = new Agg(success, { (curr, next) =>
-		if (isFail(curr)) curr else next
-	})
+	// // Generic result aggregator for Either[A, T] where T is a Monoid
+	// def result[M, T](implicit M: Monoid[M]): Agg[Either[M, T]] = new Agg(success, { (curr, next) =>
+	// 	if (isFail(curr)) curr else next
+	// })
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.

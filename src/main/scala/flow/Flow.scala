@@ -4,6 +4,8 @@ import cats.Functor
 import cats.Applicative
 import scala.annotation.unused
 import cats.Eq
+import com.rpl.rama.RamaSerializable
+import cats.Monoid
 
 private[flow] final class VarId(private[flow] val id: Int, private[flow] val hint: String) {
 	override def equals(other: Any): Boolean = other match {
@@ -135,7 +137,7 @@ final class Topologies {
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
 	def query[Input, Output](name: String, agg: Agg[Output])(
-		block: TopologyBuilder[Input] => Flow[Output, QueryContext],
+		block: Var[Input] => Flow[Output, QueryContext],
 	): QueryTopology[Input, Output] = {
 		QueryTopology(declare[Input, Output, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg)(block))
 	}
@@ -148,8 +150,8 @@ final class Topologies {
 	  *
 		* TODO: does the block need to accept TopologyBuilder, or is Flow[A] / Var[A] enough?
 	  */
-	def stream[A](depot: Depot[A])(
-		block: TopologyBuilder[A] => Flow[Unit, StreamContext[Nothing]]
+	def stream_[A](depot: Depot[A])(
+		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
 	): Topology[A, Unit] = {
 		declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit)(block)
 	}
@@ -161,17 +163,18 @@ final class Topologies {
 	  * the one value an `AckLevel.Ack` append reads out of [[AckReturns]]. Rama declares
 	  * it the same way, as `StreamSourceOptions.ackReturnAgg`.
 	  */
+	// TODO: can we just return O, instead of requiring `ackReturn`?
 	def stream[A, O](depot: Depot[A], agg: Agg[O])(
-		block: TopologyBuilder[A] => Flow[Unit, StreamContext[O]]
+		block: Var[A] => Flow[Unit, StreamContext[O]]
 	): StreamTopology[A, O] = {
 		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg)(block))
 	}
 
 	private def declare[A, R, C](source: Identity, agg: Agg[R])(
-		block: TopologyBuilder[A] => Flow[?, C]
+		block: Var[A] => Flow[?, C]
 	): Topology[A, R] = {
 		val b = new TopologyBuilder[A](TopologyId(built.length), source)
-		val t = Topology[A, R](b, block(b), agg)
+		val t = Topology[A, R](b, block(b.input), agg)
 		built = t :: built
 		t
 	}
@@ -303,10 +306,6 @@ final case class PState[K, V](id: Identity) {
 }
 
 final case class Depot[A](id: Identity) {
-	// append to the current partition of the depot. Care must be taken to ensure this
-	// matches the partitioning scheme of the depot.
-	// TODO: this could fail at runtime (or compile time?) if you're not on the right partition for a depot
-	// with deterministic partitioning.
 	def localAppend(value: Var[A]): Flow[Unit, Etl] = Flow.PartitionAppend(this, value)
 }
 
@@ -431,4 +430,22 @@ private[flow] object Node {
 				(List(Node.AckReturn(value.vid)), Var.unit.asInstanceOf[Var[A]])
 		}
 	}
+}
+
+// Serializable wrapper type for Either[String, T]
+case class Result[T](value: Either[String, T]) extends RamaSerializable
+object Result {
+	type Void = Result[Unit]
+	def empty[T : Monoid]: Result[T] = Result(Right(Monoid[T].empty))
+	
+	def failure[T](s: String): Result[T] = Result[T](Left(s))
+
+	def success[T](v: T): Result[T] = Result(Right(v))
+
+	def unit: Result[Unit] = success[Unit](())
+
+	def agg[T](implicit M: Monoid[T]): flow.Agg[Result[T]] =
+		flow.Agg(Result(Right(M.empty)), { (a,b) =>
+			Result(a.value.flatMap(a => b.value.map(M.combine(a, _))))
+		})
 }

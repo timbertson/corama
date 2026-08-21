@@ -70,8 +70,7 @@ object Example extends IOApp {
 			_ <- userTickets.update(oldOwner, ticketId) { (prev, tid) =>
 				prev.map(_ - tid)
 			}
-			done <- Flow.unit
-		} yield done
+		} yield Var.unit
 
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
 	  * own partition, then collapse the results back into a single list.
@@ -93,10 +92,10 @@ object Example extends IOApp {
 	}
 
 	val userTicketsQuery: QueryTopology[Long, List[Ticket]] =
-		topologies.query[Long, List[Ticket]]("userTickets", Agg.list[Ticket])(t => listUserTickets(t.input))
+		topologies.query[Long, List[Ticket]]("userTickets", Agg.list[Ticket])(listUserTickets)
 
 	val assigning: StreamTopology[Assignment, List[Option[Long]]] =
-		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(t => propagateAssignment(t.input))
+		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(propagateAssignment)
 
 	override def run(args: List[String]): IO[ExitCode] = {
 		println("flow.Example")
