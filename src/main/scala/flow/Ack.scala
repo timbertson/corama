@@ -23,43 +23,6 @@ object AckLevel {
 	case object Ack extends AckLevel[AckReturns]
 }
 
-final class Agg[A] private[flow] (
-	private[flow] val zero: A,
-	private[flow] val combine: (A, A) => A
-) {
-	private[flow] def merge(values: List[A]): A = values.foldLeft(zero)(combine)
-	private[flow] def mergeAny(values: List[Any]): A = merge(values.asInstanceOf[List[A]])
-	private[flow] def combineAny(a: Any, b: Any): A = combine(a.asInstanceOf[A], b.asInstanceOf[A])
-}
-
-object Agg {
-	def apply[A](zero: A, combine: (A, A) => A): Agg[A] = new Agg(zero, combine)
-
-	// Collect act returns into a sequence (monoid)
-	def collect[A, M[_]](using app: Applicative[M], m: Monoid[M[A]]): Agg[M[A]] = {
-		new Agg[M[A]](m.empty, m.combine)
-	}
-
-	// convenience overload of collect to hardcode the List type
-	def list[A]: Agg[List[A]] = collect
-
-	// return nothing, accumulate nothing
-	def unit: Agg[Unit] = apply((), (_, _) => ())
-
-	def error[E]: Agg[Either[E, Unit]] = new Agg(Right(()), { (curr, next) =>
-		curr.flatMap(_ => next)
-	})
-
-	def either[E, T](initial: T): Agg[Either[E, T]] = new Agg(Right(initial), { (curr, next) =>
-		curr.flatMap(_ => next)
-	})
-
-	// // Generic result aggregator for Either[A, T] where T is a Monoid
-	// def result[M, T](implicit M: Monoid[M]): Agg[Either[M, T]] = new Agg(success, { (curr, next) =>
-	// 	if (isFail(curr)) curr else next
-	// })
-}
-
 /** The ack returns from one depot append, keyed by the topology that produced each.
   *
   * Values arrive as a list per topology. TODO: could these be pre-combined with agg?

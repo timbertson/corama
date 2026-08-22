@@ -42,13 +42,6 @@ sealed trait Etl
 sealed trait QueryContext extends Batch
 
 /** Requires a topology whose ack returns are values of type `O`.
-  *
-  * Invariant in `O` deliberately, and that is the whole mechanism: a flow that
-  * `ackReturn`s an `Int` requires `AckReturning[Int]`, which only a topology declared
-  * with an `AckAgg[Int, ?]` provides. Two `ackReturn`s of different types in one flow
-  * intersect to `AckReturning[Int] & AckReturning[String]`, which nothing provides — so
-  * that fails to compile too, which is right: Rama has one ack-return aggregator per
-  * topology, so the values reaching it must share a type.
   */
 sealed trait AckReturning[O]
 

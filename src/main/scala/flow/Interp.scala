@@ -13,6 +13,8 @@ import scala.util.Random
 import fs2.concurrent.SignallingRef
 import fs2.Chunk
 
+import flow.internal._
+
 /** Simple interpreter: runs a [[Flow]] as plain Scala over in-memory state.
   *
   * An environment is one *branch* of execution, mapping vars to values.

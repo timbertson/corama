@@ -1,4 +1,4 @@
-package flow
+package flow.rama
 
 import cats.syntax.all._
 import com.rpl.rama.{Agg, Block, Path}
@@ -11,6 +11,9 @@ import flow.IdentityNamespace.Query
 import com.rpl.rama.module.StreamTopology
 import com.rpl.rama.ops.RamaAccumulatorAgg
 import com.rpl.rama.ops.RamaFunction0
+
+import flow._
+import flow.internal._
 
 class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
 	import RamaBackend._

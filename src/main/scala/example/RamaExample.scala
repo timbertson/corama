@@ -9,6 +9,7 @@ import com.rpl.rama
 import dsl.JLong
 import scala.annotation.unused
 import flow.Example.assigning
+import flow.rama.RamaBackend
 
 class RamaExample extends RamaModule {
 	// import RamaModule._
