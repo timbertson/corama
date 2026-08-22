@@ -15,6 +15,7 @@ libraryDependencies ++= Seq(
 	"org.typelevel" %% "cats-effect" % ceVersion,
 	"co.fs2" %% "fs2-core" % fs2Version,
 	"co.fs2" %% "fs2-io" % fs2Version,
+	"org.tpolecat" %% "sourcepos" % "1.2.0",
 )
 
 val logbackClassic = "ch.qos.logback" % "logback-classic" % "1.5.6"

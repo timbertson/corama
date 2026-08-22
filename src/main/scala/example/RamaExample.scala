@@ -11,7 +11,6 @@ import scala.annotation.unused
 import flow.Example.assigning
 
 class RamaExample extends RamaModule {
-	implicit val eqLong: Eq[JLong] = Eq.fromUniversalEquals
 	// import RamaModule._
 	import RamaExample._
 
@@ -241,6 +240,8 @@ class RamaExample extends RamaModule {
 }
 
 object RamaExample {
+	implicit val eqLong: Eq[JLong] = Eq.fromUniversalEquals
+
 	def main(@unused argv: Array[String]): Unit = {
 
 		def appendTo(depot: rama.Depot, obj: Object*) = {

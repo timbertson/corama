@@ -1,5 +1,6 @@
 package flow
 
+import org.tpolecat.sourcepos._
 import cats.Functor
 import cats.Applicative
 import scala.annotation.unused
@@ -20,30 +21,30 @@ object VarId {
 	implicit val eq: Eq[VarId] = Eq.fromUniversalEquals
 }
 
-final class Var[A] private[flow] (private[flow] val vid: VarId) {
+final class Var[A] private[flow] (private[flow] val vid: VarId, pos: SourcePos) {
 	private def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
 
-	def map : Var.Map[A] = new Var.Map(this)
+	def map: Var.Map[A] = new Var.Map(this)
 
 	// TODO this could probably be optimised
-	def mapFilter[B](f: A => Option[B]): Flow[B, Any] = for {
+	def mapFilter[B](f: A => Option[B])(implicit pos: SourcePos): Flow[B, Any] = for {
 		opt <- this.map(f)
 		_ <- opt.filter(_.isDefined)
 		result <- opt.map(_.get)
 	} yield result
 
-	def foreach(f: A => Unit) = map[Unit](f)
+	def foreach(f: A => Unit)(implicit pos: SourcePos) = map[Unit](f)
 
-	def into[F[_]](using f: Applicative[F]): Flow[F[A], Any] = this.map(f.pure)
+	def into[F[_]](using f: Applicative[F])(implicit pos: SourcePos): Flow[F[A], Any] = this.map(f.pure)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
-	def explode[B](f: A => Seq[B]): Flow[B, Any] = Flow.ExplodeOp(this, f)
+	def explode[B](f: A => Seq[B])(implicit pos: SourcePos): Flow[B, Any] = Flow.ExplodeOp(pos, this, f)
 
 	def filter: Var.Filter[A] = new Var.Filter(this)
 
 	def void: Flow[Unit, Any] = Flow.Pure(Var.unit)
 
-	override def toString: String = s"Var($vid)"
+	override def toString: String = s"Var($vid, $pos)"
 	override def equals(other: Any): Boolean = other match {
 		case that: Var[?] => that.vid == vid
 		case _            => false
@@ -51,9 +52,11 @@ final class Var[A] private[flow] (private[flow] val vid: VarId) {
 	override def hashCode: Int = vid.hashCode
 }
 
+private def impossible(reason: String) = throw new IllegalStateException(reason)
+
 object Var {
 	// Virtual vars have a unique id < 0 and are never given a Rama name
-	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"))
+	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"), implicitly[SourcePos])
 
 	extension [A](v: Var[Option[A]]) {
 		def fold[B, C](ifNone: Flow[B, C])(ifSome: Var[A] => Flow[B, C]): Flow[B, C] =
@@ -65,26 +68,26 @@ object Var {
 	}
 
 	class Map[A](v: Var[A]) {
-		def apply[B](f: A => B): Flow[B, Any] = Flow.MapN(List(v.asAny), {
+		def apply[B](f: A => B)(implicit pos: SourcePos): Flow[B, Any] = Flow.MapN(pos, List(v.asAny), {
 			case List(v) => f(v.asInstanceOf[A])
-				case _ => ??? // impossible
+			case other => impossible(s"map1 with ${other.length}")
 		})
 
-		def zip[B, C](b: Var[B])(f: (A, B) => C): Flow[C, Any] = Flow.MapN(List(v.asAny, b.asAny), {
+		def zip[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos): Flow[C, Any] = Flow.MapN(pos, List(v.asAny, b.asAny), {
 			case List(a, b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
-			case _ => ??? // impossible
+			case other => impossible(s"map2 with ${other.length}")
 		})
 
-		def zip[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D): Flow[D, Any] = Flow.MapN(List(v.asAny, b.asAny, c.asAny), {
+		def zip[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos): Flow[D, Any] = Flow.MapN(pos, List(v.asAny, b.asAny, c.asAny), {
 			case List(a, b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
-			case _ => ??? // impossible
+			case other => impossible(s"map3 with ${other.length}")
 		})
 	}
 
 	class Filter[A](v: Var[A]) {
-		def apply(p: A => Boolean): Flow[A, Any] = Flow.FilterOp(v, p).as(v)
+		def apply(p: A => Boolean)(implicit pos: SourcePos): Flow[A, Any] = Flow.FilterOp(pos, v, p).as(v)
 
-		def zip[B](b: Var[B])(p: (A, B) => Boolean): Flow[A, Any] = for {
+		def zip[B](b: Var[B])(p: (A, B) => Boolean)(implicit pos: SourcePos): Flow[A, Any] = for {
 			bool <- v.map.zip(b)(p)
 			_ <- bool.filter(identity)
 		} yield v
@@ -97,10 +100,10 @@ final case class TopologyId(value: Int) extends AnyVal
 private[flow] class VarRegistry {
 	private var defined = 0
 
-	def add[A](hint: String): Var[A] = {
-		// println(s"Adding var: $hint")
-		val v = new Var[A](new VarId(defined, hint))
+	def add[A](pos: SourcePos, hint: String): Var[A] = {
+		val v = new Var[A](new VarId(defined, hint), pos)
 		defined += 1
+		println(s"Added var: $v")
 		v
 	}
 
@@ -118,18 +121,20 @@ final class TopologyBuilder[S] private[flow] (
 	val id: TopologyId,
 	// source may be a Depot or Query, it won't be a PState
 	val source: Identity
-	) {
+	)(implicit pos: SourcePos) {
 
 	private[flow] val vars = new VarRegistry()
 
-	val input: Var[S] = vars.add[S](source.name) // mint a generated var name for elements in the source
+	val input: Var[S] = vars.add[S](pos, source.name) // mint a generated var name for elements in the source
 
-	val output: Var[S] = vars.add[S]("out") // mint a generated var name for output. Only used for queries
+	val output: Var[S] = vars.add[S](pos, "out") // mint a generated var name for output. Only used for queries
 
-	def define[A](hint: String = "var"): Var[A] = vars.add[A](hint)
+	def define[A](pos: SourcePos, hint: String = "var"): Var[A] = vars.add[A](pos, hint)
 
 	override def toString: String = s"TopologyBuilder($source)"
 }
+
+private val internal = SourcePos("internal", 1)
 
 /** The topologies of one module, and the declarations they share.
   *
@@ -231,11 +236,11 @@ final case class StreamTopology[S, R] private[flow](topology: Topology[S, R])
   */
 sealed trait Flow[A, -Ctx] {
 	import Flow._
-	def flatMap[B, C](f: Var[A] => Flow[B, C]): Flow[B, Ctx & C] = Bind(this, f)
+	def flatMap[B, C](f: Var[A] => Flow[B, C])(implicit pos: SourcePos): Flow[B, Ctx & C] = Bind(pos, this, f)
 
-	def map[B](f: Var[A] => Var[B]): Flow[B, Ctx] = Bind(this, a => Flow.Pure(f(a)))
+	def map[B](f: Var[A] => Var[B])(implicit pos: SourcePos): Flow[B, Ctx] = Bind(pos, this, a => Flow.Pure(f(a)))
 
-	def as[B](v: Var[B]): Flow[B, Ctx] = Bind(this, (_: Var[A]) => Pure(v))
+	def as[B](v: Var[B]): Flow[B, Ctx] = Bind(internal, this, (_: Var[A]) => Pure(v))
 
 	def void: Flow[Unit, Ctx] = as(Var.unit)
 
@@ -254,11 +259,11 @@ sealed trait Flow[A, -Ctx] {
 object Flow {
 	private[flow] case class Pure[A](v: Var[A]) extends Flow[A, Any]
 
-	private[flow] case class Bind[A, B, C1, C2](fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
-	private[flow] case class MapN[O](ins: List[Var[Any]], f: List[Any] => O) extends Flow[O, Any]
+	private[flow] case class Bind[A, B, C1, C2](pos: SourcePos, fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
+	private[flow] case class MapN[O](pos: SourcePos, ins: List[Var[Any]], f: List[Any] => O) extends Flow[O, Any]
 
-	private[flow] case class ExplodeOp[I, O](in: Var[I], f: I => Seq[O]) extends Flow[O, Any]
-	private[flow] case class FilterOp[I](in: Var[I], p: I => Boolean) extends Flow[Unit, Any]
+	private[flow] case class ExplodeOp[I, O](pos: SourcePos, in: Var[I], f: I => Seq[O]) extends Flow[O, Any]
+	private[flow] case class FilterOp[I](pos: SourcePos, in: Var[I], p: I => Boolean) extends Flow[Unit, Any]
 	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
 
 	private[flow] case class If[A, Ccond, C1, C2](cond: Flow[Boolean, Ccond], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C1 & C2]
@@ -269,9 +274,9 @@ object Flow {
 	// what it is for. Writes require `Etl`: "a PState can only be updated by the ETL
 	// topology that owns it".
 	private[flow] case class Select[K, V](ps: PState[K, V], key: Var[K]) extends Flow[Option[V], Any]
-	private[flow] case class Update[K, V](ps: PState[K, V], key: Var[K], f: Option[V] => Option[V]) extends Flow[Unit, Etl]
+	private[flow] case class Update[K, V](pos: SourcePos, ps: PState[K, V], key: Var[K], f: Option[V] => Option[V]) extends Flow[Unit, Etl]
 	private[flow] case class Put[K, V](ps: PState[K, V], key: Var[K], value: Var[V]) extends Flow[Unit, Etl]
-	private[flow] case class UpdateWith[K, V, A]( ps: PState[K, V], key: Var[K], arg: Var[A], f: (Option[V], A) => Option[V]) extends Flow[Unit, Etl]
+	private[flow] case class UpdateWith[K, V, A](pos: SourcePos,  ps: PState[K, V], key: Var[K], arg: Var[A], f: (Option[V], A) => Option[V]) extends Flow[Unit, Etl]
 
 	// Depot. `Etl` for the same reason: an append is an effect on the module's state,
 	// and a query is invoked by a client to compute a value.
@@ -281,12 +286,12 @@ object Flow {
 
 	def of[A](v: Var[A]): Flow[A, Any] = Pure(v)
 
-	def pure[A](value: A): Flow[A, Any] = {
+	def pure[A](value: A)(implicit pos: SourcePos): Flow[A, Any] = {
 		// TODO this can probably be optimised
-		Flow.MapN(Nil, _ => value)
+		Flow.MapN(pos, Nil, _ => value)
 	}
 
-	def foreach[O](f: () => O): Flow[O, Any] = MapN(Nil, _ => f())
+	def foreach[O](f: () => O)(implicit pos: SourcePos): Flow[O, Any] = MapN(pos, Nil, _ => f())
 
 	/** Move downstream execution to the partition owning `v`.
 	  */
@@ -321,13 +326,13 @@ final case class PState[K, V](id: Identity) {
 	def update(key: Var[K]): PState.Update[K, V] = new PState.Update(this, key)
 
 	def put(key: Var[K], value: Var[V]): Flow[Unit, Etl] = Flow.Put(this, key, value)
-	def delete(key: Var[K]): Flow[Unit, Etl] = Flow.Update(this, key, _ => None)
+	def delete(key: Var[K])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, this, key, _ => None)
 }
 
 object PState {
 	class Update[K, V](pstate: PState[K,V], key: Var[K]) {
-		def apply(f: Option[V] => Option[V]): Flow[Unit, Etl] = Flow.Update(pstate, key, f)
-		def zip[A](arg: Var[A])(f: (Option[V], A) => Option[V]): Flow[Unit, Etl] = Flow.UpdateWith(pstate, key, arg, f)
+		def apply(f: Option[V] => Option[V])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, pstate, key, f)
+		def zip[A](arg: Var[A])(f: (Option[V], A) => Option[V])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.UpdateWith(pos, pstate, key, arg, f)
 	}
 }
 
@@ -341,16 +346,16 @@ final case class Depot[A](id: Identity) {
 
 private[flow] sealed trait Node
 private[flow] object Node {
-	case class MapN(fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
+	case class MapN(pos: SourcePos, fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
 
-	case class Explode(fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
+	case class Explode(pos: SourcePos, fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
 
 	case class Assign(in: VarId, out: VarId) extends Node
 
 	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
 	  * it. Unused by `interp` backend.
 		*/
-	case class Filter(fn: Any => Boolean, in: VarId, flag: VarId) extends Node
+	case class Filter(pos: SourcePos, fn: Any => Boolean, in: VarId, flag: VarId) extends Node
 
 	case class Partition(in: VarId) extends Node
 
@@ -362,13 +367,11 @@ private[flow] object Node {
 	case class Agg(block: List[Node], agg: flow.Agg[?], collectFrom: VarId, out: VarId) extends Node
 
 	case class Select(pstate: Identity, key: VarId, out: VarId) extends Node
-	case class Update(pstate: Identity, key: VarId, fn: Option[Any] => Option[Any]) extends Node
+	case class Update(pos: SourcePos, pstate: Identity, key: VarId, fn: Option[Any] => Option[Any]) extends Node
 	case class Put(pstate: Identity, key: VarId, value: VarId) extends Node
-	case class UpdateWith(pstate: Identity, key: VarId, arg: VarId, fn: (Option[Any], Any) => Option[Any]) extends Node
+	case class UpdateWith(pos: SourcePos, pstate: Identity, key: VarId, arg: VarId, fn: (Option[Any], Any) => Option[Any]) extends Node
 	case class PartitionAppend(depot: Identity, arg: VarId) extends Node
 	case class AckReturn(value: VarId) extends Node
-
-	// case class Aggregate(agg: AckAgg[?,?], in: VarId, out: VarId) extends Node
 
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*
@@ -381,21 +384,21 @@ private[flow] object Node {
 		flow match {
 			case Flow.Pure(v) => (Nil, v)
 			case e: Flow.MapN[A] =>
-				val out = t.define[A]("map")
+				val out = t.define[A](e.pos, "map")
 				val f = e.f
-				(List(Node.MapN(args => f(args), List(), out.vid)), out)
+				(List(Node.MapN(e.pos, f, e.ins.map(_.vid), out.vid)), out)
 
 			case e: Flow.ExplodeOp[i, A] =>
-				val out = t.define[A]("exploded")
+				val out = t.define[A](e.pos, "exploded")
 				val f = e.f
 				val fn = (arg: Any) => f(arg.asInstanceOf[i]).asInstanceOf[Seq[Any]]
-				(List(Node.Explode(fn, e.in.vid, out.vid)), out)
+				(List(Node.Explode(e.pos, fn, e.in.vid, out.vid)), out)
 
 			case e: Flow.FilterOp[i] =>
 				val p = e.p
 				val fn = (arg: Any) => p(arg.asInstanceOf[i])
-				val flag = t.define[Boolean](s"${e.in.vid.hint}_keep")
-				(List(Node.Filter(fn, e.in.vid, flag.vid)), Var.unit.asInstanceOf[Var[A]])
+				val flag = t.define[Boolean](e.pos, s"${e.in.vid.hint}_keep")
+				(List(Node.Filter(e.pos, fn, e.in.vid, flag.vid)), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
 				(List(Node.Partition(p.in.vid)), Var.unit.asInstanceOf[Var[A]])
@@ -406,7 +409,7 @@ private[flow] object Node {
 				(n1 ++ n2, v2)
 
 			case i: Flow.If[a, ccond, c1, c2] =>
-				val out = t.define[a]("ifOut")
+				val out = t.define[a](internal, "ifOut")
 				val (condBlock, vCond) = compile(t, i.cond)
 				val (ifBlock, vIf) = compile(t, i.ifBlock)
 				val (elseBlock, vElse) = compile(t, i.elseBlock)
@@ -421,32 +424,31 @@ private[flow] object Node {
 
 			case a: Flow.AggList[x, c] =>
 				val (block, innerVar) = compile(t, a.block)
-				val out = t.define[A]("aggList")
+				val out = t.define[A](internal, "aggList")
 				(List(Node.AggList(block, innerVar.vid, out.vid)), out)
 
 			case a: Flow.Agg[a, b, c] =>
 				val (block, innerVar) = compile(t, a.block)
-				val out = t.define[A]("agg")
+				val out = t.define[A](internal, "agg")
 				(List(Node.Agg(block, a.agg, innerVar.vid, out.vid)), out)
 
 			case s: Flow.Select[k, v] =>
-				val out = t.define[A]("select")
+				val out = t.define[A](internal, "select")
 				(List(Node.Select(s.ps.id, s.key.vid, out.vid)), out)
 
 			case u: Flow.Update[k, v] =>
 				val f = u.f
 				val fn = (cur: Option[Any]) => f(cur.asInstanceOf[Option[v]]).asInstanceOf[Option[Any]]
-				(List(Node.Update(u.ps.id, u.key.vid, fn)), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.Update(u.pos, u.ps.id, u.key.vid, fn)), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Put(ps, key, value) =>
 				(List(Node.Put(ps.id, key.vid, value.vid)), Var.unit.asInstanceOf[Var[A]])
 
 			case up: Flow.UpdateWith[k, v, a] =>
 				up match {
-					case Flow.UpdateWith(ps, key, arg, fn) =>
-						val fnWrapped = (cur: Option[Any], arg: Any) =>
-							fn(cur.asInstanceOf[Option[v]], arg.asInstanceOf[a]).asInstanceOf[Option[Any]]
-						(List(Node.UpdateWith(ps.id, key.vid, arg.vid, fnWrapped)), Var.unit.asInstanceOf[Var[A]])
+					case Flow.UpdateWith(pos, ps, key, arg, fn0) =>
+						val fn = fn0.asInstanceOf[(Option[Any], Any) => Option[Any]]
+						(List(Node.UpdateWith(pos, ps.id, key.vid, arg.vid, fn)), Var.unit.asInstanceOf[Var[A]])
 				}
 
 			case Flow.PartitionAppend(depot, value) =>

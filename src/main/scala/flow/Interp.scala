@@ -298,11 +298,12 @@ class Partition(interpreter: Interpreter) {
 		nodes match {
 			case Nil => IO.pure(envs)
 
-			case Node.MapN(fn, ins, out) :: tail =>
+			case Node.MapN(pos, fn, ins, out) :: tail => {
 				val results = envs.map(env => env.updated(out, fn(ins.map(env(_)))))
 				continue(tail, results, ack)
+			}
 
-			case Node.Explode(fn, in, out) :: tail =>
+			case Node.Explode(_pos, fn, in, out) :: tail =>
 				val exploded = envs.flatMap { env =>
 					// in each env, `in` holds an `A`
 					// `fn` takes A and yields a Seq of values.
@@ -319,7 +320,7 @@ class Partition(interpreter: Interpreter) {
 					env.updated(out, env(in))
 				})
 
-			case Node.Filter(fn, in, _) :: tail =>
+			case Node.Filter(_pos, fn, in, _) :: tail =>
 				// The flag var exists for Rama's `keepTrue`; here the predicate prunes
 				// directly, so nothing needs binding.
 				continue(tail, envs.filter(env => fn(env(in))), ack)
@@ -374,7 +375,7 @@ class Partition(interpreter: Interpreter) {
 					continue(tail, updatedEnvs, ack)
 				}
 
-			case Node.Update(ps, key, fn) :: tail =>
+			case Node.Update(_pos, ps, key, fn) :: tail =>
 				val state = pstate(ps.name)
 				envs.traverse_ { env =>
 					val k = env(key)
@@ -392,7 +393,7 @@ class Partition(interpreter: Interpreter) {
 					}
 				} *> continue(tail, envs, ack)
 
-			case Node.UpdateWith(ps, key, arg, fn) :: tail =>
+			case Node.UpdateWith(_pos, ps, key, arg, fn) :: tail =>
 				val state = pstate(ps.name)
 				envs.traverse_ { env =>
 					val k = env(key)

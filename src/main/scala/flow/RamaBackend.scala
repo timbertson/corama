@@ -103,10 +103,10 @@ object RamaBackend {
 	}
 
 	private def compileNode(node: Node): Block.Impl = node match {
-		case Node.MapN(fn, ins, out)    => eachStep(fn, ins.map(compileVar), compileVar(out))
-		case Node.Explode(fn, in, out) => explodeStep(fn, compileVar(in), compileVar(out))
+		case Node.MapN(_pos, fn, ins, out)    => eachStep(fn, ins.map(compileVar), compileVar(out))
+		case Node.Explode(_pos, fn, in, out) => explodeStep(fn, compileVar(in), compileVar(out))
 
-		case Node.Filter(fn, in, flag) =>
+		case Node.Filter(_pos, fn, in, flag) =>
 			val flagName = compileVar(flag)
 			eachStep(arg => fn(arg).asInstanceOf[Any], List(compileVar(in)), flagName)
 				.`macro`(Block.keepTrue(flagName))
@@ -145,7 +145,7 @@ object RamaBackend {
 				.each(Option.apply, compileVar(out)) // localselect returns null when not found
 				.out(compileVar(out))
 
-		case Node.Update(ps, key, fn) =>
+		case Node.Update(_pos, ps, key, fn) =>
 			// Rama models read-modify-write as a `term` on the path: the function
 			// receives the current value (null when absent) and returns the new one.
 			val term = new RamaFunction1[Any, Any] {
@@ -162,7 +162,7 @@ object RamaBackend {
 		case Node.AckReturn(value) =>
 			Block.ackReturn(compileVar(value))
 
-		case Node.UpdateWith(ps, key, arg, fn) =>
+		case Node.UpdateWith(_pos, ps, key, arg, fn) =>
 			// Rama's 2-arity `term`: the extra var is passed as a path argument, which
 			// is how a runtime value reaches a read-modify-write.
 			val term = new RamaFunction2[Any, Any, Any] {
