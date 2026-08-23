@@ -16,6 +16,7 @@ libraryDependencies ++= Seq(
 	"co.fs2" %% "fs2-core" % fs2Version,
 	"co.fs2" %% "fs2-io" % fs2Version,
 	"org.tpolecat" %% "sourcepos" % "1.2.0",
+	"dev.zio" %% "izumi-reflect" % "3.0.9",
 )
 
 val logbackClassic = "ch.qos.logback" % "logback-classic" % "1.5.6"

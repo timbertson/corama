@@ -35,10 +35,63 @@ object VarId {
 	implicit val eq: Eq[VarId] = Eq.fromUniversalEquals
 }
 
-final class Var[A] private[flow] (private[flow] val vid: VarId, pos: SourcePos) {
+// Some parts of the API require either a literal or a var,
+// in particular paths. This trait allows you to accept
+// either a var or anything else, and you'll summon the
+// appropriate instance.
+// TODO: put a constraint on `serializable` for the any instance,
+// since Var should never be serializable.
+private [flow] sealed trait MaybeVar[A]
+
+trait IntoVar[A] {
+	// type B will either be `A` or `Var[A]`
+	type T
+	def intoVar(value: A): MaybeVar[T]
+}
+
+trait DefaultIntoVar {
+	implicit def anyIntoVar[A]: IntoVar[A] = new IntoVar[A] {
+		type T = A
+		def intoVar(value: A): MaybeVar[T] = Var.Literal(value)
+	}
+}
+
+object IntoVar extends DefaultIntoVar {
+	implicit def varIntoVar[A]: IntoVar[Var[A]] = new IntoVar[Var[A]] {
+		type T = A
+		def intoVar(value: Var[A]): MaybeVar[T] = value
+	}
+}
+
+final class Var[A] private[flow] (private[flow] val vid: VarId, pos: SourcePos) extends MaybeVar[A] {
 	private def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
 
-	def map: Var.Map[A] = new Var.Map(this)
+	def map[B](f: A => B)(implicit pos: SourcePos): Flow[B, Any] = Flow.MapN(pos, List(this.asAny), {
+		case List(v) => f(v.asInstanceOf[A])
+		case other => impossible(s"map with ${other.length}")
+	})
+
+	def mapWith[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos): Flow[C, Any] = Flow.MapN(pos, List(this.asAny, b.asAny), {
+		case List(a, b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
+		case other => impossible(s"mapWith[2] with ${other.length}")
+	})
+
+	def mapWith[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos): Flow[D, Any] = Flow.MapN(pos, List(this.asAny, b.asAny, c.asAny), {
+		case List(a, b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
+		case other => impossible(s"mapWith[3] with ${other.length}")
+	})
+
+	def filter(p: A => Boolean)(implicit pos: SourcePos): Flow[A, Any] =
+		Flow.FilterOp(pos, List(this.asAny), {
+			case List(a) => p(a.asInstanceOf[A])
+			case other => impossible(s"filter with ${other.length}")
+		}).as(this)
+
+	def filterWith[B](b: Var[B])(p: (A, B) => Boolean)(implicit pos: SourcePos): Flow[A, Any] =
+		Flow.FilterOp(pos, List(this.asAny, b.asAny), {
+			case List(a,b) => p(a.asInstanceOf[A],b.asInstanceOf[B])
+			case other => impossible(s"filter[2] with ${other.length}")
+		}).as(this)
 
 	// TODO this could probably be optimised
 	def mapFilter[B](f: A => Option[B])(implicit pos: SourcePos): Flow[B, Any] = for {
@@ -52,9 +105,10 @@ final class Var[A] private[flow] (private[flow] val vid: VarId, pos: SourcePos) 
 	def into[F[_]](using f: Applicative[F])(implicit pos: SourcePos): Flow[F[A], Any] = this.map(f.pure)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
-	def explode[B](f: A => Seq[B])(implicit pos: SourcePos): Flow[B, Any] = Flow.ExplodeOp(pos, this, f)
-
-	def filter: Var.Filter[A] = new Var.Filter(this)
+	def explode[B](f: A => Seq[B])(implicit pos: SourcePos): Flow[B, Any] = Flow.ExplodeOp(pos, List(this.asAny), {
+		case List(a) => f(a.asInstanceOf[A])
+		case other => impossible(s"explode with ${other.length}")
+	})
 
 	def void: Flow[Unit, Any] = Flow.Pure(Var.unit)
 
@@ -69,6 +123,8 @@ final class Var[A] private[flow] (private[flow] val vid: VarId, pos: SourcePos) 
 private def impossible(reason: String) = throw new IllegalStateException(reason)
 
 object Var {
+	case class Literal[A](value: A) extends MaybeVar[A]
+
 	// Virtual vars have a unique id < 0 and are never given a Rama name
 	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"), implicitly[SourcePos])
 
@@ -81,31 +137,5 @@ object Var {
 				ifNone,
 				v.map(_.get).flatMap(ifSome)
 			)
-	}
-
-	class Map[A](v: Var[A]) {
-		def apply[B](f: A => B)(implicit pos: SourcePos): Flow[B, Any] = Flow.MapN(pos, List(v.asAny), {
-			case List(v) => f(v.asInstanceOf[A])
-			case other => impossible(s"map1 with ${other.length}")
-		})
-
-		def zip[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos): Flow[C, Any] = Flow.MapN(pos, List(v.asAny, b.asAny), {
-			case List(a, b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
-			case other => impossible(s"map2 with ${other.length}")
-		})
-
-		def zip[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos): Flow[D, Any] = Flow.MapN(pos, List(v.asAny, b.asAny, c.asAny), {
-			case List(a, b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
-			case other => impossible(s"map3 with ${other.length}")
-		})
-	}
-
-	class Filter[A](v: Var[A]) {
-		def apply(p: A => Boolean)(implicit pos: SourcePos): Flow[A, Any] = Flow.FilterOp(pos, v, p).as(v)
-
-		def zip[B](b: Var[B])(p: (A, B) => Boolean)(implicit pos: SourcePos): Flow[A, Any] = for {
-			bool <- v.map.zip(b)(p)
-			_ <- bool.filter(identity)
-		} yield v
 	}
 }

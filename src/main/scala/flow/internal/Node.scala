@@ -16,36 +16,73 @@ import flow._
 
 private[flow] sealed trait Node
 private[flow] object Node {
-	case class MapN(pos: SourcePos, fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
+	// operations backed by a user-supplied function
+	sealed trait DynamicOp
+	object DynamicOp {
+		case class Map(out: VarId) extends DynamicOp
+		case class Explode(out: VarId) extends DynamicOp
+		case class Filter(condVar: VarId) extends DynamicOp
+	}
 
-	case class Explode(pos: SourcePos, fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
+	// Dynamic node represents anything with a user-supplied function.
+	// The `op` contains the output var, if present
+	case class Dynamic(pos: SourcePos, ins: List[VarId], fn: List[Any] => Any, op: DynamicOp) extends Node
+
+	// // Operations with a single input var, and optional output var
+	// sealed trait UnaryOp
+	// object UnaryOp {
+	// 	case class Assign(out: VarId)
+	// 	case class Agg(agg: Flow.Agg[?], out: VarId)
+	// 	case class If(ifBlock: List[Node], elseBlock: List[Node], out: VarId)
+	// 	case class LocalAppend(depot: Depot[?])
+	// }
+	// case class Unary(in: VarId, op: UnaryOp) extends Node
+
+	// case class MapN(pos: SourcePos, fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
+
+	// case class Explode(pos: SourcePos, fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
 
 	case class Assign(in: VarId, out: VarId) extends Node
 
 	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
 	  * it. Unused by `interp` backend.
 		*/
-	case class Filter(pos: SourcePos, fn: Any => Boolean, in: VarId, flag: VarId) extends Node
+	// case class Filter(pos: SourcePos, fn: Any => Boolean, in: VarId, flag: VarId) extends Node
 
 	case class Partition(in: VarId) extends Node
 
 	case class If(cond: VarId, ifBlock: List[Node], elseBlock: List[Node], out: VarId) extends Node
 
-	// TODO: this is a special case of Agg, is it necessary?
-	case class AggList(block: List[Node], collectFrom: VarId, out: VarId) extends Node
-
 	case class Agg(block: List[Node], agg: flow.Agg[?], collectFrom: VarId, out: VarId) extends Node
 
-	case class Select(pstate: Identity, key: VarId, out: VarId) extends Node
-	case class Update(pos: SourcePos, pstate: Identity, key: VarId, fn: Option[Any] => Option[Any]) extends Node
-	case class Put(pstate: Identity, key: VarId, value: VarId) extends Node
-	case class UpdateWith(pos: SourcePos, pstate: Identity, key: VarId, arg: VarId, fn: (Option[Any], Any) => Option[Any]) extends Node
-	case class PartitionAppend(depot: Identity, arg: VarId) extends Node
+	case class LocalAppend(depot: Identity, arg: VarId) extends Node
+
 	case class AckReturn(value: VarId) extends Node
+
+	sealed trait PStateOp
+	object PStateOp {
+		case class Add(v: VarId) extends PStateOp
+		case class Remove(v: VarId) extends PStateOp
+		case class Select(out: VarId, limit: Option[Int]) extends PStateOp
+
+		case class Get(out: VarId) extends PStateOp
+		case class Put(v: VarId) extends PStateOp
+		// case class Delete(v: VarId) extends PStateOp
+	}
+
+	case class PStateNode(pstate: Identity, path: CompiledPath, op: PStateOp) extends Node
+	case class PStateUpdate(
+		pos: SourcePos, pstate: Identity, path: CompiledPath, ins: List[VarId],
+		fn: (Option[Any], List[Any]) => Option[Any]
+	) extends Node
+
+	private def compilePath(path: Path): CompiledPath = ???
 
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*
 		* TODO: remove unnecessary var return?
+		*
+		* It at least should be a Var[Any], Var[A] is a lie
 		*
 		* NOTE: for the rama backend, _always_ extract `f` to a value first. Otherwise
 		*       the closure captures Var[T], which isn't serializable.
@@ -53,22 +90,21 @@ private[flow] object Node {
 	def compile[A](t: TopologyBuilder[?], flow: Flow[A, ?]): (List[Node], Var[A]) = {
 		flow match {
 			case Flow.Pure(v) => (Nil, v)
+
 			case e: Flow.MapN[A] =>
 				val out = t.define[A](e.pos, "map")
 				val f = e.f
-				(List(Node.MapN(e.pos, f, e.ins.map(_.vid), out.vid)), out)
+				(List(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Map(out.vid))), out)
 
-			case e: Flow.ExplodeOp[i, A] =>
+			case e: Flow.ExplodeOp[A] =>
 				val out = t.define[A](e.pos, "exploded")
 				val f = e.f
-				val fn = (arg: Any) => f(arg.asInstanceOf[i]).asInstanceOf[Seq[Any]]
-				(List(Node.Explode(e.pos, fn, e.in.vid, out.vid)), out)
+				(List(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Explode(out.vid))), out)
 
 			case e: Flow.FilterOp[i] =>
-				val p = e.p
-				val fn = (arg: Any) => p(arg.asInstanceOf[i])
-				val flag = t.define[Boolean](e.pos, s"${e.in.vid.hint}_keep")
-				(List(Node.Filter(e.pos, fn, e.in.vid, flag.vid)), Var.unit.asInstanceOf[Var[A]])
+				val f = e.f
+				val condVar = t.define[Boolean](Var.internal, "cond")
+				(List(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Filter(condVar.vid))), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
 				(List(Node.Partition(p.in.vid)), Var.unit.asInstanceOf[Var[A]])
@@ -92,37 +128,34 @@ private[flow] object Node {
 
 				(condBlock ++ bodyNodes, out)
 
-			case a: Flow.AggList[x, c] =>
-				val (block, innerVar) = compile(t, a.block)
-				val out = t.define[A](Var.internal, "aggList")
-				(List(Node.AggList(block, innerVar.vid, out.vid)), out)
-
 			case a: Flow.Agg[a, b, c] =>
 				val (block, innerVar) = compile(t, a.block)
 				val out = t.define[A](Var.internal, "agg")
 				(List(Node.Agg(block, a.agg, innerVar.vid, out.vid)), out)
 
-			case s: Flow.Select[k, v] =>
-				val out = t.define[A](Var.internal, "select")
-				(List(Node.Select(s.ps.id, s.key.vid, out.vid)), out)
+			case g: Flow.Get[a] =>
+				val out = t.define[A](Var.internal, "get")
+				(List(Node.PStateNode(g.lens.pstate.id, compilePath(g.lens.path), PStateOp.Get(out.vid))), out)
 
-			case u: Flow.Update[k, v] =>
+			case Flow.Put(lens, value) =>
+				(List(Node.PStateNode(lens.pstate.id, compilePath(lens.path), PStateOp.Put(value.vid))), Var.unit.asInstanceOf[Var[A]])
+
+			case Flow.Add(lens, value) =>
+				(List(Node.PStateNode(lens.pstate.id, compilePath(lens.path), PStateOp.Add(value.vid))), Var.unit.asInstanceOf[Var[A]])
+
+			case Flow.Remove(lens, value) =>
+				(List(Node.PStateNode(lens.pstate.id, compilePath(lens.path), PStateOp.Remove(value.vid))), Var.unit.asInstanceOf[Var[A]])
+
+			case u: Flow.Update[v] =>
 				val f = u.f
-				val fn = (cur: Option[Any]) => f(cur.asInstanceOf[Option[v]]).asInstanceOf[Option[Any]]
-				(List(Node.Update(u.pos, u.ps.id, u.key.vid, fn)), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.PStateUpdate(u.pos, u.lens.pstate.id, compilePath(u.lens.path), u.ins.map(_.vid), f)), Var.unit.asInstanceOf[Var[A]])
 
-			case Flow.Put(ps, key, value) =>
-				(List(Node.Put(ps.id, key.vid, value.vid)), Var.unit.asInstanceOf[Var[A]])
+			case s: Flow.Select[v] =>
+				val out = t.define[A](Var.internal, "select")
+				(List(Node.PStateNode(s.lens.pstate.id, compilePath(s.lens.path), PStateOp.Select(out.vid, s.limit))), out)
 
-			case up: Flow.UpdateWith[k, v, a] =>
-				up match {
-					case Flow.UpdateWith(pos, ps, key, arg, fn0) =>
-						val fn = fn0.asInstanceOf[(Option[Any], Any) => Option[Any]]
-						(List(Node.UpdateWith(pos, ps.id, key.vid, arg.vid, fn)), Var.unit.asInstanceOf[Var[A]])
-				}
-
-			case Flow.PartitionAppend(depot, value) =>
-				(List(Node.PartitionAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])
+			case Flow.LocalAppend(depot, value) =>
+				(List(Node.LocalAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.AckReturn(value) =>
 				(List(Node.AckReturn(value.vid)), Var.unit.asInstanceOf[Var[A]])

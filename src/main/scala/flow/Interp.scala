@@ -1,5 +1,6 @@
 package flow
 
+import cats.data.NonEmptyList
 import fs2.Stream
 import cats.syntax.all._
 import scala.collection.mutable
@@ -12,6 +13,7 @@ import flow.Interpreter.Env
 import scala.util.Random
 import fs2.concurrent.SignallingRef
 import fs2.Chunk
+import izumi.reflect.Tag
 
 import flow.internal._
 
@@ -57,6 +59,24 @@ class Partitions(interpreter: Interpreter, numPartitions: Int) {
 object Storage {
 	class PState() {
 		val inner = Ref.unsafe[IO, Map[Any,Any]](Map.empty)
+		def modify[R](path: NonEmptyList[Any])(fn: (Option[Any]) => (Option[Any], R)): IO[R] = {
+			inner.modify { map =>
+				def recurse(path: NonEmptyList[Any], map: Map[Any, Any]): (Map[Any, Any], R) = {
+					NonEmptyList.fromList(path.tail) match {
+						case Some(tail) => {
+							val child = map.get(path.head).fold(Map.empty[Any, Any])(_.asInstanceOf[Map[Any, Any]])
+							val (newMap, result) = recurse(tail, child)
+							(map.updated(path.head, newMap), result)
+						}
+						case None => {
+							val (newValue, result) = fn(map.get(path.head))
+							(map.updated(path.head, newValue), result)
+						}
+					}
+				}
+				recurse(path, map)
+			}
+		}
 	}
 	class Depot() {
 		val inner = SignallingRef.of[IO, Vector[Record]](Vector.empty).unsafeRunSync()(using unsafe.IORuntime.global)
@@ -64,6 +84,11 @@ object Storage {
 			val additions = values.drop(seen)
 			(seen + additions.length, additions)
 		}.mapChunks { ch => ch.flatMap(tup => Chunk.from(tup._2)) }
+	}
+
+	class Lens[V](pstate: PState) {
+		def put(v: V): IO[Unit] = ???
+		def get: IO[Option[V]] = ???
 	}
 }
 
@@ -147,16 +172,13 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 		IO.race(block, run).map(_.merge)
 	}
 
-	def put[K, V](pstate: flow.PState[K, V], key: K, value: V): IO[Unit] =
-		this.partitions.partitionKey(key).put(pstate, key, value)
+	def access[K, V](pstate: flow.PStateKV[K, V], key: K): Storage.Lens[V] = ???
 
-	def delete[K, V](pstate: flow.PState[K, V], key: K): IO[Unit] =
-		this.partitions.partitionKey(key).delete(pstate, key)
+	def access[K, V](pstate: flow.PStateKVSet[K, V], key: K): Storage.Lens[Set[V]] = ???
 
-	def get[K, V](pstate: flow.PState[K, V], key: K): IO[Option[V]] =
-		this.partitions.partitionKey(key).get(pstate, key)
+	def access[V: Tag](pstate: flow.PState, path: Path): Storage.Lens[V] = ???
 
-	def getKeys[K, V](pstate: flow.PState[K, V]): IO[Set[K]] =
+	def getKeys[K, V](pstate: flow.PStateKV[K, V]): IO[Set[K]] =
 		this.partitions.all.flatTraverse { partition =>
 			partition.getKeys(pstate).map(_.toList)
 		}.map(_.toSet)
@@ -259,17 +281,13 @@ class Partition(interpreter: Interpreter) {
 		} *> IO.never
 	}
 	
-	def put[K, V](pstate: flow.PState[K, V], key: K, value: V): IO[Unit] =
-		this.pstate(pstate.id.name).inner.update(_.updated(key, value))
+	def access[K, V](pstate: flow.PStateKV[K, V], key: K): Storage.Lens[V] = ???
 
-	def delete[K, V](pstate: flow.PState[K, V], key: K): IO[Unit] =
-		this.pstate(pstate.id.name).inner.update(_.removed(key))
+	def access[K, V](pstate: flow.PStateKVSet[K, V], key: K): Storage.Lens[Set[V]] = ???
 
-	def get[K, V](pstate: flow.PState[K, V], key: K): IO[Option[V]] = {
-		this.pstate(pstate.id.name).inner.get.map(_.get(key).map(_.asInstanceOf[V]))
-	}
+	def access[V: Tag](pstate: flow.PState, path: Path): Storage.Lens[V] = ???
 
-	def getKeys[K, V](pstate: flow.PState[K, V]): IO[Set[K]] = {
+	def getKeys[K, V](pstate: flow.PStateKV[K, V]): IO[Set[K]] = {
 		this.pstate(pstate.id.name).inner.get.map(_.keySet.map(_.asInstanceOf[K]))
 	}
 
@@ -289,6 +307,11 @@ class Partition(interpreter: Interpreter) {
 	private def pstate(name: String) = pstates.getOrElse(name, throw new RuntimeException(s"Unknown pstate: ${name}"))
 	private def depot(name: String) = depots.getOrElse(name, throw new RuntimeException(s"Unknown depot: ${name}"))
 
+	private def compilePath(path: CompiledPath, envs: Env): NonEmptyList[Any] = {
+		???
+	}
+
+
 	/** Runs a list of nodes with the given envs. Returns the resulting list of envs.
 	  *
 	  * `ack` is where `Node.AckReturn` reports, and is `None` for a query or for a record
@@ -297,35 +320,37 @@ class Partition(interpreter: Interpreter) {
 	  * to the *appender* rather than to the task that produced it.
 	  */
 	private [flow] def continue(nodes: List[Node], envs: List[Env], ack: Option[AckSink] = None): IO[List[Env]] =
+		import Node.DynamicOp
+		import Node.PStateOp
+
 		nodes match {
 			case Nil => IO.pure(envs)
 
-			case Node.MapN(pos, fn, ins, out) :: tail => {
-				val results = envs.map(env => env.updated(out, fn(ins.map(env(_)))))
+			case Node.Dynamic(pos, ins, fn, op) :: tail => {
+				// TODO: error reporting using the `pos`
+				val results = op match {
+					case DynamicOp.Map(out) =>
+						envs.map(env => env.updated(out, fn(ins.map(env(_)))))
+					case DynamicOp.Explode(out) =>
+						// in each env, `in` holds an `A`
+						// `fn` takes A and yields a Seq of values.
+						// we expand each of these into `out` in a
+						// copy of the parent env
+						envs.flatMap { env =>
+							fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
+								env.updated(out, value)
+							}
+						}
+					case DynamicOp.Filter(_) =>
+						envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
+				}
 				continue(tail, results, ack)
 			}
-
-			case Node.Explode(_pos, fn, in, out) :: tail =>
-				val exploded = envs.flatMap { env =>
-					// in each env, `in` holds an `A`
-					// `fn` takes A and yields a Seq of values.
-					// we expand each of these into `out` in a
-					// copy of the parent env
-					fn(env(in)).toList.map { value =>
-						env.updated(out, value)
-					}
-				}
-				continue(tail, exploded, ack)
 
 			case Node.Assign(in, out) :: tail =>
 				continue(tail, envs.map { env =>
 					env.updated(out, env(in))
 				})
-
-			case Node.Filter(_pos, fn, in, _) :: tail =>
-				// The flag var exists for Rama's `keepTrue`; here the predicate prunes
-				// directly, so nothing needs binding.
-				continue(tail, envs.filter(env => fn(env(in))), ack)
 
 			case Node.If(cond, ifBranch, elseBranch, out) :: tail =>
 				envs.flatTraverse { env =>
@@ -342,18 +367,6 @@ class Partition(interpreter: Interpreter) {
 				}
 			}
 
-			case Node.AggList(block, collectFrom, out) :: tail => {
-				envs.traverse { env =>
-					// for each env, we execute the sub-block and add its result to `out` in the
-					// single resulting env
-					continue(block, List(env), ack).map { innerEnvs =>
-						env.updated(out, innerEnvs.map(block => block(collectFrom)))
-					}
-				}.flatMap { outputEnvs =>
-					continue(tail, outputEnvs, ack)
-				}
-			}
-
 			case Node.Agg(block, agg, collectFrom, out) :: tail => {
 				envs.traverse { env =>
 					continue(block, List(env), ack).map { innerEnvs =>
@@ -365,47 +378,65 @@ class Partition(interpreter: Interpreter) {
 					continue(tail, outputEnvs, ack)
 				}
 			}
-
-			case Node.Select(ps, key, out) :: tail =>
+			
+			case Node.PStateNode(ps, path, op) :: tail =>
 				val state = pstate(ps.name)
 				envs.traverse { env =>
-					val k = env(key)
-					state.inner.get.map(_.get(k)).map { value =>
-						env.updated(out, value)
+					val rawPath = compilePath(path, env)
+					def applyOp(current: Option[Any]): (Option[Any], Env) = {
+						def currentSet: Set[Any] = current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
+						op match {
+							case PStateOp.Add(v: VarId) => (Some(currentSet.incl(env(v))), env)
+							case PStateOp.Remove(v: VarId) => (Some(currentSet.excl(env(v))), env)
+							case PStateOp.Select(out: VarId, limit: Option[Int]) => {
+								// TODO: implement limit
+								(current, env.updated(out, currentSet))
+							}
+
+							case PStateOp.Get(out: VarId) => (current, env.updated(out, current))
+							case PStateOp.Put(v: VarId) => (Some(env(v)), env)
+							// case PStateOp.Delete(v: VarId) => (None, env)
+						}
 					}
+					state.modify(rawPath)(applyOp)
 				}.flatMap { updatedEnvs =>
 					continue(tail, updatedEnvs, ack)
 				}
 
-			case Node.Update(_pos, ps, key, fn) :: tail =>
+			case Node.PStateUpdate(_pos, ps, path, ins, fn) :: tail =>
+				val f = fn // TODO is this necessary?
 				val state = pstate(ps.name)
 				envs.traverse_ { env =>
-					val k = env(key)
-					state.inner.update { map =>
-						map.updatedWith(k)(fn)
+					val rawPath = compilePath(path, env)
+					def applyOp(current: Option[Any]): (Option[Any], Unit) = {
+						val args = ins.map(env(_))
+						(f(current, args), ())
 					}
-				} *> continue(tail, envs, ack)
+					state.modify(rawPath)(applyOp)
+				}.flatMap { _ =>
+					continue(tail, envs, ack)
+				}
 
-			case Node.Put(ps, key, value) :: tail =>
-				val state = pstate(ps.name)
-				envs.traverse_ { env =>
-					val k = env(key)
-					state.inner.update { map =>
-						map.updated(k, env(value))
-					}
-				} *> continue(tail, envs, ack)
+			// case Node.Put(ps, key, value) :: tail =>
+			// 	val state = pstate(ps.name)
+			// 	envs.traverse_ { env =>
+			// 		val k = env(key)
+			// 		state.inner.update { map =>
+			// 			map.updated(k, env(value))
+			// 		}
+			// 	} *> continue(tail, envs, ack)
 
-			case Node.UpdateWith(_pos, ps, key, arg, fn) :: tail =>
-				val state = pstate(ps.name)
-				envs.traverse_ { env =>
-					val k = env(key)
-					val a = env(arg)
-					state.inner.update { map =>
-						map.updatedWith(k)(v => fn(v, a))
-					}
-				} *> continue(tail, envs, ack)
+			// case Node.UpdateWith(_pos, ps, key, arg, fn) :: tail =>
+			// 	val state = pstate(ps.name)
+			// 	envs.traverse_ { env =>
+			// 		val k = env(key)
+			// 		val a = env(arg)
+			// 		state.inner.update { map =>
+			// 			map.updatedWith(k)(v => fn(v, a))
+			// 		}
+			// 	} *> continue(tail, envs, ack)
 
-			case Node.PartitionAppend(dep, value) :: tail =>
+			case Node.LocalAppend(dep, value) :: tail =>
 				val state = depot(dep.name)
 				envs.traverse_ { env =>
 					val v = env(value)

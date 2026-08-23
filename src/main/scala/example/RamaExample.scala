@@ -18,7 +18,6 @@ class RamaExample extends RamaModule {
 	val topologies: Topologies = Topologies()
 
 	// val fullTickets: PState[Long, FullTicket] = topologies.pstate("fullTickets")
-	// val userTickets: PState[Long, Set[Long]] = topologies.pstate("userTickets")
 	// val users: PState[Long, String] = topologies.pstate("users")
 
 	// val ticketAssignment: Depot[TicketAssignment] = topologies.depot("ticketAssignment")
@@ -35,23 +34,25 @@ class RamaExample extends RamaModule {
 	val mergedUserChange = topologies.depot[User]("mergedUserChange", rama.Depot.hashBy(classOf[UserPartitionKey]))
 	val propagateTicketAssignment = topologies.depot[PropagateTicketAssignment]("propagateTicketAssignment", rama.Depot.hashBy(classOf[PropagateTicketAssignmentKey]))
 
-	val users = topologies.pstate[JLong, User]("user", rama.PState.mapSchema(classOf[JLong], classOf[User]))
+	val users = topologies.pstateKV[JLong, User]("user")
 
 	// tickets is a set of IDs, subindexed so it can be arbitrarily large
-	val userTickets = topologies.pstate[JLong, List[JLong]]("userTickets", rama.PState.mapSchema(classOf[JLong],
-		rama.PState.fixedKeysSchema(
-			"user", classOf[User],
-			"ticketIds", rama.PState.setSchema(classOf[JLong]).subindexed,
-		))
-	)
+	val userTickets = topologies.pstateKVSet[JLong, JLong]("userTickets", Subindex.indexed)
 
-	val fullTicket = topologies.pstate[JLong, FullTicket]("fullTicket", rama.PState.mapSchema(classOf[JLong], classOf[FullTicket]))
+	// val userTickets = topologies.pstate("userTickets",
+	// 	Schema.map(Schema[JLong], Schema.fixed(
+	// 		"user" -> Schema[User],
+	// 		"ticketIds" -> Schema.set[JLong](Subindex.indexed)
+	// 	)
+	// ))
+
+	val fullTicket = topologies.pstateKV[JLong, FullTicket]("fullTicket")
 
 	// upstream ticket changes update the fullTicket view
 	topologies.stream_(upstreamTicket) { ticket =>
 		for {
 			id <- ticket.map(_.id)
-			_ <- fullTicket.update(id).zip(ticket) { (full, upstream) =>
+			_ <- fullTicket(id).updateWith(ticket) { (full, upstream) =>
 				println(s"upserting $upstream into $full")
 				Some(full.fold(FullTicket(upstream, None, None))(_.copy(upstream = upstream)))
 			}
@@ -62,7 +63,7 @@ class RamaExample extends RamaModule {
 	val registrationStream = topologies.stream(userRegistration, Result.agg[Unit]) { user =>
 		for {
 			userId <- user.map(_.id)
-			existing <- users.get(userId)
+			existing <- users(userId).get
 			result <- existing.fold[Result.Void, flow.Etl] {
 				// no existing user
 				for {
@@ -78,14 +79,14 @@ class RamaExample extends RamaModule {
 	val nameChangeStream = topologies.stream(userNameChange, Result.agg[Unit]) { change =>
 		for {
 			userId <- change.map(_.userId)
-			existing <- users.get(userId)
+			existing <- users(userId).get
 			result <- existing.fold[Result.Void, flow.Etl] {
 				userId.map { uid =>
 					Result.failure(s"No such user: $uid")
 				}
 			} { existing =>
 				for {
-					user <- existing.map.zip(change) { (existing, change) =>
+					user <- existing.mapWith(change) { (existing, change) =>
 						existing.copy(name = change.name)
 					}
 					_ <- mergedUserChange.localAppend(user)
@@ -103,7 +104,7 @@ class RamaExample extends RamaModule {
 			userId <- user.map(_.id)
 			_ <- user.foreach { user => println(s"Applying merged user change: $user") }
 			// store the new user
-			_ <- users.put(userId, user)
+			_ <- users(userId).put(user)
 			// _ <- userId.foreach { id => println(s"Updating user $id in userTickets") }
 			// _ <- userTickets.update(userId, user) { (maybeUserTickets, user) =>
 			// 	maybeUserTickets.map(_.copy(user = user))
@@ -118,14 +119,14 @@ class RamaExample extends RamaModule {
 			ticketId <- assignment.map(_.ticketId)
 
 			// assignment is partitioned by (new) assigneeId. First validate the new assignee
-			newAssignee <- users.get(userId)
+			newAssignee <- users(userId).get
 			result <- newAssignee.fold[Result.Void, StreamContext[Result.Void]] {
 				userId.map(userId => Result.failure(s"No such user: $userId"))
 			} { newAssignee =>
 				for {
 					_ <- Flow.hashPartition(ticketId)
 					_ <- ticketId.foreach(t => println(s"Finding ticket $t"))
-					prevTicket <- fullTicket.get(ticketId)
+					prevTicket <- fullTicket(ticketId).get
 					result <- prevTicket.fold {
 						ticketId.map(ticketId => Result.failure[Unit](s"No such ticket: $ticketId"))
 					} { ticket =>
@@ -133,7 +134,7 @@ class RamaExample extends RamaModule {
 						// Dispatch an event keyed on the ticket ID, serializing the
 						// old assignee ID so it can't be lost in the case of a retried transaction
 						for {
-							message <- ticket.map.zip(userId) { (ticket, assignee) =>
+							message <- ticket.mapWith(userId) { (ticket, assignee) =>
 								PropagateTicketAssignment(ticket.upstream.id, assignee = assignee, prevAssignee = ticket.assignee)
 							}
 							_ <- propagateTicketAssignment.localAppend(message)
@@ -153,27 +154,20 @@ class RamaExample extends RamaModule {
 			oldUserId <- assignment.map(_.prevAssignee)
 
 			// Update fullTicket, it's the source of truth for who owns a ticket
-			_ <- fullTicket.update(ticketId).zip(newUserId) { (ticket, newUserId) =>
+			_ <- fullTicket(ticketId).updateWith(newUserId) { (ticket, newUserId) =>
 				ticket.map(_.copy(assignee = Some(newUserId)))
 			}
 			
 			// now update new user
 			_ <- Flow.hashPartition(newUserId)
 
-			// TODO: update userTickets.ticketIds as a set, not userTickets as a single object
-			// Rama uses: Path.key("*newUserId", "ticketIds").voidSetElem().termVal("*ticketId")
-			_ <- userTickets.update(newUserId).zip(ticketId) { (userTickets: Option[List[JLong]], ticketId) =>
-				Some(userTickets.getOrElse(List.empty[JLong]).appended(ticketId))
-			}
+			_ <- userTickets(newUserId).add(ticketId)
 			
 			// now remove from old user, if defined (and different from new user)
 			oldUserId <- oldUserId.mapFilter(identity)
-			_ <- oldUserId.filter.zip(newUserId)((a, b) => a =!= b)
+			_ <- oldUserId.filterWith(newUserId)((a, b) => a =!= b)
 			_ <- Flow.hashPartition(oldUserId)
-			// TODO act as a sub-collection, not a raw set
-			_ <- userTickets.update(oldUserId).zip(ticketId) { (tickets, ticketId) =>
-				Some(tickets.getOrElse(List.empty[JLong]).filter(_ =!= ticketId))
-			}
+			_ <- userTickets(oldUserId).remove(ticketId)
 		} yield Var.unit
 	}
 

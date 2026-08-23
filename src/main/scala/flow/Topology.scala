@@ -7,6 +7,7 @@ import scala.annotation.unused
 import cats.Eq
 import com.rpl.rama.RamaSerializable
 import cats.Monoid
+import izumi.reflect.Tag
 
 import flow.internal._
 
@@ -45,6 +46,8 @@ final class Topologies {
 	private [flow] var ids = Set.empty[Identity]
 	private var built = List.empty[Topology[?, ?]]
 
+	// private var pstates: List[Pstate]
+
 	def topologies: List[Topology[?, ?]] = built.reverse
 
 	private[flow] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
@@ -57,7 +60,14 @@ final class Topologies {
 		identity
 	}
 
-	def pstate[K, V](name: String, @unused /* TODO */ schame: Any = ()): PState[K, V] = PState[K, V](claim(Identity(IdentityNamespace.PState, name)))
+	def pstateKV[K: Tag, V: Tag](name: String): PStateKV[K, V] =
+		PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name)))
+
+	def pstateKVSet[K: Tag, V: Tag](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
+		PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex)
+
+	def pstate(name: String, schema: Schema): PState =
+		PState(claim(Identity(IdentityNamespace.PState, name)), schema)
 
 	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] = Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
 
@@ -143,25 +153,3 @@ object IdentityNamespace {
 // Shared trait for PState, Depot and Query which all
 // have publically referenceable names
 private case class Identity(namespace: IdentityNamespace, name: String)
-
-final case class PState[K, V](id: Identity) {
-	def get(key: Var[K]): Flow[Option[V], Any] = Flow.Select(this, key)
-
-	def getOrElse(key: Var[K], dfl: V): Flow[V, Any] = Flow.Select(this, key).flatMap(v => v.map(_.getOrElse(dfl)))
-
-	def update(key: Var[K]): PState.Update[K, V] = new PState.Update(this, key)
-
-	def put(key: Var[K], value: Var[V]): Flow[Unit, Etl] = Flow.Put(this, key, value)
-	def delete(key: Var[K])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, this, key, _ => None)
-}
-
-object PState {
-	class Update[K, V](pstate: PState[K,V], key: Var[K]) {
-		def apply(f: Option[V] => Option[V])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, pstate, key, f)
-		def zip[A](arg: Var[A])(f: (Option[V], A) => Option[V])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.UpdateWith(pos, pstate, key, arg, f)
-	}
-}
-
-final case class Depot[A](id: Identity) {
-	def localAppend(value: Var[A]): Flow[Unit, Etl] = Flow.PartitionAppend(this, value)
-}

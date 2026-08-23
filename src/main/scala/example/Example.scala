@@ -22,9 +22,10 @@ object Example extends IOApp {
 
 	val topologies: Topologies = Topologies()
 
-	val fullTickets: PState[Long, FullTicket] = topologies.pstate("fullTickets")
-	val userTickets: PState[Long, Set[Long]] = topologies.pstate("userTickets")
-	val users: PState[Long, String] = topologies.pstate("users")
+	val fullTickets = topologies.pstateKV[Long, FullTicket]("fullTickets")
+	val userTickets = topologies.pstateKVSet[Long, Long]("userTickets")
+	val users = topologies.pstateKV[Long, String]("users")
+
 	val ticketAssignment: Depot[Assignment] = topologies.depot("ticketAssignment")
 
 	/** Propagate an assignment: update the ticket, add to the new owner's set,
@@ -43,10 +44,10 @@ object Example extends IOApp {
 			// Rama's version carries `prevAssignee` on an intermediate depot record so
 			// a retry can't lose it (Main.scala:196-200); the same concern applies here.
 			_ <- Flow.hashPartition(ticketId)
-			existing <- fullTickets.get(ticketId)
+			existing <- fullTickets(ticketId).get
 			_ <- existing.filter(_.isDefined)
 			previousOwner <- existing.map(_.flatMap(_.assignee))
-			_ <- fullTickets.update(ticketId).zip(newOwner) { (cur, owner) =>
+			_ <- fullTickets(ticketId).updateWith(newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
 			previousOwnerList <- previousOwner.into[List]
@@ -54,18 +55,14 @@ object Example extends IOApp {
 			// Partition by the new owner: add the ticket to their set.
 			// This write is in a different transaction (in terms of pstate upates)
 			_ <- Flow.hashPartition(newOwner)
-			_ <- userTickets.update(newOwner).zip(ticketId) { (prev, tid) =>
-				Some(prev.getOrElse(Set.empty) + tid)
-			}
+			_ <- userTickets(newOwner).add(ticketId)
 
 			// And remove from the previous owner, when there was a different one.
-			hop <- previousOwner.map.zip(newOwner)((prev, now) => prev.filter(_ != now))
+			hop <- previousOwner.mapWith(newOwner)((prev, now) => prev.filter(_ != now))
 			_ <- hop.filter(_.isDefined)
 			oldOwner <- hop.map(_.get)
 			_ <- Flow.hashPartition(oldOwner)
-			_ <- userTickets.update(oldOwner).zip(ticketId) { (prev, tid) =>
-				prev.map(_ - tid)
-			}
+			_ <- userTickets(oldOwner).remove(ticketId)
 		} yield previousOwnerList
 
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
@@ -74,13 +71,13 @@ object Example extends IOApp {
 	def listUserTickets(userId: Var[Long]): Flow[List[Ticket], Any] = {
 		for {
 			_ <- Flow.hashPartition(userId)
-			ids <- userTickets.get(userId)
+			ids <- userTickets(userId).selectAll
 
 			// Each ticket lives on its own partition. Explode
 			// fans out each ID
-			ticketId <- ids.explode(_.getOrElse(Set.empty).toList.sorted)
+			ticketId <- ids.explode(_.sorted)
 			_ <- Flow.hashPartition(ticketId)
-			full <- fullTickets.get(ticketId)
+			full <- fullTickets(ticketId).get
 			_ <- full.filter(_.isDefined)
 			ticket <- full.map(_.get.ticket)
 			tickets <- ticket.into[List]
@@ -106,10 +103,10 @@ object Example extends IOApp {
 		interp.running {
 			for {
 				_ <- tickets.traverse_ { t =>
-					interp.put(fullTickets, t.id, FullTicket(t, Some(111L)))
+					interp.access(fullTickets, t.id).put(FullTicket(t, Some(111L)))
 				}
-				_ <- interp.put(userTickets, 111L, Set(1L, 2L))
-				_ <- interp.put(userTickets, 222, Set(3L))
+				_ <- interp.access(userTickets, 111L).put(Set(1L, 2L))
+				_ <- interp.access(userTickets, 222).put(Set(3L))
 
 				_ = println("Getting user tickets")
 				listed <- interp.invoke(userTicketsQuery, 111L)
@@ -127,19 +124,19 @@ object Example extends IOApp {
 				_ = println(s"  reassigned ticket 1, previously owned by: $previous")
 				_ = assert(previous == Some(111L), s"ack return: $previous")
 
-				_ <- interp.get(userTickets, 222L).map { result =>
-					assert(result == Some(Set(3L, 1L)), s"new owner: ${result}")
+				_ <- interp.access(userTickets, 222L).get.map { result =>
+					assert(result === Some(Set(3L, 1L)), s"new owner: ${result}")
 				}
-				_ <- interp.get(userTickets, 111L).map { result =>
-					assert(result == Some(Set(2L)), s"old owner: ${result}")
+				_ <- interp.access(userTickets, 111L).get.map { result =>
+					assert(result === Some(Set(2L)), s"old owner: ${result}")
 				}
-				_ <- interp.get(fullTickets, 1L).map { result =>
+				_ <- interp.access(fullTickets, 1L).get.map { result =>
 					assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
 				}
 
 				// Reassigning to the same owner must not remove the ticket.
 				_ <- interp.append(ticketAssignment, Assignment(1L, 222L))
-				_ <- interp.get(userTickets, 222L).map { result =>
+				_ <- interp.access(userTickets, 222L).get.map { result =>
 					assert(result == Some(Set(3L, 1L)), s"self-reassign: ${result}")
 				}
 			} yield ExitCode.Success
