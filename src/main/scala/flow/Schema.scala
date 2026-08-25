@@ -29,12 +29,12 @@ object Schema {
 
 	// sub-indexable shapes
 	case class MapSchema private[flow](k: Schema, v: Schema, index: Subindex) extends IndexableSchema
-	case class SetSchema[A] private[flow](v: ClassSchema[A], index: Subindex) extends IndexableSchema with LeafSchema[A]
+	case class SetSchema[A] private[flow](v: ClassSchema[A], index: Subindex, setTag: Tag[Set[A]]) extends IndexableSchema with LeafSchema[A]
 	
 	def apply[T](implicit tag: Tag[T]) = ClassSchema(tag)
 	val string = apply[String]
 	def fixed(pairs: (String, Schema)*) = FixedKeySchema(pairs.toMap)
 
 	def map(k: Schema, v: Schema, subindex: Subindex = Subindex.default) = MapSchema(k, v, subindex)
-	def set[A: Tag](subindex: Subindex = Subindex.default) = SetSchema[A](apply[A], subindex)
+	def set[A](subindex: Subindex = Subindex.default)(implicit atag: Tag[A], setTag: Tag[Set[A]]) = SetSchema[A](apply[A](using atag), subindex, setTag)
 }

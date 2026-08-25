@@ -59,7 +59,7 @@ class Partitions(interpreter: Interpreter, numPartitions: Int) {
 object Storage {
 	class PState() {
 		val inner = Ref.unsafe[IO, Map[Any,Any]](Map.empty)
-		def modify[R](path: NonEmptyList[Any])(fn: (Option[Any]) => (Option[Any], R)): IO[R] = {
+		def modify[R](fullPath: NonEmptyList[Any])(fn: (Option[Any]) => (Option[Any], R)): IO[R] = {
 			inner.modify { map =>
 				def recurse(path: NonEmptyList[Any], map: Map[Any, Any]): (Map[Any, Any], R) = {
 					NonEmptyList.fromList(path.tail) match {
@@ -69,12 +69,19 @@ object Storage {
 							(map.updated(path.head, newMap), result)
 						}
 						case None => {
-							val (newValue, result) = fn(map.get(path.head))
-							(map.updated(path.head, newValue), result)
+							val current = map.get(path.head)
+							println(s"modifying @ $fullPath: ${current}")
+							val (newValue, result) = fn(current)
+							println(s"-> $newValue")
+							val newMap = newValue match {
+								case Some(x) => map.updated(path.head, x)
+								case None => map.removed(path.head)
+							}
+							(newMap, result)
 						}
 					}
 				}
-				recurse(path, map)
+				recurse(fullPath, map)
 			}
 		}
 	}
@@ -86,9 +93,9 @@ object Storage {
 		}.mapChunks { ch => ch.flatMap(tup => Chunk.from(tup._2)) }
 	}
 
-	class Lens[V](pstate: PState) {
-		def put(v: V): IO[Unit] = ???
-		def get: IO[Option[V]] = ???
+	class Lens[V](pstate: PState, path: NonEmptyList[Any]) {
+		def put(v: V): IO[Unit] = pstate.modify(path) { _ => (Some(v), ()) }
+		def get: IO[Option[V]] = pstate.modify(path) { x => (x, x.asInstanceOf[Option[V]]) }
 	}
 }
 
@@ -171,12 +178,18 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 	def running[A](block: IO[A]): IO[A] = {
 		IO.race(block, run).map(_.merge)
 	}
+	
+	private def accessPath[V](pstate: flow.PState, path: NonEmptyList[Any]): Storage.Lens[V] =
+		this.partitions.partitionKey(path.head).access(pstate, path)
 
-	def access[K, V](pstate: flow.PStateKV[K, V], key: K): Storage.Lens[V] = ???
+	def access[K, V](pstate: flow.PStateKV[K, V], key: K): Storage.Lens[V] =
+		accessPath[V](pstate.inner, NonEmptyList.one(key))
 
-	def access[K, V](pstate: flow.PStateKVSet[K, V], key: K): Storage.Lens[Set[V]] = ???
+	def access[K, V](pstate: flow.PStateKVSet[K, V], key: K): Storage.Lens[Set[V]] =
+		accessPath[Set[V]](pstate.inner, NonEmptyList.one(key))
 
-	def access[V: Tag](pstate: flow.PState, path: Path): Storage.Lens[V] = ???
+	def access[V: Tag](pstate: flow.PState, root: Any, path: Any*): Storage.Lens[V] =
+		accessPath[V](pstate, NonEmptyList(root, path.toList))
 
 	def getKeys[K, V](pstate: flow.PStateKV[K, V]): IO[Set[K]] =
 		this.partitions.all.flatTraverse { partition =>
@@ -281,11 +294,8 @@ class Partition(interpreter: Interpreter) {
 		} *> IO.never
 	}
 	
-	def access[K, V](pstate: flow.PStateKV[K, V], key: K): Storage.Lens[V] = ???
-
-	def access[K, V](pstate: flow.PStateKVSet[K, V], key: K): Storage.Lens[Set[V]] = ???
-
-	def access[V: Tag](pstate: flow.PState, path: Path): Storage.Lens[V] = ???
+	def access[V](pstate: flow.PState, path: NonEmptyList[Any]): Storage.Lens[V] =
+		Storage.Lens[V](this.pstate(pstate.id.name), path)
 
 	def getKeys[K, V](pstate: flow.PStateKV[K, V]): IO[Set[K]] = {
 		this.pstate(pstate.id.name).inner.get.map(_.keySet.map(_.asInstanceOf[K]))
@@ -307,8 +317,12 @@ class Partition(interpreter: Interpreter) {
 	private def pstate(name: String) = pstates.getOrElse(name, throw new RuntimeException(s"Unknown pstate: ${name}"))
 	private def depot(name: String) = depots.getOrElse(name, throw new RuntimeException(s"Unknown depot: ${name}"))
 
-	private def compilePath(path: CompiledPath, envs: Env): NonEmptyList[Any] = {
-		???
+	private def compilePath(path: CompiledPath, env: Env): NonEmptyList[Any] = {
+		import CompiledPath._
+		path.path.map {
+			case Literal(inner) => inner
+			case Variable(id) => env(id)
+		}
 	}
 
 
@@ -384,13 +398,16 @@ class Partition(interpreter: Interpreter) {
 				envs.traverse { env =>
 					val rawPath = compilePath(path, env)
 					def applyOp(current: Option[Any]): (Option[Any], Env) = {
-						def currentSet: Set[Any] = current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
+						def currentSet: Set[Any] = {
+							println(s"accessing current set @ $rawPath: ${current}")
+							current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
+						}
 						op match {
 							case PStateOp.Add(v: VarId) => (Some(currentSet.incl(env(v))), env)
 							case PStateOp.Remove(v: VarId) => (Some(currentSet.excl(env(v))), env)
 							case PStateOp.Select(out: VarId, limit: Option[Int]) => {
 								// TODO: implement limit
-								(current, env.updated(out, currentSet))
+								(current, env.updated(out, currentSet.toList))
 							}
 
 							case PStateOp.Get(out: VarId) => (current, env.updated(out, current))

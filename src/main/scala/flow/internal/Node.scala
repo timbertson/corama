@@ -7,6 +7,7 @@ import scala.annotation.unused
 import cats.Eq
 import com.rpl.rama.RamaSerializable
 import cats.Monoid
+import izumi.reflect.Tag
 
 import flow._
 
@@ -76,8 +77,6 @@ private[flow] object Node {
 		fn: (Option[Any], List[Any]) => Option[Any]
 	) extends Node
 
-	private def compilePath(path: Path): CompiledPath = ???
-
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*
 		* TODO: remove unnecessary var return?
@@ -92,18 +91,18 @@ private[flow] object Node {
 			case Flow.Pure(v) => (Nil, v)
 
 			case e: Flow.MapN[A] =>
-				val out = t.define[A](e.pos, "map")
+				val out = t.define[A](e.tag, e.pos, "map")
 				val f = e.f
 				(List(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Map(out.vid))), out)
 
 			case e: Flow.ExplodeOp[A] =>
-				val out = t.define[A](e.pos, "exploded")
+				val out = t.define[A](e.tag, e.pos, "exploded")
 				val f = e.f
 				(List(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Explode(out.vid))), out)
 
 			case e: Flow.FilterOp[i] =>
 				val f = e.f
-				val condVar = t.define[Boolean](Var.internal, "cond")
+				val condVar = t.define[Boolean](Tag[Boolean], Var.internal, "cond")
 				(List(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Filter(condVar.vid))), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
@@ -115,7 +114,7 @@ private[flow] object Node {
 				(n1 ++ n2, v2)
 
 			case i: Flow.If[a, ccond, c1, c2] =>
-				val out = t.define[a](Var.internal, "ifOut")
+				val out = t.define[a](i.tag, Var.internal, "ifOut")
 				val (condBlock, vCond) = compile(t, i.cond)
 				val (ifBlock, vIf) = compile(t, i.ifBlock)
 				val (elseBlock, vElse) = compile(t, i.elseBlock)
@@ -130,29 +129,29 @@ private[flow] object Node {
 
 			case a: Flow.Agg[a, b, c] =>
 				val (block, innerVar) = compile(t, a.block)
-				val out = t.define[A](Var.internal, "agg")
+				val out = t.define[A](a.tag, Var.internal, "agg")
 				(List(Node.Agg(block, a.agg, innerVar.vid, out.vid)), out)
 
 			case g: Flow.Get[a] =>
-				val out = t.define[A](Var.internal, "get")
-				(List(Node.PStateNode(g.lens.pstate.id, compilePath(g.lens.path), PStateOp.Get(out.vid))), out)
+				val out = t.define[a](g.lens.tag, Var.internal, "get")
+				(List(Node.PStateNode(g.lens.pstate.id, CompiledPath.from(g.lens.path), PStateOp.Get(out.vid))), out.asInstanceOf[Var[A]])
 
 			case Flow.Put(lens, value) =>
-				(List(Node.PStateNode(lens.pstate.id, compilePath(lens.path), PStateOp.Put(value.vid))), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Put(value.vid))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Add(lens, value) =>
-				(List(Node.PStateNode(lens.pstate.id, compilePath(lens.path), PStateOp.Add(value.vid))), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Add(value.vid))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Remove(lens, value) =>
-				(List(Node.PStateNode(lens.pstate.id, compilePath(lens.path), PStateOp.Remove(value.vid))), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Remove(value.vid))), Var.unit.asInstanceOf[Var[A]])
 
 			case u: Flow.Update[v] =>
 				val f = u.f
-				(List(Node.PStateUpdate(u.pos, u.lens.pstate.id, compilePath(u.lens.path), u.ins.map(_.vid), f)), Var.unit.asInstanceOf[Var[A]])
+				(List(Node.PStateUpdate(u.pos, u.lens.pstate.id, CompiledPath.from(u.lens.path), u.ins.map(_.vid), f)), Var.unit.asInstanceOf[Var[A]])
 
 			case s: Flow.Select[v] =>
-				val out = t.define[A](Var.internal, "select")
-				(List(Node.PStateNode(s.lens.pstate.id, compilePath(s.lens.path), PStateOp.Select(out.vid, s.limit))), out)
+				val out = t.define[Set[v]](s.lens.schema.setTag, Var.internal, "select")
+				(List(Node.PStateNode(s.lens.pstate.id, CompiledPath.from(s.lens.path), PStateOp.Select(out.vid, s.limit))), out.asInstanceOf[Var[A]])
 
 			case Flow.LocalAppend(depot, value) =>
 				(List(Node.LocalAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])

@@ -23,16 +23,16 @@ enum TopologyKind {
 final class TopologyBuilder[S] private[flow] (
 	val id: TopologyId,
 	// source may be a Depot or Query, it won't be a PState
-	val source: Identity
-	)(implicit pos: SourcePos) {
+	val source: Identity,
+	tag: Tag[S],
+	pos: SourcePos
+) {
 
 	private[flow] val vars = new VarRegistry()
 
-	val input: Var[S] = vars.add[S](pos, source.name) // mint a generated var name for elements in the source
+	val input: Var[S] = vars.add[S](source.name, tag, pos) // mint a generated var name for elements in the source
 
-	val output: Var[S] = vars.add[S](pos, "out") // mint a generated var name for output. Only used for queries
-
-	def define[A](pos: SourcePos, hint: String = "var"): Var[A] = vars.add[A](pos, hint)
+	def define[A](tag: Tag[A], pos: SourcePos, hint: String = "var"): Var[A] = vars.add[A](hint, tag, pos)
 
 	override def toString: String = s"TopologyBuilder($source)"
 }
@@ -69,14 +69,15 @@ final class Topologies {
 	def pstate(name: String, schema: Schema): PState =
 		PState(claim(Identity(IdentityNamespace.PState, name)), schema)
 
-	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] = Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
+	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] =
+		Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
 
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
 	def query[Input, Output](name: String, agg: Agg[Output])(
 		block: Var[Input] => Flow[Output, QueryContext],
-	): QueryTopology[Input, Output] = {
-		QueryTopology(declare[Input, Output, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg)(block))
+	)(implicit pos: SourcePos, tag: Tag[Input]): QueryTopology[Input, Output] = {
+		QueryTopology(declare[Input, Output, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tag, pos)(block))
 	}
 
 	/** Attach a stream topology to a depot: driven by an append, writes PStates,
@@ -89,8 +90,8 @@ final class Topologies {
 	  */
 	def stream_[A](depot: Depot[A])(
 		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
-	): Topology[A, Unit] = {
-		declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit)(block)
+	)(implicit pos: SourcePos, tag: Tag[A]): Topology[A, Unit] = {
+		declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tag, pos)(block)
 	}
 
 	/** Attach a stream topology that hands a value back to whoever appended.
@@ -102,16 +103,16 @@ final class Topologies {
 	  */
 	def stream[A, O](depot: Depot[A], agg: Agg[O])(
 		block: Var[A] => Flow[O, StreamContext[O]]
-	): StreamTopology[A, O] = {
-		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg) { input =>
+	)(implicit pos: SourcePos, tag: Tag[A]): StreamTopology[A, O] = {
+		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg, tag, pos) { input =>
 			block(input).flatMap(Flow.ackReturn)
 		})
 	}
 
-	private def declare[A, R, C](source: Identity, agg: Agg[R])(
+	private def declare[A, R, C](source: Identity, agg: Agg[R], tag: Tag[A], pos: SourcePos)(
 		block: Var[A] => Flow[?, C]
 	): Topology[A, R] = {
-		val b = new TopologyBuilder[A](TopologyId(built.length), source)
+		val b = new TopologyBuilder[A](TopologyId(built.length), source, tag, pos)
 		val t = Topology[A, R](b, block(b.input), agg)
 		built = t :: built
 		t

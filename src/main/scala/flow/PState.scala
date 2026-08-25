@@ -17,12 +17,19 @@ import flow.internal._
 sealed trait Lens[A]
 
 case class ValueLens[A](pstate: PState, path: Path, schema: Schema.ClassSchema[A]) extends Lens[A] {
+	private [flow] def tag: Tag[A] = schema.tag
 	def get: Flow[Option[A], Any] = Flow.Get(this)
-	def getOrElse(dfl: A): Flow[A, Any] = Flow.Get(this).flatMap(v => v.map(_.getOrElse(dfl)))
+	def getOrElse(dfl: A): Flow[A, Any] = Flow.Get(this).flatMap(v => v.map(_.getOrElse(dfl))(using implicitly, tag))
 	def put(value: Var[A]): Flow[Unit, Etl] = Flow.Put(this, value)
 	def delete(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, this, Nil, (_, _) => None)
 	def update(f: Option[A] => Option[A])(implicit pos: SourcePos): Flow[Unit, Etl] = ???
-	def updateWith[B](b: Var[B])(f: (Option[A], B) => Option[A])(implicit pos: SourcePos): Flow[Unit, Etl] = ???
+	def updateWith[B](b: Var[B])(f: (Option[A], B) => Option[A])(implicit pos: SourcePos): Flow[Unit, Etl] =
+		Flow.Update(pos, this, List(b.asAny), { (a, args) =>
+			args match {
+				case List(b) => f(a.asInstanceOf[Option[A]], b.asInstanceOf[B])
+				case other => impossible(s"update with ${other.length}")
+			}
+		})
 }
 
 case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) extends Lens[A] {
@@ -42,19 +49,48 @@ case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) e
 
 // Pstate with nested schemas. Not fully type safe, validity of paths is verified at runtime
 final case class PState(id: Identity, schema: Schema) {
-	private def checkType(value: PathComponent[?], schema: Schema): Either[String, Unit] = ???
+	println(s"created pstate ${id.name} with schema $schema")
+	private def checkType(value: PathComponent[?], schema: Schema): Either[String, Unit] =
+		def requireValueOf(schemaTag: Tag[?]) = {
+			if (value.value.tag =:= schemaTag) {
+				Right(())
+			} else {
+				Left(s"Incompatible path component (${value}) for schema (${schema}) on pstate ${id.name}")
+			}
+		}
+		schema match {
+			case Schema.ClassSchema(tag) => requireValueOf(tag)
+			case _: Schema.FixedKeySchema => requireValueOf(Schema.string.tag)
+			case map: Schema.MapSchema => checkType(value, map.k)
+			case set: Schema.SetSchema[?] => Left(s"Path component ${value} attempted to enter a set schema")
+		}
 
-	private def matchingClass[A](schema: Schema.ClassSchema[?], tag: Tag[?]): Either[String, Schema.ClassSchema[A]] = ???
+	private def matchingClass[A](schema: Schema.ClassSchema[?], tag: Tag[?]): Either[String, Schema.ClassSchema[A]] =
+		if (schema.tag =:= tag) {
+			Right(schema.asInstanceOf[Schema.ClassSchema[A]])
+		} else {
+			Left(s"Incompatible class schema: ${schema.tag} != ${tag}")
+		}
 
-	private def matchingSet[A](schema: Schema.SetSchema[?], tag: Tag[?]): Either[String, Schema.SetSchema[A]] = ???
+	private def matchingSet[A](schema: Schema.SetSchema[?], tag: Tag[?]): Either[String, Schema.SetSchema[A]] =
+		if (schema.v.tag =:= tag) {
+			Right(schema.asInstanceOf[Schema.SetSchema[A]])
+		} else {
+			Left(s"Incompatible set schema: ${schema.v.tag} != ${tag}")
+		}
+
+	private def accessMismatch(path: Path)(msg: String) = {
+		throw new RuntimeException(s"Error resolving path: ${path}:\n$msg")
+	}
 
 	// TODO: should this throw?
 	def valueAt[A](path: Path)(implicit tag: Tag[A]): ValueLens[A] = {
-		access(path, tag).getOrElse((m: String) => throw new RuntimeException(m)).asInstanceOf[ValueLens[A]]
+		access(path, tag).fold(accessMismatch(path), identity).asInstanceOf[ValueLens[A]]
 	}
 
 	def setAt[A](path: Path)(implicit tag: Tag[A]): SetLens[A] = {
-		access(path, tag).getOrElse((m: String) => throw new RuntimeException(m)).asInstanceOf[SetLens[A]]
+		// TODO: validate set-ness
+		access(path, tag).fold(accessMismatch(path), identity).asInstanceOf[SetLens[A]]
 	}
 
 	private def access[A](rootPath: Path, expected: Tag[A]): Either[String, Lens[A]] = {
@@ -79,7 +115,7 @@ final case class PState(id: Identity, schema: Schema) {
 						_ <- checkType(path.head, Schema.string)
 						// reject dynamic path components for fixed schemas
 						key <- path.head.value match {
-							case Var.Literal(key) => Right(key.asInstanceOf[String])
+							case lit: Var.Literal[?] => Right(lit.value.asInstanceOf[String])
 							case _: Var[?] => Left(s"Path component within a FixedKeySchema must be a literal: ${path}")
 						}
 						valueSchema <- shape.get(key).toRight(s"${path.head} not found in fixed keys: ${shape.keys}")
@@ -95,11 +131,11 @@ final case class PState(id: Identity, schema: Schema) {
 
 // A convenience API with additional type safety for simple K/V PStates
 final case class PStateKV[K: Tag, V: Tag](id: Identity) {
-	private var internal: PState = PState(id, Schema.map(Schema[K], Schema[V]))
-	def apply(k: Var[K]) = internal.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
+	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema[V]))
+	def apply(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
 final case class PStateKVSet[K: Tag, V: Tag](id: Identity, subindex: Subindex) {
-	private var internal: PState = PState(id, Schema.map(Schema[K], Schema.set[V](subindex)))
-	def apply(k: Var[K]) = internal.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
+	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema.set[V](subindex)))
+	def apply(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }

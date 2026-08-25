@@ -79,7 +79,7 @@ object RamaBackend {
 				}
 				p
 			}
-			case CompiledPath.Var(v) => compileVar(v)
+			case CompiledPath.Variable(v) => compileVar(v)
 		}
 	}
 
