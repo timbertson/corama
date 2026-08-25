@@ -35,7 +35,9 @@ case class ValueLens[A](pstate: PState, path: Path, schema: Schema.ClassSchema[A
 case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) extends Lens[A] {
 	def add(value: Var[A]): Flow[Unit, Etl] = Flow.Add(this, value)
 	def remove(value: Var[A])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Remove(this, value)
-	def selectAll(implicit pos: SourcePos): Flow[List[A], Any] = Flow.Select(this)
+	def selectAll(implicit pos: SourcePos): Flow[List[A], Any] = Flow.Select(this, SelectOptions.all[A](using schema.ord))
+	def selectRange(afterItem: Option[Var[A]], maxItems: Int)(implicit pos: SourcePos): Flow[List[A], Any] =
+		Flow.Select(this, SelectOptions(afterItem, maxItems = Some(maxItems), schema.ord))
 }
 
 // object PState {
@@ -135,7 +137,12 @@ final case class PStateKV[K: Tag, V: Tag](id: Identity) {
 	def apply(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class PStateKVSet[K: Tag, V: Tag](id: Identity, subindex: Subindex) {
+final case class PStateKVSet[K: Tag, V: Tag : Ordering](id: Identity, subindex: Subindex) {
 	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema.set[V](subindex)))
 	def apply(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
+}
+
+final case class SelectOptions[A](after: Option[Var[A]], maxItems: Option[Int], ord: Ordering[A])
+object SelectOptions {
+	def all[A](implicit ord: Ordering[A]): SelectOptions[A] = SelectOptions(None, None, ord)
 }

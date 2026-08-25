@@ -11,6 +11,7 @@ import flow.IdentityNamespace.Query
 import com.rpl.rama.module.StreamTopology
 import com.rpl.rama.ops.RamaAccumulatorAgg
 import com.rpl.rama.ops.RamaFunction0
+import scala.jdk.CollectionConverters._
 
 import flow._
 import flow.internal._
@@ -205,15 +206,24 @@ object RamaBackend {
 			// Rama models read-modify-write as a `term` on the path: the function
 			// receives the current value (null when absent) and returns the new one.
 			op match {
-				case PStateOp.Add(v: VarId) => ???
-				case PStateOp.Remove(v: VarId) => ???
-				case PStateOp.Select(out: VarId, limit: Option[Int]) =>
-					???
-					// TODO: limit
-					// Block.localSelect(ps)
-					// 	.out(compileVar(out))
-					// 	.each(Option.apply, compileVar(out))
-					// 	.out(compileVar(out))
+				case PStateOp.Add(v: VarId) =>
+					Block.localTransform(ps, ramaPath.nullToSet().voidSetElem().termVal(compileVar(v)))
+
+				case PStateOp.Remove(v: VarId) =>
+					Block.localTransform(ps, ramaPath.nullToSet().setElem(compileVar(v)).termVoid())
+
+				case PStateOp.Select(out: VarId, opts) =>
+					val setPath = ramaPath.nullToSet()
+					val fullPath = opts match {
+						case SelectOptions(Some(after), Some(limit), _) => setPath.sortedSetRangeFrom(compileVar(after), limit)
+						case SelectOptions(None, Some(limit), _) => setPath.sortedSetRangeFromStart(limit)
+						case SelectOptions(Some(after), None, _) => setPath.sortedSetRangeFrom(compileVar(after))
+						case SelectOptions(None, None, _) => setPath
+					}
+					Block.localSelect(ps, fullPath)
+						.out(compileVar(out))
+						.each((jlist: java.util.List[Any]) => jlist.asScala, compileVar(out))
+						.out(compileVar(out))
 
 				case PStateOp.Get(out: VarId) => {
 					Block.localSelect(ps, ramaPath)

@@ -63,7 +63,7 @@ final class Topologies {
 	def pstateKV[K: Tag, V: Tag](name: String): PStateKV[K, V] =
 		PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name)))
 
-	def pstateKVSet[K: Tag, V: Tag](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
+	def pstateKVSet[K: Tag, V: Tag : Ordering](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
 		PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex)
 
 	def pstate(name: String, schema: Schema): PState =

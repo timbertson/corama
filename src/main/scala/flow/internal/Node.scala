@@ -64,7 +64,7 @@ private[flow] object Node {
 	object PStateOp {
 		case class Add(v: VarId) extends PStateOp
 		case class Remove(v: VarId) extends PStateOp
-		case class Select(out: VarId, limit: Option[Int]) extends PStateOp
+		case class Select(out: VarId, options: SelectOptions[?]) extends PStateOp
 
 		case class Get(out: VarId) extends PStateOp
 		case class Put(v: VarId) extends PStateOp
@@ -151,7 +151,7 @@ private[flow] object Node {
 
 			case s: Flow.Select[v] =>
 				val out = t.define[Set[v]](s.lens.schema.setTag, Var.internal, "select")
-				(List(Node.PStateNode(s.lens.pstate.id, CompiledPath.from(s.lens.path), PStateOp.Select(out.vid, s.limit))), out.asInstanceOf[Var[A]])
+				(List(Node.PStateNode(s.lens.pstate.id, CompiledPath.from(s.lens.path), PStateOp.Select(out.vid, s.options))), out.asInstanceOf[Var[A]])
 
 			case Flow.LocalAppend(depot, value) =>
 				(List(Node.LocalAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])

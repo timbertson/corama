@@ -403,11 +403,23 @@ class Partition(interpreter: Interpreter) {
 							current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
 						}
 						op match {
-							case PStateOp.Add(v: VarId) => (Some(currentSet.incl(env(v))), env)
-							case PStateOp.Remove(v: VarId) => (Some(currentSet.excl(env(v))), env)
-							case PStateOp.Select(out: VarId, limit: Option[Int]) => {
+							case PStateOp.Add(v) => (Some(currentSet.incl(env(v))), env)
+							case PStateOp.Remove(v) => (Some(currentSet.excl(env(v))), env)
+							case PStateOp.Select(out, options) => {
 								// TODO: implement limit
-								(current, env.updated(out, currentSet.toList))
+								val ord: Ordering[Any] = options.ord.asInstanceOf[Ordering[Any]]
+								val fullList = currentSet.toList.sorted(using ord)
+								val result = options match {
+									case SelectOptions(afterVar, maxItems, _) =>
+										val afterList = afterVar.fold(fullList){ afterVar =>
+											val afterVal = env(afterVar.vid)
+											fullList.dropWhile(x => ord.lteq(x, afterVal))
+										}
+										val afterLimit = maxItems.fold(afterList) { max =>
+											afterList.take(max)
+										}
+								}
+								(current, env.updated(out, result))
 							}
 
 							case PStateOp.Get(out: VarId) => (current, env.updated(out, current))
