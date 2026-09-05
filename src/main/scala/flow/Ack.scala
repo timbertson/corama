@@ -25,23 +25,28 @@ object AckLevel {
 
 /** The ack returns from one depot append, keyed by the topology that produced each.
   *
-  * Values arrive as a list per topology. TODO: could these be pre-combined with agg?
+  * Values arrive as a list per topology. TODO: these could be pre-combined with agg?
   */
 final class AckReturns private[flow] (
 	private val values: Map[TopologyId, List[Any]],
 	private val topologies: Topologies) {
 
-	def result[S, R](stream: StreamTopology[S, R]): R = {
+	// Results are stored as type A, the aggregation. `mapOutput` is only performed when the
+	// result is actually returned.
+	def result[S, A, R](stream: StreamTopology[S, A, R]): R = {
 		val t = stream.topology
 		require(
 			topologies.declared(t),
 			s"${t.builder.source} was not declared in the module this append went to")
 
-		values.getOrElse(t.builder.id, Nil).foldLeft(t.agg.zero)(t.agg.combineAny)
+		val aggregator: Aggregator[A, R] = Agg.asAggregator(t.agg)
+		val combiner: Combiner[A] = aggregator.combiner
+		val aggregated: A = values.getOrElse(t.builder.id, Nil).foldLeft(combiner.zero)(combiner.combineAny)
+		aggregator.mapOut(aggregated)
 	}
 
-	def unique[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[T] = {
-		val seq = result[S, M](stream)
+	def unique[S, A, T, M <: Seq[T]](stream: StreamTopology[S, A, M]): Try[T] = {
+		val seq = result[S, A, M](stream)
 		if (seq.length == 1) {
 			Success(seq.head)
 		} else {

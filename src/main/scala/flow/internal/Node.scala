@@ -54,7 +54,7 @@ private[flow] object Node {
 
 	case class If(cond: VarId, ifBlock: List[Node], elseBlock: List[Node], out: VarId) extends Node
 
-	case class Agg(block: List[Node], agg: flow.Agg[?], collectFrom: VarId, out: VarId) extends Node
+	case class Combine(block: List[Node], agg: flow.Combiner[?], collectFrom: VarId, out: VarId) extends Node
 
 	case class LocalAppend(depot: Identity, arg: VarId) extends Node
 
@@ -127,10 +127,14 @@ private[flow] object Node {
 
 				(condBlock ++ bodyNodes, out)
 
-			case a: Flow.Agg[a, b, c] =>
+			case a: Flow.Agg[a, b, ctx] =>
 				val (block, innerVar) = compile(t, a.block)
-				val out = t.define[A](a.tag, Var.internal, "agg")
-				(List(Node.Agg(block, a.agg, innerVar.vid, out.vid)), out)
+				a.agg match {
+					case collector: Combiner[_] =>
+						val out = t.define[A](a.tag, Var.internal, "agg")
+						(List(Node.Combine(block, collector, innerVar.vid, out.vid)), out)
+					case aggregator: Aggregator[_, _] => ??? // TODO
+				}
 
 			case g: Flow.Get[a] =>
 				val out = t.define[a](g.lens.tag, Var.internal, "get")

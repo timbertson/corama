@@ -44,13 +44,13 @@ final class TopologyBuilder[S] private[flow] (
 
 final class Topologies {
 	private [flow] var ids = Set.empty[Identity]
-	private var built = List.empty[Topology[?, ?]]
+	private var built = List.empty[Topology[?, ?, ?]]
 
 	// private var pstates: List[Pstate]
 
-	def topologies: List[Topology[?, ?]] = built.reverse
+	def topologies: List[Topology[?, ?, ?]] = built.reverse
 
-	private[flow] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
+	private[flow] def declared(t: Topology[?, ?, ?]): Boolean = built.exists(_ eq t)
 
 	private def claim(identity: Identity): Identity = {
 		if (ids.contains(identity)) {
@@ -74,46 +74,43 @@ final class Topologies {
 
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
-	def query[Input, Output](name: String, agg: Agg[Output])(
-		block: Var[Input] => Flow[Output, QueryContext],
-	)(implicit pos: SourcePos, tag: Tag[Input]): QueryTopology[Input, Output] = {
-		QueryTopology(declare[Input, Output, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tag, pos)(block))
+	def query[S, A, R](name: String, agg: Aggregator[A, R])(
+		block: Var[S] => Flow[A, QueryContext],
+	)(implicit pos: SourcePos, tag: Tag[S]): QueryTopology[S, A, R] = {
+		QueryTopology(declare[S, A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tag, pos)(block))
 	}
 
-	/** Attach a stream topology to a depot: driven by an append, writes PStates,
-	  * returns nothing.
+	// Overload accepting a simple combiner
+	def query[Input, R](name: String, agg: Combiner[R])(
+		block: Var[Input] => Flow[R, QueryContext],
+	)(implicit pos: SourcePos, tag: Tag[Input]): QueryTopology[Input, R, R] = {
+		QueryTopology(declare[Input, R, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tag, pos)(block))
+	}
+
+	/** A stream topology: driven by an append, writes PStates, returns nothing.
 	  *
-	  * The context provided is `StreamContext[Nothing]`, so [[Flow.ackReturn]] does not
-	  * compile here — there is no declared aggregator for a value to reach.
-	  *
-		* TODO: does the block need to accept TopologyBuilder, or is Flow[A] / Var[A] enough?
+	  * The context provided is `StreamContext[Nothing]`, making `Flow.ackReturn` impossible.
 	  */
 	def stream_[A](depot: Depot[A])(
 		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
-	)(implicit pos: SourcePos, tag: Tag[A]): Topology[A, Unit] = {
-		declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tag, pos)(block)
+	)(implicit pos: SourcePos, tag: Tag[A]): Topology[A, Unit, Unit] = {
+		declare[A, Unit, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tag, pos)(block)
 	}
 
-	/** Attach a stream topology that hands a value back to whoever appended.
-	  *
-	  * The aggregator determines the topology's `R`: a flow emits 0..n ack returns across
-	  * however many partitions its branches reached, and [[AckAgg]] says how those become
-	  * the one value an `AckLevel.Ack` append reads out of [[AckReturns]]. Rama declares
-	  * it the same way, as `StreamSourceOptions.ackReturnAgg`.
-	  */
-	def stream[A, O](depot: Depot[A], agg: Agg[O])(
-		block: Var[A] => Flow[O, StreamContext[O]]
-	)(implicit pos: SourcePos, tag: Tag[A]): StreamTopology[A, O] = {
-		StreamTopology(declare[A, O, StreamContext[O]](depot.id, agg, tag, pos) { input =>
-			block(input).flatMap(Flow.ackReturn)
+	// A stream topology returning `A` values, aggregated into an `R` value.
+	def stream[S, A, R](depot: Depot[S], agg: Agg[A, R])(
+		block: Var[S] => Flow[A, StreamContext[A]]
+	)(implicit pos: SourcePos, tag: Tag[S]): StreamTopology[S, A, R] = {
+		StreamTopology(declare[S, A, R, StreamContext[A]](depot.id, agg, tag, pos) { input =>
+			block(input)
 		})
 	}
 
-	private def declare[A, R, C](source: Identity, agg: Agg[R], tag: Tag[A], pos: SourcePos)(
-		block: Var[A] => Flow[?, C]
-	): Topology[A, R] = {
-		val b = new TopologyBuilder[A](TopologyId(built.length), source, tag, pos)
-		val t = Topology[A, R](b, block(b.input), agg)
+	private def declare[S, A, R, C](source: Identity, agg: Agg[A, R], tag: Tag[S], pos: SourcePos)(
+		block: Var[S] => Flow[A, C]
+	): Topology[S, A, R] = {
+		val b = new TopologyBuilder[S](TopologyId(built.length), source, tag, pos)
+		val t = Topology[S, A, R](b, block(b.input), agg)
 		built = t :: built
 		t
 	}
@@ -123,25 +120,23 @@ object Topologies {
 	def apply(): Topologies = new Topologies()
 }
 
-/** A declared topology, and how it produces its `R`.
-  *
-  * `R` is returned in two ways: a query returns the value its flow ends on, while a stream returns
-  * whatever `ackAgg` makes of the flow's ack returns (and a stream without one returns
-  * `Unit`). So the flow is stored existentially and `R` is tied down at the declaration
-  * site instead — by `query`'s `Flow[R, QueryContext]`, or by `ackAgg`.
-  */
-final case class Topology[S, R](
+/** A declared topology, and how it produces its result.
+	* S: source type (input variable)
+	* A: accumulation type (the result of the flow)
+	* R: final post-aggregation return type; often the same as A
+	*/
+final case class Topology[S, A, R](
 	builder: TopologyBuilder[S],
-	flow: Flow[?, Nothing],
-	agg: Agg[R]) {
+	flow: Flow[A, Nothing],
+	agg: Agg[A, R]) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
 }
 
 // wrappers for the different types of topology
-final case class QueryTopology[S, R] private[flow](topology: Topology[S, R])
+final case class QueryTopology[S, A, R] private[flow](topology: Topology[S, A, R])
 
-final case class StreamTopology[S, R] private[flow](topology: Topology[S, R])
+final case class StreamTopology[S, A, R] private[flow](topology: Topology[S, A, R])
 
 
 sealed trait IdentityNamespace

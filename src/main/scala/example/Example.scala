@@ -44,10 +44,10 @@ object Example extends IOApp {
 			// Rama's version carries `prevAssignee` on an intermediate depot record so
 			// a retry can't lose it (Main.scala:196-200); the same concern applies here.
 			_ <- Flow.hashPartition(ticketId)
-			existing <- fullTickets(ticketId).get
+			existing <- fullTickets.key(ticketId).get
 			_ <- existing.filter(_.isDefined)
 			previousOwner <- existing.map(_.flatMap(_.assignee))
-			_ <- fullTickets(ticketId).updateWith(newOwner) { (cur, owner) =>
+			_ <- fullTickets.key(ticketId).updateWith(newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
 			previousOwnerList <- previousOwner.into[List]
@@ -55,14 +55,14 @@ object Example extends IOApp {
 			// Partition by the new owner: add the ticket to their set.
 			// This write is in a different transaction (in terms of pstate upates)
 			_ <- Flow.hashPartition(newOwner)
-			_ <- userTickets(newOwner).add(ticketId)
+			_ <- userTickets.key(newOwner).add(ticketId)
 
 			// And remove from the previous owner, when there was a different one.
 			hop <- previousOwner.mapWith(newOwner)((prev, now) => prev.filter(_ != now))
 			_ <- hop.filter(_.isDefined)
 			oldOwner <- hop.map(_.get)
 			_ <- Flow.hashPartition(oldOwner)
-			_ <- userTickets(oldOwner).remove(ticketId)
+			_ <- userTickets.key(oldOwner).remove(ticketId)
 		} yield previousOwnerList
 
 	/** List a user's tickets: fan out over their ticket ids, look each one up on its
@@ -71,23 +71,23 @@ object Example extends IOApp {
 	def listUserTickets(userId: Var[Long]): Flow[List[Ticket], Any] = {
 		for {
 			_ <- Flow.hashPartition(userId)
-			ids <- userTickets(userId).selectAll
+			ids <- userTickets.key(userId).selectAll
 
 			// Each ticket lives on its own partition. Explode
 			// fans out each ID
-			ticketId <- ids.explode(_.sorted)
+			ticketId <- ids.explodeBy(_.sorted)
 			_ <- Flow.hashPartition(ticketId)
-			full <- fullTickets(ticketId).get
+			full <- fullTickets.key(ticketId).get
 			_ <- full.filter(_.isDefined)
 			ticket <- full.map(_.get.ticket)
 			tickets <- ticket.into[List]
 		} yield tickets
 	}
 
-	val userTicketsQuery: QueryTopology[Long, List[Ticket]] =
-		topologies.query[Long, List[Ticket]]("userTickets", Agg.list[Ticket])(listUserTickets)
+	val userTicketsQuery: QueryTopology[Long, List[Ticket], List[Ticket]] =
+		topologies.query("userTickets", Agg.list[Ticket])(listUserTickets)
 
-	val assigning: StreamTopology[Assignment, List[Option[Long]]] =
+	val assigning: StreamTopology[Assignment, List[Option[Long]], List[Option[Long]]] =
 		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(propagateAssignment)
 
 	override def run(args: List[String]): IO[ExitCode] = {

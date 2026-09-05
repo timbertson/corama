@@ -41,6 +41,10 @@ case class UserNameChange(userId: JLong, name: String) extends RamaSerializable
 case class UserTicketsRequest(userId: JLong, cursor: Option[JLong] = None) extends RamaSerializable
 case class UserTicketsResponse(tickets: List[Ticket], nextCursor: Option[JLong]) extends RamaSerializable
 
+object UserTicketsResponse {
+	val empty = UserTicketsResponse(Nil, None)
+}
+
 class TicketIdExtractor extends RamaFunction1[Ticket, JLong] {
 	override def invoke(ticket: Ticket): JLong = ticket.id
 }

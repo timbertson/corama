@@ -16,6 +16,7 @@ import scala.jdk.CollectionConverters._
 import flow._
 import flow.internal._
 import flow.internal.Node.{PStateOp, DynamicOp}
+import com.rpl.rama.ops.RamaCombinerAgg
 
 class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
 	import RamaBackend._
@@ -172,21 +173,10 @@ object RamaBackend {
 				Block.each(identity, compileVar(in)).out(compileVar(out))
 			}
 
-		// case Node.AggList(block, collectFrom, out) =>
-		// 	Block.create()
-		// 		.`macro`(compileNodes(block))
-		// 		.`macro`(Block.agg(Agg.list(compileVar(collectFrom))).out(compileVar(out)))
-
-		case Node.Agg(block, agg, collectFrom, out) =>
+		case Node.Combine(block, combiner, collectFrom, out) =>
 			Block.create()
 				.`macro`(compileNodes(block))
-				.`macro`(Block.agg(Agg.accumulator(compileAgg(agg), compileVar(collectFrom))).out(compileVar(out)))
-
-		// case Node.Select(ps, key, out) =>
-		// 	Block.localSelect(compileIdentity(ps), Path.key(compileVar(key)))
-		// 		.out(compileVar(out))
-		// 		.each(Option.apply, compileVar(out)) // localselect returns null when not found
-		// 		.out(compileVar(out))
+				.`macro`(Block.agg(Agg.combiner(compileCombiner(combiner), compileVar(collectFrom))).out(compileVar(out)))
 
 		case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
 			val ramaPath = compilePath(path)
@@ -250,10 +240,10 @@ object RamaBackend {
 	private def compileNodes(nodes: List[Node]): Block.Impl =
 		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
 
-	private def compileAgg[O](agg: flow.Agg[O]): RamaAccumulatorAgg1[O, O] = {
-		new RamaAccumulatorAgg1[O, O] {
-			override def initVal(): O = agg.zero
-			override def accumulate(current: O, value: O): O = agg.combine(current, value)
+	private def compileCombiner[O](agg: flow.Combiner[O]): RamaCombinerAgg[O] = {
+		new RamaCombinerAgg[O] {
+			override def zeroVal(): O = agg.zero
+			override def combine(current: O, value: O): O = agg.combine(current, value)
 		}
 	}
 }

@@ -108,7 +108,9 @@ final class Var[A] private[flow] (private[flow] val vid: VarId, val tag: Tag[A],
 	def into[F[_]](using f: Applicative[F])(implicit pos: SourcePos, tag: Tag[F[A]]): Flow[F[A], Any] = this.map(f.pure)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
-	def explode[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = Flow.ExplodeOp(tag, pos, List(this.asAny), {
+	def explode[B](implicit pos: SourcePos, tag: Tag[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
+
+	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = Flow.ExplodeOp(tag, pos, List(this.asAny), {
 		case List(a) => f(a.asInstanceOf[A])
 		case other => impossible(s"explode with ${other.length}")
 	})

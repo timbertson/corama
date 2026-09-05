@@ -46,13 +46,13 @@ class RamaExample extends RamaModule {
 	// 	)
 	// ))
 
-	val fullTicket = topologies.pstateKV[JLong, FullTicket]("fullTicket")
+	val fullTickets = topologies.pstateKV[JLong, FullTicket]("fullTicket")
 
 	// upstream ticket changes update the fullTicket view
 	topologies.stream_(upstreamTicket) { ticket =>
 		for {
 			id <- ticket.map(_.id)
-			_ <- fullTicket(id).updateWith(ticket) { (full, upstream) =>
+			_ <- fullTickets.key(id).updateWith(ticket) { (full, upstream) =>
 				println(s"upserting $upstream into $full")
 				Some(full.fold(FullTicket(upstream, None, None))(_.copy(upstream = upstream)))
 			}
@@ -63,7 +63,7 @@ class RamaExample extends RamaModule {
 	val registrationStream = topologies.stream(userRegistration, Result.agg[Unit]) { user =>
 		for {
 			userId <- user.map(_.id)
-			existing <- users(userId).get
+			existing <- users.key(userId).get
 			result <- existing.fold[Result.Void, flow.Etl] {
 				// no existing user
 				for {
@@ -79,7 +79,7 @@ class RamaExample extends RamaModule {
 	val nameChangeStream = topologies.stream(userNameChange, Result.agg[Unit]) { change =>
 		for {
 			userId <- change.map(_.userId)
-			existing <- users(userId).get
+			existing <- users.key(userId).get
 			result <- existing.fold[Result.Void, flow.Etl] {
 				userId.map { uid =>
 					Result.failure(s"No such user: $uid")
@@ -104,7 +104,7 @@ class RamaExample extends RamaModule {
 			userId <- user.map(_.id)
 			_ <- user.foreach { user => println(s"Applying merged user change: $user") }
 			// store the new user
-			_ <- users(userId).put(user)
+			_ <- users.key(userId).put(user)
 			// _ <- userId.foreach { id => println(s"Updating user $id in userTickets") }
 			// _ <- userTickets.update(userId, user) { (maybeUserTickets, user) =>
 			// 	maybeUserTickets.map(_.copy(user = user))
@@ -119,14 +119,14 @@ class RamaExample extends RamaModule {
 			ticketId <- assignment.map(_.ticketId)
 
 			// assignment is partitioned by (new) assigneeId. First validate the new assignee
-			newAssignee <- users(userId).get
+			newAssignee <- users.key(userId).get
 			result <- newAssignee.fold[Result.Void, StreamContext[Result.Void]] {
 				userId.map(userId => Result.failure(s"No such user: $userId"))
 			} { newAssignee =>
 				for {
 					_ <- Flow.hashPartition(ticketId)
 					_ <- ticketId.foreach(t => println(s"Finding ticket $t"))
-					prevTicket <- fullTicket(ticketId).get
+					prevTicket <- fullTickets.key(ticketId).get
 					result <- prevTicket.fold {
 						ticketId.map(ticketId => Result.failure[Unit](s"No such ticket: $ticketId"))
 					} { ticket =>
@@ -153,40 +153,57 @@ class RamaExample extends RamaModule {
 			newUserId <- assignment.map(_.assignee)
 			oldUserId <- assignment.map(_.prevAssignee)
 
-			// Update fullTicket, it's the source of truth for who owns a ticket
-			_ <- fullTicket(ticketId).updateWith(newUserId) { (ticket, newUserId) =>
+			// Update fullTickets, it's the source of truth for who owns a ticket
+			_ <- fullTickets.key(ticketId).updateWith(newUserId) { (ticket, newUserId) =>
 				ticket.map(_.copy(assignee = Some(newUserId)))
 			}
 			
 			// now update new user
 			_ <- Flow.hashPartition(newUserId)
 
-			_ <- userTickets(newUserId).add(ticketId)
+			_ <- userTickets.key(newUserId).add(ticketId)
 			
 			// now remove from old user, if defined (and different from new user)
 			oldUserId <- oldUserId.mapFilter(identity)
 			_ <- oldUserId.filterWith(newUserId)((a, b) => a =!= b)
 			_ <- Flow.hashPartition(oldUserId)
-			_ <- userTickets(oldUserId).remove(ticketId)
+			_ <- userTickets.key(oldUserId).remove(ticketId)
 		} yield Var.unit
 	}
 
-	// val userTicketsPageSize = 10
-	// topologies.query[UserTicketsRequest, List[Ticket]]("userTickets", Agg.list) { t =>
-	// 	val req = t.input
-	// 	for {
-	// 		userId <- req.map(_.userId)
-	// 		cursor <- req.map(_.cursor.getOrElse[JLong](Long.MinValue))
+	val userTicketsPageSize = 10
+	val ticketAgg = Agg(UserTicketsResponse.empty, (a, b) => {
+		UserTicketsResponse(a.tickets ++ b.tickets, a.nextCursor.orElse(b.nextCursor))
+	})
 
-	// 		_ <- Flow.hashPartition(userId)
-	// 		_ <- userId.foreach(uid => println(s"fetching ticket assignment for $uid"))
+	topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
+		for {
+			userId <- query.map(_.userId)
+			cursor <- query.map(_.cursor)
+
+			_ <- Flow.hashPartition(userId)
+			_ <- userId.foreach(uid => println(s"fetching ticket assignment for $uid"))
 			
-	// 		// TODO: paginate via cursor
-	// 		ticketIds <- userTickets.getOrElse(userId, Nil)
+			// TODO: paginate via cursor
+			ticketIds <- userTickets.key(userId).selectRange(afterItem = cursor, maxItems = userTicketsPageSize)
+			cursor <- ticketIds.map { ids =>
+				// potentially more results, use the last ID as the cursor
+				Option.when(ids.size >= userTicketsPageSize)(ids.last)
+			}
+			
+			// TODO: is this serial? Can I make it parallel per hashPartition?
+			ticketId <- ticketIds.explode[JLong]
+			_ <- Flow.hashPartition(ticketId)
 
-	// 		result <- req.map(_ => Nil)
-	// 	} yield result
-	// }
+			// lookup ticket; filter out None (TODO: log / alert on none?)
+			fullTicketOpt <- fullTickets.key(ticketId).get
+			fullTicket <- fullTicketOpt.mapFilter(identity)
+			ticket <- fullTicket.map(_.upstream)
+			result <- ticket.mapWith(cursor) { (ticket, cursor) =>
+				UserTicketsResponse(List(ticket), cursor)
+			}
+		} yield result
+	}
 
 	// {
 	// 	()

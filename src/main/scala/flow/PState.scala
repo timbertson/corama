@@ -36,8 +36,8 @@ case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) e
 	def add(value: Var[A]): Flow[Unit, Etl] = Flow.Add(this, value)
 	def remove(value: Var[A])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Remove(this, value)
 	def selectAll(implicit pos: SourcePos): Flow[List[A], Any] = Flow.Select(this, SelectOptions.all[A](using schema.ord))
-	def selectRange(afterItem: Option[Var[A]], maxItems: Int)(implicit pos: SourcePos): Flow[List[A], Any] =
-		Flow.Select(this, SelectOptions(afterItem, maxItems = Some(maxItems), schema.ord))
+	def selectRange(afterItem: Var[Option[A]], maxItems: Int)(implicit pos: SourcePos): Flow[List[A], Any] =
+		Flow.Select(this, SelectOptions(Some(afterItem), maxItems = Some(maxItems), schema.ord))
 }
 
 // object PState {
@@ -134,15 +134,15 @@ final case class PState(id: Identity, schema: Schema) {
 // A convenience API with additional type safety for simple K/V PStates
 final case class PStateKV[K: Tag, V: Tag](id: Identity) {
 	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema[V]))
-	def apply(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
+	def key(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
 final case class PStateKVSet[K: Tag, V: Tag : Ordering](id: Identity, subindex: Subindex) {
 	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema.set[V](subindex)))
-	def apply(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
+	def key(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class SelectOptions[A](after: Option[Var[A]], maxItems: Option[Int], ord: Ordering[A])
+final case class SelectOptions[A](after: Option[Var[Option[A]]], maxItems: Option[Int], ord: Ordering[A])
 object SelectOptions {
 	def all[A](implicit ord: Ordering[A]): SelectOptions[A] = SelectOptions(None, None, ord)
 }

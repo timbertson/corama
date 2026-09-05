@@ -27,7 +27,8 @@ sealed trait Flow[A, -Ctx] {
 	// TODO: remove?
 	// def aggList: Flow[List[A], Ctx & Batch] = Flow.AggList(this)
 
-	def agg[B](agg: flow.Agg[B])(implicit tag: Tag[B]): Flow[B, Ctx & Batch] = Flow.Agg(tag, this, agg)
+	def agg[B](agg: flow.Aggregator[A, B])(implicit tag: Tag[B]): Flow[B, Ctx & Batch] = Flow.Agg(tag, this, agg)
+	def agg(agg: flow.Combiner[A])(implicit tag: Tag[A]): Flow[A, Ctx & Batch] = Flow.Agg(tag, this, agg)
 }
 
 object Flow {
@@ -42,7 +43,7 @@ object Flow {
 
 	private[flow] case class If[A, C0, C1, C2](tag: Tag[A], cond: Flow[Boolean, C0], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C0 & C1 & C2]
 	// private[flow] case class AggList[A, C](block: Flow[A, C]) extends Flow[List[A], C & Batch]
-	private[flow] case class Agg[A, B, C](tag: Tag[B], block: Flow[A, C], agg: flow.Agg[B]) extends Flow[B, C & Batch]
+	private[flow] case class Agg[A, B, Ctx](tag: Tag[B], block: Flow[A, Ctx], agg: flow.Agg[A, B]) extends Flow[B, Ctx & Batch]
 
 	// PState. Reads are available anywhere — a query topology reads PStates, that is
 	// what it is for. Writes require `Etl`: "a PState can only be updated by the ETL
@@ -72,11 +73,11 @@ object Flow {
 	  */
 	def hashPartition[A](v: Var[A]): Flow[Unit, Any] = Partition(v)
 
-	/** Works from any partition — Rama routes the value to the appender rather than to
-	  * the origin task, which is what makes this usable after a `hashPartition`. Note it
+	/** Works from any partition — Rama routes the value to the appender. Note it
 	  * does not end the flow: execution continues, and a fanned-out flow can reach this
-	  * more than once, which is what [[AckAgg]] exists to resolve.
+	  * more than once.
 	  */
+	 // TODO: this should be just a Node value, not a Flow
 	def ackReturn[O](v: Var[O]): Flow[Unit, AckReturning[O]] = AckReturn(v)
 
 	def unit: Flow[Unit, Any] = Pure(Var.unit)
