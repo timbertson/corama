@@ -31,18 +31,16 @@ final class AckReturns private[flow] (
 	private val values: Map[TopologyId, List[Any]],
 	private val topologies: Topologies) {
 
-	// Results are stored as type A, the aggregation. `mapOutput` is only performed when the
-	// result is actually returned.
+	// Results are stored as type A, the aggregation. `mapOutput` is performed when the result is returned.
 	def result[S, A, R](stream: StreamTopology[S, A, R]): R = {
 		val t = stream.topology
 		require(
 			topologies.declared(t),
 			s"${t.builder.source} was not declared in the module this append went to")
 
-		val aggregator: Aggregator[A, R] = Agg.asAggregator(t.agg)
-		val combiner: Combiner[A] = aggregator.combiner
+		val combiner: Combiner[A] = t.combiner
 		val aggregated: A = values.getOrElse(t.builder.id, Nil).foldLeft(combiner.zero)(combiner.combineAny)
-		aggregator.mapOut(aggregated)
+		t.applyMapOut(aggregated)
 	}
 
 	def unique[S, A, T, M <: Seq[T]](stream: StreamTopology[S, A, M]): Try[T] = {

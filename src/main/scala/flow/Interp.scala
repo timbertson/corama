@@ -229,13 +229,12 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 	def invoke[S, A, R](q: QueryTopology[S, A, R], value: S): IO[R] = {
 		val topology = q.topology
 		val env: Env = Map(topology.builder.input.vid -> value)
-		val agg = Agg.asAggregator(topology.agg)
-		val combiner = agg.combiner
+		val combiner = topology.combiner
 		partitions.random.continue(topology.compiled._1, List(env)).map { resultEnvs =>
 			val resultAgg: A = resultEnvs.foldLeft(combiner.zero) { (acc, resultEnv) =>
 				combiner.combineAny(acc, resultEnv.getOrElse(topology.compiled._2.vid, throw new RuntimeException("output var not present in query result")))
 			}
-			agg.mapOut(resultAgg)
+			topology.applyMapOut(resultAgg)
 		}
 	}
 }
@@ -449,25 +448,6 @@ class Partition(interpreter: Interpreter) {
 					continue(tail, envs, ack)
 				}
 
-			// case Node.Put(ps, key, value) :: tail =>
-			// 	val state = pstate(ps.name)
-			// 	envs.traverse_ { env =>
-			// 		val k = env(key)
-			// 		state.inner.update { map =>
-			// 			map.updated(k, env(value))
-			// 		}
-			// 	} *> continue(tail, envs, ack)
-
-			// case Node.UpdateWith(_pos, ps, key, arg, fn) :: tail =>
-			// 	val state = pstate(ps.name)
-			// 	envs.traverse_ { env =>
-			// 		val k = env(key)
-			// 		val a = env(arg)
-			// 		state.inner.update { map =>
-			// 			map.updatedWith(k)(v => fn(v, a))
-			// 		}
-			// 	} *> continue(tail, envs, ack)
-
 			case Node.LocalAppend(dep, value) :: tail =>
 				val state = depot(dep.name)
 				envs.traverse_ { env =>
@@ -475,13 +455,6 @@ class Partition(interpreter: Interpreter) {
 					// `None`: the new record starts its own event tree rather than extending
 					// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
 					state.inner.update(_.appended(Record(v, None)))
-				} *> continue(tail, envs, ack)
-
-			case Node.AckReturn(value) :: tail =>
-				// Once per branch. A flow that fans out reaches this many times, and it is
-				// the declared `AckAgg` that decides what the appender sees.
-				envs.traverse_ { env =>
-					ack.traverse_(_.ackReturn(env(value)))
 				} *> continue(tail, envs, ack)
 		}
 }

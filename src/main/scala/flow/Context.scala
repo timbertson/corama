@@ -27,7 +27,7 @@ package flow
   */
 object Context
 
-/** Requires a batch block: a value-producing `agg`, as [[Flow.aggList]] compiles to.
+/** Requires a batch block: a value-producing `agg`
   *
   * Available in query topologies (implicitly batch blocks) and inside a microbatch
   * topology's `batchBlock`. Not in stream topologies.

@@ -29,20 +29,6 @@ private[flow] object Node {
 	// The `op` contains the output var, if present
 	case class Dynamic(pos: SourcePos, ins: List[VarId], fn: List[Any] => Any, op: DynamicOp) extends Node
 
-	// // Operations with a single input var, and optional output var
-	// sealed trait UnaryOp
-	// object UnaryOp {
-	// 	case class Assign(out: VarId)
-	// 	case class Agg(agg: Flow.Agg[?], out: VarId)
-	// 	case class If(ifBlock: List[Node], elseBlock: List[Node], out: VarId)
-	// 	case class LocalAppend(depot: Depot[?])
-	// }
-	// case class Unary(in: VarId, op: UnaryOp) extends Node
-
-	// case class MapN(pos: SourcePos, fn: List[Any] => Any, ins: List[VarId], out: VarId) extends Node
-
-	// case class Explode(pos: SourcePos, fn: Any => Seq[Any], in: VarId, out: VarId) extends Node
-
 	case class Assign(in: VarId, out: VarId) extends Node
 
 	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
@@ -57,8 +43,6 @@ private[flow] object Node {
 	case class Combine(block: List[Node], agg: flow.Combiner[?], collectFrom: VarId, out: VarId) extends Node
 
 	case class LocalAppend(depot: Identity, arg: VarId) extends Node
-
-	case class AckReturn(value: VarId) extends Node
 
 	sealed trait PStateOp
 	object PStateOp {
@@ -80,8 +64,6 @@ private[flow] object Node {
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*
 		* TODO: remove unnecessary var return?
-		*
-		* It at least should be a Var[Any], Var[A] is a lie
 		*
 		* NOTE: for the rama backend, _always_ extract `f` to a value first. Otherwise
 		*       the closure captures Var[T], which isn't serializable.
@@ -127,14 +109,10 @@ private[flow] object Node {
 
 				(condBlock ++ bodyNodes, out)
 
-			case a: Flow.Agg[a, b, ctx] =>
+			case a: Flow.Combine[a, ctx] =>
 				val (block, innerVar) = compile(t, a.block)
-				a.agg match {
-					case collector: Combiner[_] =>
-						val out = t.define[A](a.tag, Var.internal, "agg")
-						(List(Node.Combine(block, collector, innerVar.vid, out.vid)), out)
-					case aggregator: Aggregator[_, _] => ??? // TODO
-				}
+				val out = t.define[A](a.tag, Var.internal, "agg")
+				(List(Node.Combine(block, a.combiner, innerVar.vid, out.vid)), out)
 
 			case g: Flow.Get[a] =>
 				val out = t.define[a](g.lens.tag, Var.internal, "get")
@@ -159,9 +137,6 @@ private[flow] object Node {
 
 			case Flow.LocalAppend(depot, value) =>
 				(List(Node.LocalAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])
-
-			case Flow.AckReturn(value) =>
-				(List(Node.AckReturn(value.vid)), Var.unit.asInstanceOf[Var[A]])
 		}
 	}
 }

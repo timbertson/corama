@@ -36,14 +36,32 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 		topologies.topologies.foreach { t =>
 			val id = t.builder.source
 			val compiled = compileNodes(t.compiled._1)
-			val block = t.builder.source.namespace match {
-				case IdentityNamespace.Depot => Some(streamTopology.source(compileIdentity(id)))
-				case IdentityNamespace.Query => Some(ramaTopologies.query(compileIdentity(id)))
-				case IdentityNamespace.PState => None
+
+			def install(source: rama.Block.Out) = {
+				source.out(compileVar(t.input)).`macro`(compiled)
 			}
-			block.foreach(_.out(compileVar(t.input)).`macro`(compiled))
+
+			t.builder.source.namespace match {
+				case IdentityNamespace.Depot =>
+					// streams always return their final value. Combination is performed by rama, however post-aggregation mapping
+					// is not. TODO integrate this into the API
+
+					// TODO: aggregation could be omitted for Unit streams
+					install(streamTopology.source(compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.combiner))))
+						.ackReturn(compileVar(t.compiled._2))
+
+				case IdentityNamespace.Query =>
+					// queries perform combination as part of the flow, mapAggregation is performed at query time
+					install(ramaTopologies.query(compileIdentity(id)))
+						.agg(rama.Agg.combiner(compileCombiner(t.combiner), t.compiled._2)).out(compileVar(t.queryResultVar))
+						.originPartition()
+
+				case IdentityNamespace.PState => ()
+			}
 		}
 	}
+	
+	// TODO: overloads for invoke / query which perform post-aggregation
 }
 
 object RamaBackend {
@@ -227,14 +245,8 @@ object RamaBackend {
 			}
 		}
 
-		// case Node.Put(ps, key, value) =>
-		// 	Block.localTransform(compileIdentity(ps), Path.key(compileVar(key)).termVal(compileVar(value)))
-
 		case Node.LocalAppend(dep, value) =>
 			Block.depotPartitionAppend(compileIdentity(dep), compileVar(value))
-
-		case Node.AckReturn(value) =>
-			Block.ackReturn(compileVar(value))
 	}
 
 	private def compileNodes(nodes: List[Node]): Block.Impl =

@@ -10,7 +10,7 @@ import scala.util.Success
 import cats.data.NonEmptyList
 
 sealed trait Agg[A, B] {
-	def map[C](fn: B => C): Aggregator[A, C]
+	def map[C](fn: B => C): MapAggregator[A, C]
 }
 
 // The simple combiner type, an aggregation where input / state / output are all the same type
@@ -22,24 +22,26 @@ final class Combiner[A] private[flow] (
 	private[flow] def mergeAny(values: List[Any]): A = merge(values.asInstanceOf[List[A]])
 	private[flow] def combineAny(a: Any, b: Any): A = combine(a.asInstanceOf[A], b.asInstanceOf[A])
 
-	private[flow] def generic: Aggregator[A, A] = new Aggregator(this, identity)
+	private[flow] def generic: MapAggregator[A, A] = new MapAggregator(this, identity)
 	
-	override def map[B](fn: A => B): Aggregator[A, B] = generic.map(fn)
+	override def map[B](fn: A => B): MapAggregator[A, B] = generic.map(fn)
 }
 
 // Full aggregation type, with `mapOut`
-final class Aggregator[A, B] private[flow] (
+final class MapAggregator[A, B] private[flow] (
 	private[flow] val combiner: Combiner[A],
 	private[flow] val mapOut: A => B
 ) extends Agg[A, B] {
 
-	def map[C](fn: B => C): Aggregator[A, C] = new Aggregator(combiner, mapOut = x => fn(this.mapOut(x)))
+	def map[C](fn: B => C): MapAggregator[A, C] =
+		val mapOut = this.mapOut // prevent capture of `this` in closure
+		new MapAggregator(combiner, mapOut = x => fn(mapOut(x)))
 }
 
 object Agg {
-	private[flow] def asAggregator[A, B](agg: Agg[A, B]): Aggregator[A, B] = agg match {
+	private[flow] def asMapAggregator[A, B](agg: Agg[A, B]): MapAggregator[A, B] = agg match {
 		case c: Combiner[?] => c.generic
-		case a: Aggregator[?, ?] => a
+		case a: MapAggregator[?, ?] => a
 	}
 
 	def apply[A](zero: A, combine: (A, A) => A): Combiner[A] = new Combiner(zero, combine)

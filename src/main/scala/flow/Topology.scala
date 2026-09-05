@@ -74,17 +74,21 @@ final class Topologies {
 
 	/** Declare a query topology: invoked by a client, returns exactly one value.
 	  */
-	def query[S, A, R](name: String, agg: Aggregator[A, R])(
+	def query[S, A, R](name: String, agg: MapAggregator[A, R])(
 		block: Var[S] => Flow[A, QueryContext],
-	)(implicit pos: SourcePos, tag: Tag[S]): QueryTopology[S, A, R] = {
-		QueryTopology(declare[S, A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tag, pos)(block))
+	)(implicit pos: SourcePos, tagS: Tag[S], tagA: Tag[A], tagR: Tag[R]): QueryTopology[S, A, R] = {
+		QueryTopology(declare[S, A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, tagA, tagR, pos) { input =>
+			block(input).agg(agg.combiner)
+		})
 	}
 
 	// Overload accepting a simple combiner
-	def query[Input, R](name: String, agg: Combiner[R])(
-		block: Var[Input] => Flow[R, QueryContext],
-	)(implicit pos: SourcePos, tag: Tag[Input]): QueryTopology[Input, R, R] = {
-		QueryTopology(declare[Input, R, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tag, pos)(block))
+	def query[S, R](name: String, agg: Combiner[R])(
+		block: Var[S] => Flow[R, QueryContext],
+	)(implicit pos: SourcePos, tagS: Tag[S], tagR: Tag[R]): QueryTopology[S, R, R] = {
+		QueryTopology(declare[S, R, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, tagR, tagR, pos) { input =>
+			block(input).agg(agg)
+		})
 	}
 
 	/** A stream topology: driven by an append, writes PStates, returns nothing.
@@ -93,24 +97,33 @@ final class Topologies {
 	  */
 	def stream_[A](depot: Depot[A])(
 		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
-	)(implicit pos: SourcePos, tag: Tag[A]): Topology[A, Unit, Unit] = {
-		declare[A, Unit, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tag, pos)(block)
+	)(implicit pos: SourcePos, tagA: Tag[A]): Topology[A, Unit, Unit] = {
+		val tagUnit = implicitly[Tag[Unit]]
+		declare[A, Unit, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tagA, tagUnit, tagUnit, pos)(block)
 	}
 
 	// A stream topology returning `A` values, aggregated into an `R` value.
 	def stream[S, A, R](depot: Depot[S], agg: Agg[A, R])(
 		block: Var[S] => Flow[A, StreamContext[A]]
-	)(implicit pos: SourcePos, tag: Tag[S]): StreamTopology[S, A, R] = {
-		StreamTopology(declare[S, A, R, StreamContext[A]](depot.id, agg, tag, pos) { input =>
+	)(implicit pos: SourcePos, tagS: Tag[S], tagA: Tag[A], tagR: Tag[R]): StreamTopology[S, A, R] = {
+		StreamTopology(declare[S, A, R, StreamContext[A]](depot.id, agg, tagS, tagA, tagR, pos) { input =>
 			block(input)
 		})
 	}
 
-	private def declare[S, A, R, C](source: Identity, agg: Agg[A, R], tag: Tag[S], pos: SourcePos)(
+	private def declare[S, A, R, C](source: Identity, agg: Agg[A, R], tagS: Tag[S], tagA: Tag[A], tagR: Tag[R], pos: SourcePos)(
 		block: Var[S] => Flow[A, C]
 	): Topology[S, A, R] = {
-		val b = new TopologyBuilder[S](TopologyId(built.length), source, tag, pos)
-		val t = Topology[S, A, R](b, block(b.input), agg)
+		val b = new TopologyBuilder[S](TopologyId(built.length), source, tagS, pos)
+		
+		// Note: declaration can only embed the combine part of the aggregation, the mapOut part
+		// is handled differently depending on whether it's a query or stream topology
+		val (combiner, mapOut) = agg match {
+			case c: Combiner[?] => (c.asInstanceOf[Combiner[A]], None)
+			case a: MapAggregator[?, ?] => (a.combiner, Some(a.mapOut))
+		}
+
+		val t = Topology[S, A, R](b, block(b.input), combiner, mapOut, tagR)
 		built = t :: built
 		t
 	}
@@ -128,9 +141,18 @@ object Topologies {
 final case class Topology[S, A, R](
 	builder: TopologyBuilder[S],
 	flow: Flow[A, Nothing],
-	agg: Agg[A, R]) {
+	combiner: Combiner[A],
+	mapOut: Option[A => R],
+	tagR: Tag[R]) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
+	
+	// only used in rama backend
+	val queryResultVar = builder.vars.add("output", tagR, implicitly[SourcePos])
+
+	def applyMapOut(aggregated: A): R =
+		// if mapOut is None, then A must == R
+		mapOut.getOrElse(identity.asInstanceOf[(A) => R]).apply(aggregated)
 }
 
 // wrappers for the different types of topology
