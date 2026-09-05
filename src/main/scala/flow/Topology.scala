@@ -44,13 +44,13 @@ final class TopologyBuilder[S] private[flow] (
 
 final class Topologies {
 	private [flow] var ids = Set.empty[Identity]
-	private var built = List.empty[Topology[?, ?, ?]]
+	private var built = List.empty[Topology[?, ?]]
 
 	// private var pstates: List[Pstate]
 
-	def topologies: List[Topology[?, ?, ?]] = built.reverse
+	def topologies: List[Topology[?, ?]] = built.reverse
 
-	private[flow] def declared(t: Topology[?, ?, ?]): Boolean = built.exists(_ eq t)
+	private[flow] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
 
 	private def claim(identity: Identity): Identity = {
 		if (ids.contains(identity)) {
@@ -72,21 +72,12 @@ final class Topologies {
 	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] =
 		Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
 
-	/** Declare a query topology: invoked by a client, returns exactly one value.
+	/** Declare a query topology: invoked by a client, returns one aggregated value.
 	  */
-	def query[S, A, R](name: String, agg: MapAggregator[A, R])(
-		block: Var[S] => Flow[A, QueryContext],
-	)(implicit pos: SourcePos, tagS: Tag[S], tagA: Tag[A], tagR: Tag[R]): QueryTopology[S, A, R] = {
-		QueryTopology(declare[S, A, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, tagA, tagR, pos) { input =>
-			block(input).agg(agg.combiner)
-		})
-	}
-
-	// Overload accepting a simple combiner
-	def query[S, R](name: String, agg: Combiner[R])(
+	def query[S, R](name: String, agg: Agg[R])(
 		block: Var[S] => Flow[R, QueryContext],
-	)(implicit pos: SourcePos, tagS: Tag[S], tagR: Tag[R]): QueryTopology[S, R, R] = {
-		QueryTopology(declare[S, R, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, tagR, tagR, pos) { input =>
+	)(implicit pos: SourcePos, tagS: Tag[S], tagR: Tag[R]): QueryTopology[S, R] = {
+		QueryTopology(declare[S, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, pos) { input =>
 			block(input).agg(agg)
 		})
 	}
@@ -97,33 +88,23 @@ final class Topologies {
 	  */
 	def stream_[A](depot: Depot[A])(
 		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
-	)(implicit pos: SourcePos, tagA: Tag[A]): Topology[A, Unit, Unit] = {
+	)(implicit pos: SourcePos, tagA: Tag[A]): StreamTopology[A, Unit] = {
 		val tagUnit = implicitly[Tag[Unit]]
-		declare[A, Unit, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tagA, tagUnit, tagUnit, pos)(block)
+		StreamTopology(declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tagA, pos)(block))
 	}
 
-	// A stream topology returning `A` values, aggregated into an `R` value.
-	def stream[S, A, R](depot: Depot[S], agg: Agg[A, R])(
-		block: Var[S] => Flow[A, StreamContext[A]]
-	)(implicit pos: SourcePos, tagS: Tag[S], tagA: Tag[A], tagR: Tag[R]): StreamTopology[S, A, R] = {
-		StreamTopology(declare[S, A, R, StreamContext[A]](depot.id, agg, tagS, tagA, tagR, pos) { input =>
-			block(input)
-		})
+	// A stream topology returning `R` aggregated values
+	def stream[S, R](depot: Depot[S], agg: Agg[R])(
+		block: Var[S] => Flow[R, StreamContext[R]]
+	)(implicit pos: SourcePos, tagS: Tag[S]): StreamTopology[S, R] = {
+		StreamTopology(declare[S, R, StreamContext[R]](depot.id, agg, tagS, pos)(block))
 	}
 
-	private def declare[S, A, R, C](source: Identity, agg: Agg[A, R], tagS: Tag[S], tagA: Tag[A], tagR: Tag[R], pos: SourcePos)(
-		block: Var[S] => Flow[A, C]
-	): Topology[S, A, R] = {
+	private def declare[S, R, C](source: Identity, agg: Agg[R], tagS: Tag[S], pos: SourcePos)(
+		block: Var[S] => Flow[R, C]
+	): Topology[S, R] = {
 		val b = new TopologyBuilder[S](TopologyId(built.length), source, tagS, pos)
-		
-		// Note: declaration can only embed the combine part of the aggregation, the mapOut part
-		// is handled differently depending on whether it's a query or stream topology
-		val (combiner, mapOut) = agg match {
-			case c: Combiner[?] => (c.asInstanceOf[Combiner[A]], None)
-			case a: MapAggregator[?, ?] => (a.combiner, Some(a.mapOut))
-		}
-
-		val t = Topology[S, A, R](b, block(b.input), combiner, mapOut, tagR)
+		val t = Topology[S, R](b, block(b.input), agg)
 		built = t :: built
 		t
 	}
@@ -135,30 +116,20 @@ object Topologies {
 
 /** A declared topology, and how it produces its result.
 	* S: source type (input variable)
-	* A: accumulation type (the result of the flow)
-	* R: final post-aggregation return type; often the same as A
+	* R: aggregated return type
 	*/
-final case class Topology[S, A, R](
+final case class Topology[S, R](
 	builder: TopologyBuilder[S],
-	flow: Flow[A, Nothing],
-	combiner: Combiner[A],
-	mapOut: Option[A => R],
-	tagR: Tag[R]) {
+	flow: Flow[R, Nothing],
+	agg: Agg[R]) {
 	def input: Var[S] = builder.input
 	val compiled = Node.compile(builder, flow)
-	
-	// only used in rama backend
-	val queryResultVar = builder.vars.add("output", tagR, implicitly[SourcePos])
-
-	def applyMapOut(aggregated: A): R =
-		// if mapOut is None, then A must == R
-		mapOut.getOrElse(identity.asInstanceOf[(A) => R]).apply(aggregated)
 }
 
 // wrappers for the different types of topology
-final case class QueryTopology[S, A, R] private[flow](topology: Topology[S, A, R])
+final case class QueryTopology[S, R] private[flow](topology: Topology[S, R])
 
-final case class StreamTopology[S, A, R] private[flow](topology: Topology[S, A, R])
+final case class StreamTopology[S, R] private[flow](topology: Topology[S, R])
 
 
 sealed trait IdentityNamespace

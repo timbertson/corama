@@ -24,10 +24,7 @@ sealed trait Flow[A, -Ctx] {
 
 	def void: Flow[Unit, Ctx] = as(Var.unit)
 
-	def mapAgg[B](agg: flow.MapAggregator[A, B])(implicit tagA: Tag[A], tagB: Tag[B]): Flow[B, Ctx & Batch] =
-		Flow.Combine(tagA, this, agg.combiner).flatMap(result => result.map(agg.mapOut))
-
-	def agg(agg: flow.Combiner[A])(implicit tag: Tag[A]): Flow[A, Ctx & Batch] = Flow.Combine(tag, this, agg)
+	def agg(agg: flow.Agg[A])(implicit tag: Tag[A]): Flow[A, Ctx & Batch] = Flow.Combine(tag, this, agg)
 }
 
 object Flow {
@@ -41,7 +38,7 @@ object Flow {
 	private[flow] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
 
 	private[flow] case class If[A, C0, C1, C2](tag: Tag[A], cond: Flow[Boolean, C0], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C0 & C1 & C2]
-	private[flow] case class Combine[A, Ctx](tag: Tag[A], block: Flow[A, Ctx], combiner: flow.Combiner[A]) extends Flow[A, Ctx & Batch]
+	private[flow] case class Combine[A, Ctx](tag: Tag[A], block: Flow[A, Ctx], agg: flow.Agg[A]) extends Flow[A, Ctx & Batch]
 
 	// PState. Reads are available anywhere — a query topology reads PStates, that is
 	// what it is for. Writes require `Etl`: "a PState can only be updated by the ETL

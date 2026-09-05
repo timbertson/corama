@@ -9,59 +9,34 @@ import scala.util.Failure
 import scala.util.Success
 import cats.data.NonEmptyList
 
-sealed trait Agg[A, B] {
-	def map[C](fn: B => C): MapAggregator[A, C]
-}
-
-// The simple combiner type, an aggregation where input / state / output are all the same type
-final class Combiner[A] private[flow] (
+final class Agg[A] private[flow] (
 	private[flow] val zero: A,
 	private[flow] val combine: (A, A) => A,
-) extends Agg[A, A] {
+) {
 	private[flow] def merge(values: List[A]): A = values.foldLeft(zero)(combine)
 	private[flow] def mergeAny(values: List[Any]): A = merge(values.asInstanceOf[List[A]])
 	private[flow] def combineAny(a: Any, b: Any): A = combine(a.asInstanceOf[A], b.asInstanceOf[A])
-
-	private[flow] def generic: MapAggregator[A, A] = new MapAggregator(this, identity)
-	
-	override def map[B](fn: A => B): MapAggregator[A, B] = generic.map(fn)
-}
-
-// Full aggregation type, with `mapOut`
-final class MapAggregator[A, B] private[flow] (
-	private[flow] val combiner: Combiner[A],
-	private[flow] val mapOut: A => B
-) extends Agg[A, B] {
-
-	def map[C](fn: B => C): MapAggregator[A, C] =
-		val mapOut = this.mapOut // prevent capture of `this` in closure
-		new MapAggregator(combiner, mapOut = x => fn(mapOut(x)))
 }
 
 object Agg {
-	private[flow] def asMapAggregator[A, B](agg: Agg[A, B]): MapAggregator[A, B] = agg match {
-		case c: Combiner[?] => c.generic
-		case a: MapAggregator[?, ?] => a
-	}
-
-	def apply[A](zero: A, combine: (A, A) => A): Combiner[A] = new Combiner(zero, combine)
+	def apply[A](zero: A, combine: (A, A) => A): Agg[A] = new Agg(zero, combine)
 
 	// Collect any monoid
-	def collect[A, M[_]](using app: Applicative[M], m: Monoid[M[A]]): Combiner[M[A]] = {
-		new Combiner[M[A]](m.empty, m.combine)
+	def collect[A, M[_]](using app: Applicative[M], m: Monoid[M[A]]): Agg[M[A]] = {
+		new Agg[M[A]](m.empty, m.combine)
 	}
 
 	// convenience overload of collect to hardcode the List type
-	def list[A]: Combiner[List[A]] = collect
+	def list[A]: Agg[List[A]] = collect
 
 	// return nothing, accumulate nothing
-	def unit: Combiner[Unit] = apply((), (_, _) => ())
+	def unit: Agg[Unit] = apply((), (_, _) => ())
 
-	def error[E]: Combiner[Either[E, Unit]] = apply(Right(()), { (curr, next) =>
+	def error[E]: Agg[Either[E, Unit]] = apply(Right(()), { (curr, next) =>
 		curr.flatMap(_ => next)
 	})
 
-	def either[E, T](initial: T): Combiner[Either[E, T]] = apply(Right(initial), { (curr, next) =>
+	def either[E, T](initial: T): Agg[Either[E, T]] = apply(Right(initial), { (curr, next) =>
 		curr.flatMap(_ => next)
 	})
 }

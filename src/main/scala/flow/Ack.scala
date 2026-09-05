@@ -32,19 +32,18 @@ final class AckReturns private[flow] (
 	private val topologies: Topologies) {
 
 	// Results are stored as type A, the aggregation. `mapOutput` is performed when the result is returned.
-	def result[S, A, R](stream: StreamTopology[S, A, R]): R = {
+	def result[S, R](stream: StreamTopology[S, R]): R = {
 		val t = stream.topology
 		require(
 			topologies.declared(t),
 			s"${t.builder.source} was not declared in the module this append went to")
 
-		val combiner: Combiner[A] = t.combiner
-		val aggregated: A = values.getOrElse(t.builder.id, Nil).foldLeft(combiner.zero)(combiner.combineAny)
-		t.applyMapOut(aggregated)
+		val agg: Agg[R] = t.agg
+		values.getOrElse(t.builder.id, Nil).foldLeft(agg.zero)(agg.combineAny)
 	}
 
-	def unique[S, A, T, M <: Seq[T]](stream: StreamTopology[S, A, M]): Try[T] = {
-		val seq = result[S, A, M](stream)
+	def unique[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[T] = {
+		val seq = result[S, M](stream)
 		if (seq.length == 1) {
 			Success(seq.head)
 		} else {

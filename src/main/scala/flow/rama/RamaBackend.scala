@@ -43,17 +43,16 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 
 			t.builder.source.namespace match {
 				case IdentityNamespace.Depot =>
-					// streams always return their final value. Combination is performed by rama, however post-aggregation mapping
-					// is not. TODO integrate this into the API
-
+					// streams always return their final value, which is aggregated.
 					// TODO: aggregation could be omitted for Unit streams
-					install(streamTopology.source(compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.combiner))))
+					install(streamTopology.source(compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.agg))))
 						.ackReturn(compileVar(t.compiled._2))
 
 				case IdentityNamespace.Query =>
 					// queries perform combination as part of the flow, mapAggregation is performed at query time
 					install(ramaTopologies.query(compileIdentity(id)))
-						.agg(rama.Agg.combiner(compileCombiner(t.combiner), t.compiled._2)).out(compileVar(t.queryResultVar))
+						// TODO: is it OK to reuse this variable name?
+						.agg(rama.Agg.combiner(compileCombiner(t.agg), t.compiled._2)).out(compileVar(t.compiled._2))
 						.originPartition()
 
 				case IdentityNamespace.PState => ()
@@ -191,10 +190,10 @@ object RamaBackend {
 				Block.each(identity, compileVar(in)).out(compileVar(out))
 			}
 
-		case Node.Combine(block, combiner, collectFrom, out) =>
+		case Node.Combine(block, agg, collectFrom, out) =>
 			Block.create()
 				.`macro`(compileNodes(block))
-				.`macro`(Block.agg(Agg.combiner(compileCombiner(combiner), compileVar(collectFrom))).out(compileVar(out)))
+				.`macro`(Block.agg(Agg.combiner(compileCombiner(agg), compileVar(collectFrom))).out(compileVar(out)))
 
 		case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
 			val ramaPath = compilePath(path)
@@ -252,7 +251,7 @@ object RamaBackend {
 	private def compileNodes(nodes: List[Node]): Block.Impl =
 		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
 
-	private def compileCombiner[O](agg: flow.Combiner[O]): RamaCombinerAgg[O] = {
+	private def compileCombiner[O](agg: flow.Agg[O]): RamaCombinerAgg[O] = {
 		new RamaCombinerAgg[O] {
 			override def zeroVal(): O = agg.zero
 			override def combine(current: O, value: O): O = agg.combine(current, value)

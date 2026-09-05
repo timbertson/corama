@@ -201,7 +201,7 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 		this.partitions.partitionKey(value).emit(depot, value)
 
 	/** Topologies driven by this depot — the count an [[AckTracker]] waits for. */
-	private[flow] def subscribers(depot: Identity): List[Topology[?, ?, ?]] =
+	private[flow] def subscribers(depot: Identity): List[Topology[?, ?]] =
 		topologies.topologies.filter(_.builder.source == depot)
 
 	def append[A, R](depot: flow.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack): IO[R] =
@@ -226,15 +226,14 @@ class Interpreter(val topologies: Topologies, numPartitions: Int = 10) {
 
 	/** Invoke a query topology, as a client would.
 	  */
-	def invoke[S, A, R](q: QueryTopology[S, A, R], value: S): IO[R] = {
+	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
 		val topology = q.topology
 		val env: Env = Map(topology.builder.input.vid -> value)
-		val combiner = topology.combiner
+		val agg = topology.agg
 		partitions.random.continue(topology.compiled._1, List(env)).map { resultEnvs =>
-			val resultAgg: A = resultEnvs.foldLeft(combiner.zero) { (acc, resultEnv) =>
-				combiner.combineAny(acc, resultEnv.getOrElse(topology.compiled._2.vid, throw new RuntimeException("output var not present in query result")))
+			resultEnvs.foldLeft(agg.zero) { (acc, resultEnv) =>
+				agg.combineAny(acc, resultEnv.getOrElse(topology.compiled._2.vid, throw new RuntimeException("output var not present in query result")))
 			}
-			topology.applyMapOut(resultAgg)
 		}
 	}
 }
@@ -383,11 +382,11 @@ class Partition(interpreter: Interpreter) {
 				}
 			}
 
-			case Node.Combine(block, combiner, collectFrom, out) :: tail => {
+			case Node.Combine(block, agg, collectFrom, out) :: tail => {
 				envs.traverse { env =>
 					continue(block, List(env), ack).map { innerEnvs =>
-						env.updated(out, innerEnvs.foldLeft(combiner.zero) { (acc, innerEnv) =>
-							combiner.combineAny(acc, innerEnv(collectFrom))
+						env.updated(out, innerEnvs.foldLeft(agg.zero) { (acc, innerEnv) =>
+							agg.combineAny(acc, innerEnv(collectFrom))
 						})
 					}
 				}.flatMap { outputEnvs =>

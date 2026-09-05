@@ -20,7 +20,7 @@ object Result {
 
 	def unit: Result[Unit] = success[Unit](())
 
-	def agg[T](implicit M: Monoid[T]): flow.Combiner[Result[T]] =
+	def agg[T](implicit M: Monoid[T]): flow.Agg[Result[T]] =
 		flow.Agg(Result(Right(M.empty)), { (a,b) =>
 			Result(a.value.flatMap(a => b.value.map(M.combine(a, _))))
 		})

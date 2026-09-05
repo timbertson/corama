@@ -84,10 +84,10 @@ object Example extends IOApp {
 		} yield tickets
 	}
 
-	val userTicketsQuery: QueryTopology[Long, List[Ticket], List[Ticket]] =
+	val userTicketsQuery: QueryTopology[Long, List[Ticket]] =
 		topologies.query("userTickets", Agg.list[Ticket])(listUserTickets)
 
-	val assigning: StreamTopology[Assignment, List[Option[Long]], List[Option[Long]]] =
+	val assigning: StreamTopology[Assignment, List[Option[Long]]] =
 		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(propagateAssignment)
 
 	override def run(args: List[String]): IO[ExitCode] = {
