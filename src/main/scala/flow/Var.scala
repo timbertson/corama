@@ -111,7 +111,10 @@ final class Var[A] private[flow] (private[flow] val vid: VarId, val tag: Tag[A],
 	def explode[B](implicit pos: SourcePos, tag: Tag[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
 
 	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = Flow.ExplodeOp(tag, pos, List(this.asAny), {
-		case List(a) => f(a.asInstanceOf[A])
+		case List(a) => {
+			println(s"Exploding value: ${a}")
+			f(a.asInstanceOf[A])
+		}
 		case other => impossible(s"explode with ${other.length}")
 	})
 

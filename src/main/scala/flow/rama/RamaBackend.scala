@@ -59,8 +59,6 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 			}
 		}
 	}
-	
-	// TODO: overloads for invoke / query which perform post-aggregation
 }
 
 object RamaBackend {

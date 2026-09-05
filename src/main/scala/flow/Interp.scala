@@ -16,6 +16,9 @@ import fs2.Chunk
 import izumi.reflect.Tag
 
 import flow.internal._
+import scala.util.control.NoStackTrace
+import org.tpolecat.sourcepos.SourcePos
+import flow.Interpreter.EvalError
 
 /** Simple interpreter: runs a [[Flow]] as plain Scala over in-memory state.
   *
@@ -25,6 +28,7 @@ import flow.internal._
   */
 object Interpreter {
 	type Env = Map[VarId, Any]
+	class EvalError(msg: String, pos: SourcePos, cause: Throwable) extends RuntimeException(s"$msg defined at $pos", cause) with NoStackTrace
 }
 
 class Partitions(interpreter: Interpreter, numPartitions: Int) {
@@ -121,7 +125,7 @@ private[flow] final class AckTracker(
 	returns: Ref[IO, Map[TopologyId, List[Any]]],
 	done: Deferred[IO, Either[Throwable, Map[TopologyId, List[Any]]]]) {
 
-	/** Add a value to the return set for a specifi topology
+	/** Add a value to the return set for a specific topology
 	  */
 	def ackReturn(topology: TopologyId, value: Any): IO[Unit] =
 		returns.update(m => m.updated(topology, m.getOrElse(topology, Nil) :+ value))
@@ -140,14 +144,13 @@ private[flow] final class AckTracker(
 	def await: IO[Map[TopologyId, List[Any]]] = done.get.rethrow
 }
 
-/** An [[AckTracker]] with the identity of the topology reporting into it.
-  *
-  * `continue` executes nodes without knowing which topology it is running, and the node
-  * for `ackReturn` carries only a var. Pairing the two here keeps that so, and is what
-  * lets the sink cross a partition hop unchanged.
-  */
-private[flow] final case class AckSink(topology: TopologyId, tracker: AckTracker) {
-	def ackReturn(value: Any): IO[Unit] = tracker.ackReturn(topology, value)
+/** An [[AckTracker]] with the identity of the topology reporting into it. */
+private[flow] final case class AckSink(topology: TopologyId, outVar: VarId, tracker: AckTracker) {
+	def addResults(envs: List[Env]) = {
+		envs.traverse_ { env =>
+			tracker.ackReturn(topology, env(outVar))
+		}
+	}
 	def fail(err: Throwable): IO[Unit] = tracker.fail(err)
 	def finish: IO[Unit] = tracker.finish
 }
@@ -267,16 +270,11 @@ class Partition(interpreter: Interpreter) {
 			this.depots(top.builder.source.name).stream.foreach { record =>
 				// TODO: chunks?
 				val env = Map(top.input.vid -> record.value)
-				val ack = record.tracker.map(AckSink(top.builder.id, _))
+				val ack = record.tracker.map(tracker => AckSink(top.builder.id, top.compiled._2.vid, tracker))
 
 				// `continue` returning means the whole event tree for this record is
-				// exhausted — every fanned-out branch, on every partition it reached. So
-				// this is exactly where a colocated topology reports completion.
-				// `IO.defer`, because `continue` evaluates the pure parts of a flow — an
-				// `each`'s function, say — while *building* its `IO`. A user function that
-				// throws therefore throws here rather than inside the returned `IO`, and
-				// without this the raise escapes to the consuming fiber instead of reaching
-				// the tracker below.
+				// exhausted — every fanned-out branch, on every partition it reached.
+				// `IO.defer` ensures exceptions in user functions (like each) don't escape.
 				IO.defer(continue(top.compiled._1, List(env), ack)).void.attempt.flatMap {
 					case Right(_) => record.tracker.traverse_(_.finish)
 
@@ -287,7 +285,7 @@ class Partition(interpreter: Interpreter) {
 						record.tracker match {
 							case Some(tracker) => tracker.fail(e)
 							// Nobody is waiting, so swallowing would lose the error entirely.
-							// Failing `run` is loud, which beats a silent no-op.
+							// Failing `run` is better than silently discarding
 							case None => IO.raiseError(e)
 						}
 				}
@@ -339,25 +337,32 @@ class Partition(interpreter: Interpreter) {
 		import Node.PStateOp
 
 		nodes match {
-			case Nil => IO.pure(envs)
+			case Nil => {
+				ack.traverse_ { sink =>
+					sink.addResults(envs)
+				}.as(envs)
+			}
 
 			case Node.Dynamic(pos, ins, fn, op) :: tail => {
-				// TODO: error reporting using the `pos`
-				val results = op match {
-					case DynamicOp.Map(out) =>
-						envs.map(env => env.updated(out, fn(ins.map(env(_)))))
-					case DynamicOp.Explode(out) =>
-						// in each env, `in` holds an `A`
-						// `fn` takes A and yields a Seq of values.
-						// we expand each of these into `out` in a
-						// copy of the parent env
-						envs.flatMap { env =>
-							fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
-								env.updated(out, value)
+				val results = try {
+					op match {
+						case DynamicOp.Map(out) =>
+							envs.map(env => env.updated(out, fn(ins.map(env(_)))))
+						case DynamicOp.Explode(out) =>
+							// in each env, `in` holds an `A`
+							// `fn` takes A and yields a Seq of values.
+							// we expand each of these into `out` in a
+							// copy of the parent env
+							envs.flatMap { env =>
+								fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
+									env.updated(out, value)
+								}
 							}
-						}
-					case DynamicOp.Filter(_) =>
-						envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
+						case DynamicOp.Filter(_) =>
+							envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
+					}
+				} catch {
+					case e => throw new EvalError(s"Error evaluating node", pos, e)
 				}
 				continue(tail, results, ack)
 			}
@@ -419,7 +424,9 @@ class Partition(interpreter: Interpreter) {
 										val afterLimit = maxItems.fold(afterList) { max =>
 											afterList.take(max)
 										}
+										afterLimit
 								}
+								println(s"Select returned $result into var $out")
 								(current, env.updated(out, result))
 							}
 

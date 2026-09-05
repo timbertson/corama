@@ -184,13 +184,13 @@ class RamaExample extends RamaModule {
 			_ <- Flow.hashPartition(userId)
 			_ <- userId.foreach(uid => println(s"fetching ticket assignment for $uid"))
 			
-			// TODO: paginate via cursor
 			ticketIds <- userTickets.key(userId).selectRange(afterItem = cursor, maxItems = userTicketsPageSize)
 			cursor <- ticketIds.map { ids =>
 				// potentially more results, use the last ID as the cursor
 				Option.when(ids.size >= userTicketsPageSize)(ids.last)
 			}
 			
+			// fanout each ticket ID
 			// TODO: is this serial? Can I make it parallel per hashPartition?
 			ticketId <- ticketIds.explode[JLong]
 			_ <- Flow.hashPartition(ticketId)
@@ -200,55 +200,15 @@ class RamaExample extends RamaModule {
 			fullTicket <- fullTicketOpt.mapFilter(identity)
 			ticket <- fullTicket.map(_.upstream)
 			result <- ticket.mapWith(cursor) { (ticket, cursor) =>
+				println(s"Found ticket $ticket for ID ${ticket.id}")
 				UserTicketsResponse(List(ticket), cursor)
 			}
 		} yield result
 	}
 
-	// {
-	// 	()
-	// 	.each((r: UserTicketsRequest) => r.userId, "*request").out("*userId")
-	// 	.each((r: UserTicketsRequest) => r.cursor.getOrElse[JLong](Long.MinValue), "*request").out("*minId")
-
-	// 	.hashPartition("*userId")
-	// 	.each((uid: JLong) => println(s"fetching ticket assignment for $uid"), "*userId")
-
-	// 	.localSelect("$$userTickets",
-	// 		Path.key("*userId", "ticketIds").sortedSetRangeFrom("*minId", userTicketsPageSize + 1)
-	// 	).out("*ticketIds")
-
-	// 	// fanout each ID
-	// 	// TODO is this serial? Can I make it parallel per hashPartition?
-	// 	.each(Ops.EXPLODE, "*ticketIds").out("*ticketId")
-	// 	.hashPartition("*ticketId")
-	// 	.each(Ops.CURRENT_TASK_ID).out("*taskId")
-
-	// 	// lookup ticket; filter out None
-	// 	.localSelect("$$fullTicket", Path.key("*ticketId")).out("*fullTicket")
-	// 	.keepTrue(new Expr(Ops.IS_NOT_NULL, "*fullTicket"))
-	// 	.each((t: FullTicket) => t.upstream, "*fullTicket").out("*ticket")
-	// 	// .each(Ops.PRINTLN, "Found ticket", "*fullTicket", "for ID", "*ticketId")
-
-	// 	// send all results back to the original partition to construct the return value
-	// 	.originPartition()
-	// 	.agg(Agg.list("*ticket")).out("*tickets")
-	// 	.each((jtickets: java.util.List[Ticket]) => {
-	// 		val allTickets = jtickets.asScala
-	// 		if (allTickets.size > userTicketsPageSize) {
-	// 			val cursor = Some(allTickets.last.id)
-	// 			// more results, trim the last one and return its ID as the cursor
-	// 			UserTicketsResponse(allTickets.dropRight(1).toList, cursor)
-	// 		} else {
-	// 			// no more results
-	// 			UserTicketsResponse(allTickets.toList, None)
-	// 		}
-	// 	}, "*tickets").out("*result")
-	// }
-
 	override def define(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies): Unit = {
 		RamaBackend(setup, ramaTopologies).install(topologies)
 	}
-
 }
 
 object RamaExample {
@@ -313,19 +273,19 @@ object RamaExample {
 			println("User 111: " + cluster.clusterPState(moduleName, "$$user").selectOne[User](rama.Path.key(long2Long(111L))))
 			println("User 222: " + cluster.clusterPState(moduleName, "$$user").selectOne[User](rama.Path.key(long2Long(222L))))
 
-			// val userTicketsQuery = cluster.clusterQuery[UserTicketsResponse](moduleName, "userTickets")
-			// println("User tickets[222]: " + userTicketsQuery.invoke(UserTicketsRequest(222L)))
+			val userTicketsQuery = cluster.clusterQuery[UserTicketsResponse](moduleName, "userTickets")
+			println("User tickets[222]: " + userTicketsQuery.invoke(UserTicketsRequest(222L)))
 
-			// def recurseListTickets(pageNum: Int, cursor: Option[JLong]): Unit = {
-			// 	val result = userTicketsQuery.invoke(UserTicketsRequest(111L, cursor)).asInstanceOf[UserTicketsResponse]
-			// 	println(s"User tickets[111] (page $pageNum): ${result}")
-			// 	result.nextCursor.foreach { cursor =>
-			// 		val nextPage = pageNum + 1
-			// 		println(s"Getting page $nextPage")
-			// 		recurseListTickets(nextPage, Some(cursor))
-			// 	}
-			// }
-			// recurseListTickets(1, None)
+			def recurseListTickets(pageNum: Int, cursor: Option[JLong]): Unit = {
+				val result = userTicketsQuery.invoke(UserTicketsRequest(111L, cursor)).asInstanceOf[UserTicketsResponse]
+				println(s"User tickets[111] (page $pageNum): ${result}")
+				result.nextCursor.foreach { cursor =>
+					val nextPage = pageNum + 1
+					println(s"Getting page $nextPage")
+					recurseListTickets(nextPage, Some(cursor))
+				}
+			}
+			recurseListTickets(1, None)
 			println("DONE")
 		} finally {
 			cluster.close()
