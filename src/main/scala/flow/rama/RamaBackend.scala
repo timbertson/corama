@@ -17,6 +17,13 @@ import flow._
 import flow.internal._
 import flow.internal.Node.{PStateOp, DynamicOp}
 import com.rpl.rama.ops.RamaCombinerAgg
+import flow.Schema.ClassSchema
+import flow.Schema.FixedKeySchema
+import flow.Schema.MapSchema
+import flow.Schema.SetSchema
+import flow.Subindex.NonIndexed
+import flow.Subindex.Indexed
+import com.rpl.rama.SubindexOptions
 
 class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
 	import RamaBackend._
@@ -27,9 +34,17 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 		topologies.ids.foreach { id =>
 			id.namespace match {
 				// TODO schema + partitioning config
-				case flow.IdentityNamespace.PState => streamTopology.pstate(compileIdentity(id), classOf[Object])
 				case flow.IdentityNamespace.Depot => setup.declareDepot(compileIdentity(id), rama.Depot.random())
+				// case flow.IdentityNamespace.PState => streamTopology.pstate(compileIdentity(id), classOf[Object])
 				case _ => ()
+			}
+		}
+
+		topologies.pstates.foreach { pstate =>
+			val id = compileIdentity(pstate.id)
+			compileSchema(pstate.schema) match {
+				case Left(schema) => streamTopology.pstate(id, schema)
+				case Right(schema) => streamTopology.pstate(id, schema)
 			}
 		}
 
@@ -261,6 +276,44 @@ object RamaBackend {
 		new RamaCombinerAgg[O] {
 			override def zeroVal(): O = zero
 			override def combine(current: O, value: O): O = combineFn(current, value)
+		}
+	}
+	
+	private def compileSchema(schema: Schema): Either[Class[?], rama.PState.Schema] = {
+		def applyIndexing(source: IndexableSchema, result: rama.PState.Schema): rama.PState.Schema = {
+			source.index match {
+				case NonIndexed => result
+				case Indexed(sizeTracking) => {
+					var opts = SubindexOptions.create()
+					if (sizeTracking == false) {
+						opts = opts.withoutSizeTracking()
+					}
+					result.subindexed(opts)
+				}
+			}
+		}
+
+		schema match {
+			case ClassSchema(tag) => Left(tag.closestClass)
+
+			case FixedKeySchema(shape) => {
+				val pairs = shape.toList.flatMap {
+					case (key, schema) => List(key, compileSchema(schema).merge)
+				}
+				Right(rama.PState.fixedKeysSchema(pairs*))
+			}
+
+			case mapSchema @ MapSchema(k, v, index) => {
+				val keyClass = k.tag.closestClass
+				Right(applyIndexing(mapSchema, compileSchema(v) match {
+					case Left(x) => rama.PState.mapSchema(keyClass, x)
+					case Right(x) => rama.PState.mapSchema(keyClass, x)
+				}))
+			}
+
+			case setSchema @ SetSchema(v, index, setTag, ord) => {
+				Right(applyIndexing(setSchema, rama.PState.setSchema(v.tag.closestClass)))
+			}
 		}
 	}
 }

@@ -46,9 +46,11 @@ final class Topologies {
 	private [flow] var ids = Set.empty[Identity]
 	private var built = List.empty[Topology[?, ?]]
 
-	// private var pstates: List[Pstate]
+	private var builtPstates = List.empty[PState]
 
 	def topologies: List[Topology[?, ?]] = built.reverse
+
+	def pstates: List[PState] = builtPstates.reverse
 
 	private[flow] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
 
@@ -59,15 +61,20 @@ final class Topologies {
 		ids = ids.incl(identity)
 		identity
 	}
+	
+	private def registerPstate[A](value: A, access: A => PState): A = {
+		builtPstates = access(value) :: builtPstates
+		value
+	}
 
 	def pstateKV[K: Tag, V: Tag](name: String): PStateKV[K, V] =
-		PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name)))
+		registerPstate(PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name))), _.inner)
 
 	def pstateKVSet[K: Tag, V: Tag : Ordering](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
-		PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex)
+		registerPstate(PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex), _.inner)
 
 	def pstate(name: String, schema: Schema): PState =
-		PState(claim(Identity(IdentityNamespace.PState, name)), schema)
+		registerPstate(PState(claim(Identity(IdentityNamespace.PState, name)), schema), identity)
 
 	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] =
 		Depot[A](claim(Identity(IdentityNamespace.Depot, name)))

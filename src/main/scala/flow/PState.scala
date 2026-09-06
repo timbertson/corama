@@ -63,7 +63,7 @@ final case class PState(id: Identity, schema: Schema) {
 		schema match {
 			case Schema.ClassSchema(tag) => requireValueOf(tag)
 			case _: Schema.FixedKeySchema => requireValueOf(Schema.string.tag)
-			case map: Schema.MapSchema => checkType(value, map.k)
+			case map: Schema.MapSchema[?] => requireValueOf(map.k.tag)
 			case set: Schema.SetSchema[?] => Left(s"Path component ${value} attempted to enter a set schema")
 		}
 
@@ -133,12 +133,12 @@ final case class PState(id: Identity, schema: Schema) {
 
 // A convenience API with additional type safety for simple K/V PStates
 final case class PStateKV[K: Tag, V: Tag](id: Identity) {
-	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema[V]))
+	private [flow] var inner: PState = PState(id, Schema.mapOf[K](Schema[V]))
 	def key(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
 final case class PStateKVSet[K: Tag, V: Tag : Ordering](id: Identity, subindex: Subindex) {
-	private [flow] var inner: PState = PState(id, Schema.map(Schema[K], Schema.set[V](subindex)))
+	private [flow] var inner: PState = PState(id, Schema.mapOf[K](Schema.set[V](subindex)))
 	def key(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
