@@ -29,7 +29,7 @@ private[flow] final class VarId(private[flow] val id: Int, private[flow] val hin
 		case _           => false
 	}
 	override def hashCode: Int = id
-	override def toString: String = s"$hint#$id"
+	override def toString: String = s"${hint}_${id}"
 }
 
 object VarId {

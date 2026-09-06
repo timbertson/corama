@@ -37,23 +37,29 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 			val id = t.builder.source
 			val compiled = compileNodes(t.compiled._1)
 
-			def install(source: rama.Block.Out) = {
-				source.out(compileVar(t.input)).`macro`(compiled)
-			}
-
 			t.builder.source.namespace match {
 				case IdentityNamespace.Depot =>
 					// streams always return their final value, which is aggregated.
-					// TODO: aggregation could be omitted for Unit streams
-					install(streamTopology.source(compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.agg))))
-						.ackReturn(compileVar(t.compiled._2))
+					// aggregation is omitted for unit streams, for two reasons:
+					//  - it's pointless work to perform this aggregation
+					//  - it doesn't currently work (Var.unit is virtual, it can't be compiled to a rama var)
+
+					if (t.compiled._2.vid === Var.unit.vid) {
+						streamTopology.source(compileIdentity(id)).out(compileVar(t.input))
+							.`macro`(compiled)
+					} else {
+						streamTopology.source(
+							compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.agg))
+						).out(compileVar(t.input))
+							.`macro`(compiled)
+							.ackReturn(compileVar(t.compiled._2))
+					}
 
 				case IdentityNamespace.Query =>
-					// queries perform combination as part of the flow, mapAggregation is performed at query time
-					install(ramaTopologies.query(compileIdentity(id)))
-						// TODO: is it OK to reuse this variable name?
-						.agg(rama.Agg.combiner(compileCombiner(t.agg), t.compiled._2)).out(compileVar(t.compiled._2))
+					ramaTopologies.query(compileIdentity(id), compileVar(t.input.vid)).out(compileVar(t.queryOutputVar.vid))
+						.`macro`(compiled)
 						.originPartition()
+						.agg(rama.Agg.combiner(compileCombiner(t.agg), compileVar(t.compiled._2.vid))).out(compileVar(t.queryOutputVar.vid))
 
 				case IdentityNamespace.PState => ()
 			}
@@ -217,7 +223,7 @@ object RamaBackend {
 				case PStateOp.Remove(v: VarId) =>
 					Block.localTransform(ps, ramaPath.nullToSet().setElem(compileVar(v)).termVoid())
 
-				case PStateOp.Select(out: VarId, opts) =>
+				case PStateOp.Select(intermediate: VarId, out: VarId, opts) =>
 					val setPath = ramaPath.nullToSet()
 					val fullPath = opts match {
 						case SelectOptions(Some(after), Some(limit), _) => setPath.sortedSetRangeFrom(compileVar(after), limit)
@@ -226,14 +232,14 @@ object RamaBackend {
 						case SelectOptions(None, None, _) => setPath
 					}
 					Block.localSelect(ps, fullPath)
-						.out(compileVar(out))
-						.each((jlist: java.util.List[Any]) => jlist.asScala, compileVar(out))
+						.out(compileVar(intermediate))
+						.each((jlist: java.util.List[Any]) => jlist.asScala, compileVar(intermediate))
 						.out(compileVar(out))
 
-				case PStateOp.Get(out: VarId) => {
+				case PStateOp.Get(intermediate: VarId, out: VarId) => {
 					Block.localSelect(ps, ramaPath)
-						.out(compileVar(out))
-						.each(Option.apply, compileVar(out))
+						.out(compileVar(intermediate))
+						.each(Option.apply, compileVar(intermediate))
 						.out(compileVar(out))
 				}
 
@@ -250,9 +256,11 @@ object RamaBackend {
 		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
 
 	private def compileCombiner[O](agg: flow.Agg[O]): RamaCombinerAgg[O] = {
+		val zero = agg.zero
+		val combineFn = agg.combine
 		new RamaCombinerAgg[O] {
-			override def zeroVal(): O = agg.zero
-			override def combine(current: O, value: O): O = agg.combine(current, value)
+			override def zeroVal(): O = zero
+			override def combine(current: O, value: O): O = combineFn(current, value)
 		}
 	}
 }

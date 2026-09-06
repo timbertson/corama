@@ -48,9 +48,11 @@ private[flow] object Node {
 	object PStateOp {
 		case class Add(v: VarId) extends PStateOp
 		case class Remove(v: VarId) extends PStateOp
-		case class Select(out: VarId, options: SelectOptions[?]) extends PStateOp
+		
+		// intermediate for Select/Get are only used in rama backend
+		case class Select(intermediate: VarId, out: VarId, options: SelectOptions[?]) extends PStateOp
+		case class Get(intermediate: VarId, out: VarId) extends PStateOp
 
-		case class Get(out: VarId) extends PStateOp
 		case class Put(v: VarId) extends PStateOp
 		// case class Delete(v: VarId) extends PStateOp
 	}
@@ -115,8 +117,9 @@ private[flow] object Node {
 				(List(Node.Combine(block, a.agg, innerVar.vid, out.vid)), out)
 
 			case g: Flow.Get[a] =>
+				val intermediate = t.define[Any](implicitly[Tag[Any]], Var.internal, "getIntermediate")
 				val out = t.define[a](g.lens.tag, Var.internal, "get")
-				(List(Node.PStateNode(g.lens.pstate.id, CompiledPath.from(g.lens.path), PStateOp.Get(out.vid))), out.asInstanceOf[Var[A]])
+				(List(Node.PStateNode(g.lens.pstate.id, CompiledPath.from(g.lens.path), PStateOp.Get(intermediate.vid, out.vid))), out.asInstanceOf[Var[A]])
 
 			case Flow.Put(lens, value) =>
 				(List(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Put(value.vid))), Var.unit.asInstanceOf[Var[A]])
@@ -132,8 +135,9 @@ private[flow] object Node {
 				(List(Node.PStateUpdate(u.pos, u.lens.pstate.id, CompiledPath.from(u.lens.path), u.ins.map(_.vid), f)), Var.unit.asInstanceOf[Var[A]])
 
 			case s: Flow.Select[v] =>
+				val intermediate = t.define[Any](implicitly[Tag[Any]], Var.internal, "select")
 				val out = t.define[Set[v]](s.lens.schema.setTag, Var.internal, "select")
-				(List(Node.PStateNode(s.lens.pstate.id, CompiledPath.from(s.lens.path), PStateOp.Select(out.vid, s.options))), out.asInstanceOf[Var[A]])
+				(List(Node.PStateNode(s.lens.pstate.id, CompiledPath.from(s.lens.path), PStateOp.Select(intermediate.vid, out.vid, s.options))), out.asInstanceOf[Var[A]])
 
 			case Flow.LocalAppend(depot, value) =>
 				(List(Node.LocalAppend(depot.id, value.vid)), Var.unit.asInstanceOf[Var[A]])

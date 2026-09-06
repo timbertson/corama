@@ -77,9 +77,7 @@ final class Topologies {
 	def query[S, R](name: String, agg: Agg[R])(
 		block: Var[S] => Flow[R, QueryContext],
 	)(implicit pos: SourcePos, tagS: Tag[S], tagR: Tag[R]): QueryTopology[S, R] = {
-		QueryTopology(declare[S, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, pos) { input =>
-			block(input).agg(agg)
-		})
+		QueryTopology(declare[S, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, pos)(block))
 	}
 
 	/** A stream topology: driven by an append, writes PStates, returns nothing.
@@ -123,6 +121,10 @@ final case class Topology[S, R](
 	flow: Flow[R, Nothing],
 	agg: Agg[R]) {
 	def input: Var[S] = builder.input
+
+	// only used in rama backend
+	val queryOutputVar: Var[R] = builder.vars.add("queryOutput", null /* TODO */, implicitly[SourcePos])
+
 	val compiled = Node.compile(builder, flow)
 }
 
