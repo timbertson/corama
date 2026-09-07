@@ -75,7 +75,7 @@ object Example extends IOApp {
 
 			// Each ticket lives on its own partition. Explode
 			// fans out each ID
-			ticketId <- ids.explodeBy(_.sorted)
+			ticketId <- ids.explodeBy(_.toList.sorted)
 			_ <- Flow.hashPartition(ticketId)
 			full <- fullTickets.key(ticketId).get
 			_ <- full.filter(_.isDefined)

@@ -227,19 +227,23 @@ object RamaBackend {
 			Block.localTransform(compileIdentity(ps), mutation)
 
 		case Node.PStateNode(psId, path, op) => {
+			println(s"compiling rama path ${path} for op ${op} on ${psId}")
 			val ramaPath = compilePath(path)
 			val ps = compileIdentity(psId)
 			// Rama models read-modify-write as a `term` on the path: the function
 			// receives the current value (null when absent) and returns the new one.
 			op match {
+				// TODO: seems like `nullToSet` would be required when navigating into nonexistent sets.
+				// This doesn't work for subindexes sets (it overwrites the value to be a regular HashSet),
+				// TBD whether it's actually needed for sets.
 				case PStateOp.Add(v: VarId) =>
-					Block.localTransform(ps, ramaPath.nullToSet().voidSetElem().termVal(compileVar(v)))
+					Block.localTransform(ps, ramaPath /*.nullToSet() */ .voidSetElem().termVal(compileVar(v)))
 
 				case PStateOp.Remove(v: VarId) =>
-					Block.localTransform(ps, ramaPath.nullToSet().setElem(compileVar(v)).termVoid())
+					Block.localTransform(ps, ramaPath /*.nullToSet() */ .setElem(compileVar(v)).termVoid())
 
 				case PStateOp.Select(intermediate: VarId, out: VarId, opts) =>
-					val setPath = ramaPath.nullToSet()
+					val setPath = ramaPath // .nullToSet()
 					val fullPath = opts match {
 						case SelectOptions(Some(after), Some(limit), _) => setPath.sortedSetRangeFrom(compileVar(after), limit)
 						case SelectOptions(None, Some(limit), _) => setPath.sortedSetRangeFromStart(limit)
@@ -248,7 +252,7 @@ object RamaBackend {
 					}
 					Block.localSelect(ps, fullPath)
 						.out(compileVar(intermediate))
-						.each((jlist: java.util.List[Any]) => jlist.asScala, compileVar(intermediate))
+						.each((jlist: java.util.Collection[Any]) => jlist.asScala, compileVar(intermediate))
 						.out(compileVar(out))
 
 				case PStateOp.Get(intermediate: VarId, out: VarId) => {
@@ -280,7 +284,9 @@ object RamaBackend {
 	}
 	
 	private def compileSchema(schema: Schema): Either[Class[?], rama.PState.Schema] = {
+		println(s"Compiling schema ${schema}")
 		def applyIndexing(source: IndexableSchema, result: rama.PState.Schema): rama.PState.Schema = {
+			println(s"Applying indexing: ${source.index} to schema: $result")
 			source.index match {
 				case NonIndexed => result
 				case Indexed(sizeTracking) => {
@@ -288,6 +294,7 @@ object RamaBackend {
 					if (sizeTracking == false) {
 						opts = opts.withoutSizeTracking()
 					}
+					println(s"Subindexed: $opts")
 					result.subindexed(opts)
 				}
 			}

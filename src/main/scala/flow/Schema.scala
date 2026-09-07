@@ -9,7 +9,8 @@ object Subindex {
 	private[flow] case object NonIndexed extends Subindex
 	private[flow] case class Indexed(sizeTracking: Boolean) extends Subindex
 	val default = NonIndexed
-	val indexed = NonIndexed
+	val nonIndexed = NonIndexed
+	val indexed = Indexed(sizeTracking = true)
 	def indexedWith(sizeTracking: Boolean) = Indexed(sizeTracking)
 }
 
@@ -35,7 +36,7 @@ object Schema {
 	val string = apply[String]
 	def fixed(pairs: (String, Schema)*) = FixedKeySchema(pairs.toMap)
 
-	def mapOf[K](v: Schema, subindex: Subindex = Subindex.default)(implicit kTag: Tag[K]) = MapSchema(ClassSchema(kTag), v, subindex)
-	def set[A](subindex: Subindex = Subindex.default)(implicit atag: Tag[A], setTag: Tag[Set[A]], ord: Ordering[A]) =
+	def mapOf[K](v: Schema, subindex: Subindex)(implicit kTag: Tag[K]) = MapSchema(ClassSchema(kTag), v, subindex)
+	def set[A](subindex: Subindex)(implicit atag: Tag[A], setTag: Tag[Set[A]], ord: Ordering[A]) =
 		SetSchema[A](apply[A](using atag), subindex, setTag, ord)
 }
