@@ -47,7 +47,7 @@ object Flow {
 	private[flow] case class Put[A](lens: ValueLens[A], value: Var[A]) extends Flow[Unit, Etl]
 	private[flow] case class Update[A](pos: SourcePos, lens: ValueLens[A], ins: List[Var[Any]], f: (Option[Any], List[Any]) => Option[Any]) extends Flow[Unit, Etl]
 
-	private[flow] case class Select[A](lens: SetLens[A], options: SelectOptions[A]) extends Flow[Iterable[A], Any]
+	private[flow] case class Select[A](lens: SetLens[A], options: SelectOptions[A]) extends Flow[List[A], Any]
 	private[flow] case class Add[A](lens: SetLens[A], value: Var[A]) extends Flow[Unit, Etl]
 	private[flow] case class Remove[A](lens: SetLens[A], value: Var[A]) extends Flow[Unit, Etl]
 

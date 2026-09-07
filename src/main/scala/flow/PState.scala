@@ -35,8 +35,8 @@ case class ValueLens[A](pstate: PState, path: Path, schema: Schema.ClassSchema[A
 case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) extends Lens[A] {
 	def add(value: Var[A]): Flow[Unit, Etl] = Flow.Add(this, value)
 	def remove(value: Var[A])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Remove(this, value)
-	def selectAll(implicit pos: SourcePos): Flow[Iterable[A], Any] = Flow.Select(this, SelectOptions.all[A](using schema.ord))
-	def selectRange(afterItem: Var[Option[A]], maxItems: Int)(implicit pos: SourcePos): Flow[Iterable[A], Any] =
+	def selectAll(implicit pos: SourcePos): Flow[List[A], Any] = Flow.Select(this, SelectOptions.all[A](using schema.ord))
+	def selectRange(afterItem: Var[Option[A]], maxItems: Int)(implicit pos: SourcePos): Flow[List[A], Any] =
 		Flow.Select(this, SelectOptions(Some(afterItem), maxItems = Some(maxItems), schema.ord))
 }
 

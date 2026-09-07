@@ -174,12 +174,12 @@ class RamaExample extends RamaModule {
 		} yield Var.unit
 	}
 
-	val userTicketsPageSize = 10
 	val ticketAgg = Agg(UserTicketsResponse.empty, (a, b) => {
 		UserTicketsResponse(a.tickets ++ b.tickets, a.nextCursor.orElse(b.nextCursor))
 	})
 
 	topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
+		val userTicketsPageSize = 10
 		for {
 			userId <- query.map(_.userId)
 			cursor <- query.map(_.cursor)
@@ -188,57 +188,26 @@ class RamaExample extends RamaModule {
 			_ <- userId.foreach(uid => println(s"fetching ticket assignment for $uid"))
 			
 			ticketIds <- userTickets.key(userId).selectRange(afterItem = cursor, maxItems = userTicketsPageSize)
-			// cursor <- ticketIds.map { ids =>
-			// 	// potentially more results, use the last ID as the cursor
-			// 	Option.when(ids.size >= userTicketsPageSize)(ids.last)
-			// }
+			cursor <- ticketIds.map { ids =>
+				// potentially more results, use the last ID as the cursor
+				Option.when(ids.size >= userTicketsPageSize)(ids.last)
+			}
 			
-			// // fanout each ticket ID
-			// // TODO: is this serial? Can I make it parallel per hashPartition?
-			// ticketId <- ticketIds.explode[JLong]
-			// _ <- Flow.hashPartition(ticketId)
+			// fanout each ticket ID
+			// TODO: is this serial? Can I make it parallel per hashPartition?
+			ticketId <- ticketIds.explode[JLong]
+			_ <- Flow.hashPartition(ticketId)
 
-			// // lookup ticket; filter out None (TODO: log / alert on none?)
-			// fullTicketOpt <- fullTickets.key(ticketId).get
-			// fullTicket <- fullTicketOpt.mapFilter(identity)
-			// ticket <- fullTicket.map(_.upstream)
-			// result <- ticket.mapWith(cursor) { (ticket, cursor) =>
-			// 	println(s"Found ticket $ticket for ID ${ticket.id}")
-			// 	UserTicketsResponse(List(ticket), cursor)
-			// }
-			result <- userId.map { id => UserTicketsResponse.empty }
+			// lookup ticket; filter out None (TODO: log / alert on none?)
+			fullTicketOpt <- fullTickets.key(ticketId).get
+			fullTicket <- fullTicketOpt.mapFilter(identity)
+			ticket <- fullTicket.map(_.upstream)
+			result <- ticket.mapWith(cursor) { (ticket, cursor) =>
+				println(s"Found ticket $ticket for ID ${ticket.id}")
+				UserTicketsResponse(List(ticket), cursor)
+			}
 		} yield result
 	}
-
-	// topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
-	// 	for {
-	// 		userId <- query.map(_.userId)
-	// 		cursor <- query.map(_.cursor)
-
-	// 		_ <- Flow.hashPartition(userId)
-	// 		_ <- userId.foreach(uid => println(s"fetching ticket assignment for $uid"))
-			
-	// 		ticketIds <- userTickets.key(userId).selectRange(afterItem = cursor, maxItems = userTicketsPageSize)
-	// 		cursor <- ticketIds.map { ids =>
-	// 			// potentially more results, use the last ID as the cursor
-	// 			Option.when(ids.size >= userTicketsPageSize)(ids.last)
-	// 		}
-			
-	// 		// fanout each ticket ID
-	// 		// TODO: is this serial? Can I make it parallel per hashPartition?
-	// 		ticketId <- ticketIds.explode[JLong]
-	// 		_ <- Flow.hashPartition(ticketId)
-
-	// 		// lookup ticket; filter out None (TODO: log / alert on none?)
-	// 		fullTicketOpt <- fullTickets.key(ticketId).get
-	// 		fullTicket <- fullTicketOpt.mapFilter(identity)
-	// 		ticket <- fullTicket.map(_.upstream)
-	// 		result <- ticket.mapWith(cursor) { (ticket, cursor) =>
-	// 			println(s"Found ticket $ticket for ID ${ticket.id}")
-	// 			UserTicketsResponse(List(ticket), cursor)
-	// 		}
-	// 	} yield result
-	// }
 
 	override def define(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies): Unit = {
 		RamaBackend(setup, ramaTopologies).install(topologies)

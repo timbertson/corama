@@ -252,7 +252,7 @@ object RamaBackend {
 					}
 					Block.localSelect(ps, fullPath)
 						.out(compileVar(intermediate))
-						.each((jlist: java.util.Collection[Any]) => jlist.asScala, compileVar(intermediate))
+						.each((jlist: java.util.Collection[Any]) => jlist.asScala.toList, compileVar(intermediate))
 						.out(compileVar(out))
 
 				case PStateOp.Get(intermediate: VarId, out: VarId) => {
