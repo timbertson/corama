@@ -1,14 +1,10 @@
 package corama
 
-import org.tpolecat.sourcepos._
-import cats.Functor
-import cats.Applicative
-import scala.annotation.unused
-import cats.Eq
-import cats.Monoid
+import corama.internal.*
 import izumi.reflect.Tag
+import org.tpolecat.sourcepos.*
 
-import corama.internal._
+import scala.annotation.unused
 
 final case class TopologyId(value: Int) extends AnyVal
 
@@ -93,7 +89,6 @@ final class Topologies {
 	def stream_[A](depot: Depot[A])(
 		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
 	)(implicit pos: SourcePos, tagA: Tag[A]): StreamTopology[A, Unit] = {
-		val tagUnit = implicitly[Tag[Unit]]
 		StreamTopology(declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tagA, pos)(block))
 	}
 

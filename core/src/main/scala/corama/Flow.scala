@@ -1,14 +1,7 @@
 package corama
 
-import org.tpolecat.sourcepos._
-import cats.Functor
-import cats.Applicative
-import scala.annotation.unused
-import cats.Eq
-import cats.Monoid
 import izumi.reflect.Tag
-
-import corama.internal._
+import org.tpolecat.sourcepos.*
 
 /** A description of a fragment emitting 0..n values of type `A`, which requires a
   * context providing `Ctx` to run in. A fragment requiring nothing is `Flow[A, Any]`.

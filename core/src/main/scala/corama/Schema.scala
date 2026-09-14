@@ -1,6 +1,5 @@
 package corama
 
-import cats.data.NonEmptyList
 import izumi.reflect.Tag
 
 sealed trait Subindex

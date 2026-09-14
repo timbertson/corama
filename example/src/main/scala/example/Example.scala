@@ -1,6 +1,7 @@
 package example
 
 import corama._
+import corama.interpreter.Interpreter
 import cats.syntax.all._
 import cats.effect._
 import java.lang.{Long => JLong}

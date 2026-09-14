@@ -1,14 +1,8 @@
 package corama.internal
 
-import org.tpolecat.sourcepos._
-import cats.Functor
-import cats.Applicative
-import scala.annotation.unused
-import cats.Eq
-import cats.Monoid
+import corama.*
 import izumi.reflect.Tag
-
-import corama._
+import org.tpolecat.sourcepos.*
 
 // ---------------------------------------------------------------------------
 // base AST

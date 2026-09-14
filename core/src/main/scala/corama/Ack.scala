@@ -1,13 +1,10 @@
 package corama
 
-import cats.{Monoid, Semigroup}
-import cats.syntax.all._
-import cats.Functor
-import cats.Applicative
-import scala.util.Try
+import cats.syntax.all.*
+
 import scala.util.Failure
 import scala.util.Success
-import cats.data.NonEmptyList
+import scala.util.Try
 
 sealed trait AckLevel[R]
 

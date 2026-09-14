@@ -1,13 +1,9 @@
 package corama
 
-import cats.{Monoid, Semigroup}
-import cats.syntax.all._
-import cats.Functor
 import cats.Applicative
-import scala.util.Try
-import scala.util.Failure
-import scala.util.Success
-import cats.data.NonEmptyList
+import cats.Monoid
+import cats.Semigroup
+import cats.syntax.all.*
 
 final class Agg[A] private[corama] (
 	private[corama] val zero: A,

@@ -1,16 +1,8 @@
 package corama
 
-import cats.syntax.all._
 import cats.data.NonEmptyList
-import org.tpolecat.sourcepos._
-import cats.Functor
-import cats.Applicative
-import scala.annotation.unused
-import cats.Eq
-import cats.Monoid
+import cats.syntax.all.*
 import izumi.reflect.Tag
-
-import corama.internal._
 
 // TODO: how can we encode path components? They can be arbitrary
 // binary, and we need to distinguish e.g. [ab, cd] from [a, bc, d]

@@ -1,12 +1,9 @@
 package corama
 
-import org.tpolecat.sourcepos._
-import cats.Functor
 import cats.Applicative
-import scala.annotation.unused
 import cats.Eq
-import cats.Monoid
 import izumi.reflect.Tag
+import org.tpolecat.sourcepos.*
 
 // Allocates var ids within one topology.
 private[corama] class VarRegistry {

@@ -1,16 +1,9 @@
 package corama
 
-import cats.syntax.all._
 import cats.data.NonEmptyList
-import org.tpolecat.sourcepos._
-import cats.Functor
-import cats.Applicative
-import scala.annotation.unused
-import cats.Eq
-import cats.Monoid
+import cats.syntax.all.*
 import izumi.reflect.Tag
-
-import corama.internal._
+import org.tpolecat.sourcepos.*
 
 // A lens into some arbitrary path of a pstate, containing the given leaf schema
 sealed trait Lens[A]
