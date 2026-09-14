@@ -36,6 +36,11 @@ lazy val core = (project in file("core")).settings(
   ),
 )
 
+lazy val interpreter = (project in file("interpreter")).settings(
+  name := "corama-interpreter",
+  commonSettings,
+).dependsOn(core, rama)
+
 lazy val rama = (project in file("rama")).settings(
   name := "corama-rama",
   commonSettings,
@@ -47,11 +52,8 @@ lazy val rama = (project in file("rama")).settings(
 lazy val example = (project in file("example")).settings(
   commonSettings,
   Compile / mainClass := Some("example.Example"),
-).dependsOn(core, rama)
+).dependsOn(core, rama, interpreter)
 
-
-lazy val root = (project in file("."))
-  .settings(
-    name := "root",
-  )
-.aggregate(core, rama, example)
+lazy val root = (project in file(".")).settings(
+  name := "root",
+).aggregate(core, interpreter, rama, example)
