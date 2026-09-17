@@ -64,6 +64,9 @@ lazy val core = (project in file("core")).settings(
 lazy val interpreter = (project in file("interpreter")).settings(
   name := "corama-interpreter",
   commonSettings,
+  libraryDependencies ++= Seq(
+    "org.rocksdb" % "rocksdbjni" % "9.3.1",
+  ),
 ).dependsOn(core, pb)
 
 lazy val rama = (project in file("rama")).settings(

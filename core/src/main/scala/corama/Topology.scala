@@ -143,5 +143,5 @@ object IdentityNamespace {
 }
 
 // Shared trait for PState, Depot and Query which all
-// have publically referenceable names
+// have publicly referenceable names
 private case class Identity(namespace: IdentityNamespace, name: String)
