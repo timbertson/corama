@@ -1,25 +1,25 @@
 package corama.interpreter
 
-import corama._
 import cats.data.NonEmptyList
-import fs2.Stream
-import cats.syntax.all._
-import scala.collection.mutable
-import scala.reflect.ClassTag
-import scala.util.Try
 import cats.effect.IO
-import cats.effect.kernel.{Deferred, Outcome, Ref}
+import cats.effect.kernel.Deferred
+import cats.effect.kernel.Ref
 import cats.effect.unsafe
+import cats.syntax.all.*
+import corama.*
+import corama.internal.*
 import corama.interpreter.Interpreter.Env
-import scala.util.Random
-import fs2.concurrent.SignallingRef
-import fs2.Chunk
-import izumi.reflect.Tag
-
-import corama.internal._
-import scala.util.control.NoStackTrace
-import org.tpolecat.sourcepos.SourcePos
 import corama.interpreter.Interpreter.EvalError
+import fs2.Chunk
+import fs2.Stream
+import fs2.concurrent.SignallingRef
+import izumi.reflect.Tag
+import org.tpolecat.sourcepos.SourcePos
+
+import scala.reflect.ClassTag
+import scala.util.Random
+import scala.util.Try
+import scala.util.control.NoStackTrace
 
 /** Simple interpreter: runs a [[Flow]] as plain Scala over in-memory state.
   *

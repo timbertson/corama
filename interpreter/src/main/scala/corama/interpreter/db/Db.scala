@@ -1,7 +1,6 @@
 package corama.interpreter.db
 
 import cats.effect.*
-import cats.implicits.*
 import cats.*
 import corama.{Decoder, Encoder}
 import corama.Bytes
@@ -9,8 +8,6 @@ import corama.error.Util.*
 import scala.util.Try
 import scala.util.Failure
 import scala.util.Success
-import java.nio.file.Path
-import corama.PStateID
 
 // type PaginatedSet[K, V] = Paginated[Record.Set, K, V]
 // type PaginatedItems[K, V] = Paginated[Record.Item, K, V]

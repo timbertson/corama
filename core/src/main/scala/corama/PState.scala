@@ -41,7 +41,7 @@ case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) e
 // 	//
 // }
 
-case class PStateID(value: String)
+case class PStateId(value: String)
 
 // Pstate with nested schemas. Not fully type safe, validity of paths is verified at runtime
 final case class PState(id: Identity, schema: Schema) {

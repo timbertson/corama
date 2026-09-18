@@ -1,11 +1,9 @@
 package corama.interpreter.db
 
-import cats.syntax.all.*
 import cats.effect.*
 import cats.effect.kernel.Resource
 import corama.Bytes
 import fs2.Stream
-import flogger.*
 import corama._
 
 import cats.*
