@@ -66,6 +66,7 @@ lazy val interpreter = (project in file("interpreter")).settings(
   commonSettings,
   libraryDependencies ++= Seq(
     "org.rocksdb" % "rocksdbjni" % "9.3.1",
+    "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
   ),
 ).dependsOn(core, pb)
 

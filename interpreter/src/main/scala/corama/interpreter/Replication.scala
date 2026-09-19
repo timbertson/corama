@@ -32,7 +32,6 @@ case class ReplicationAck(
 )
 
 trait Follower {
-	val id: InstanceId
 	def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck]
 }
 
@@ -60,7 +59,6 @@ object ReplicationChannel {
 			// run the ack stream for the channel's lifetime; cancel on release
 			ackLoop = ackStream.compile.drain >> neverReached
 			channel = new ReplicationChannel {
-				def id: InstanceId = follower.id
 				def send(u: ReplicationUpdate): IO[ReplicationAck] = Deferred[IO, ReplicationAck].flatMap { d =>
 					waiters.update(_.updated(u.id, d)) *>
 						queue.offer(u) *>
@@ -78,6 +76,8 @@ case class ActiveResource[F[_], A](resource: Resource[F, (A, F[Nothing])])(impli
 			F.race(action(res), task).map(_.merge)
 		}
 	}
+	
+	def map[B](f: A => B): ActiveResource[F, B] = ActiveResource(resource.map { case (a, task) => (f(a), task) })
 }
 
 case class LeaderConfig(
@@ -87,6 +87,15 @@ case class LeaderConfig(
 	maxInFlight: Int, // in flight batches to each replica, only matters when we implement pipelining
 	minISR: Int, // min in-sync replicas (including leader)
 )
+object LeaderConfig {
+	val default = LeaderConfig(
+		maxBatchSize = 10,
+		maxBatchDelay = 50.millis,
+		maxLag = 2.seconds,
+		maxInFlight = 1,
+		minISR = 2,
+	)
+}
 
 case class TaskStatus(
 	taskId: TaskId,
@@ -118,12 +127,12 @@ final class TaskLeader private (
 	val taskStatus: Ref[IO, TaskStatus],
 	highWatermark: Ref[IO, TxId],
 ):
-	// TODO: we could reuse a single deferred per batch instead of per op
-	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[Unit] =
-	Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.AppendCmd(depot, appends, w)) *> w.get }
+	// TODO: we could reuse a single deferred per batch instead of per op, but that might increase contention
+	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[Deferred[IO, Unit]] =
+		Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.AppendCmd(depot, appends, w)).as(w) }
 
-	def update(pstate: PStateId, updates: Vector[PStateUpdate]): IO[Unit] =
-	Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.UpdateCmd(pstate, updates, w)) *> w.get }
+	def update(pstate: PStateId, updates: Vector[PStateUpdate]): IO[Deferred[IO, Unit]] =
+		Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.UpdateCmd(pstate, updates, w)).as(w) }
 
 	def replicationLoop: IO[Nothing] = {
 		def newBatchLoop: IO[Nothing] = {
@@ -138,12 +147,11 @@ final class TaskLeader private (
 
 		def continueBatchLoop(batch: OpenBatch, cmd: BatchCommand): IO[Nothing] = {
 			// Add a command to a batch and either flush immediately or keep accumulating
-			batch.update(cmd).flatMap { newWrites =>
-				if (newWrites.size >= config.maxBatchSize) {
-					flush(batch) >> newBatchLoop
-				} else {
-					waitingBatchLoop(batch)
-				}
+			val newBatch = batch.update(cmd)
+			if (newBatch.writes.size >= config.maxBatchSize) {
+				flush(batch) >> newBatchLoop
+			} else {
+				waitingBatchLoop(batch)
 			}
 		}
 
@@ -168,42 +176,43 @@ final class TaskLeader private (
 		newBatchLoop
 	}
 
-	private def flush(b: OpenBatch): IO[Unit] = for {
-		writes <- b.writes.get
-		update = ReplicationUpdate(
+	private def flush(b: OpenBatch): IO[Unit] = {
+		val writes = b.writes
+		val update = ReplicationUpdate(
 			b.txId,
 			writes.depotAppends.toList.map { case (id, v)	=> DepotAppends(id, v) },
 			writes.pstateUpdates.toList.map { case (id, v) => PStateUpdates(id, v) },
 		)
-
-		// (id, acked?) — maxLag-bounded; timeout or transport error => not acked
-		results <- channels.toList.parTraverse { case (followerId, ch) =>
-			ch.send(update).as(followerId -> true)
-				.timeout(config.maxLag)
-				.handleError { e =>
-					println(s"Follower $followerId didn't acknowledge: $e")
-					followerId -> false
-				}
-		}
-		ackedFollowers = results.mapFilter { case (followerId, success) => Option.when(success)(followerId) }
-		_ <- taskStatus.update(ts => ts.copy(isr = ackedFollowers))
-		_ <- if (ackedFollowers.size >= config.minISR - 1) {
-				advanceHighWatermark(b.txId) *> writes.waiters.traverse_(_.complete(()).void)
-			} else {
-				IO.raiseError(ReplicationStalled(b.txId))
+		for {
+			// (id, acked?) — maxLag-bounded; timeout or transport error => not acked
+			results <- channels.toList.parTraverse { case (followerId, ch) =>
+				ch.send(update).as(followerId -> true)
+					.timeout(config.maxLag)
+					.handleError { e =>
+						println(s"Follower $followerId didn't acknowledge: $e")
+						followerId -> false
+					}
 			}
-	} yield ()
+			ackedFollowers = results.mapFilter { case (followerId, success) => Option.when(success)(followerId) }
+			_ <- taskStatus.update(ts => ts.copy(isr = ackedFollowers))
+			_ <- if (ackedFollowers.size >= config.minISR - 1) {
+					advanceHighWatermark(b.txId) *> writes.waiters.traverse_(_.complete(()).void)
+				} else {
+					IO.raiseError(ReplicationStalled(b.txId))
+				}
+		} yield ()
+	}
 
 	private def advanceHighWatermark(to: TxId): IO[Unit] =
 		highWatermark.update(h => if to.value > h.value then to else h)
 
-object TaskLeader:
+object TaskLeader {
 	// A leader resource including the running replication loop for each follower
 	def resource(
 		taskId: TaskId,
 		instanceId: InstanceId,
-		followers: Map[InstanceId, Follower],
 		config: LeaderConfig,
+		followers: Map[InstanceId, Follower],
 	)(using Concurrent[IO]): ActiveResource[IO, TaskLeader] = {
 		ActiveResource(for {
 			allocator <- TransactionAllocator.resource
@@ -227,6 +236,7 @@ object TaskLeader:
 			leader = new TaskLeader(instanceId, config, allocator, cmdQueue, channels, taskStatusRef, hw)
 		} yield (leader, IO.race(leader.replicationLoop, channelSendTask).map(_.merge)))
 	}
+}
 
 case class BatchWrites(
 	depotAppends: Map[DepotId, Vector[DepotAppend]],
@@ -256,19 +266,17 @@ object BatchWrites {
 case class OpenBatch(
 	txId: TxId,
 	openedAt: FiniteDuration,
-	writes: Ref[IO, BatchWrites],
+	writes: BatchWrites,
 ) {
 
-	// returns the new size
-	def update(cmd: BatchCommand): IO[BatchWrites] = writes.updateAndGet(_.update(cmd))
+	def update(cmd: BatchCommand): OpenBatch = copy(writes = writes.update(cmd))
 }
 
 class TransactionAllocator(nextId: Ref[IO, Long]):
 	def createBatch: IO[OpenBatch] = for
 		id <- nextId.updateAndGet(_ + 1).map(TxId.apply)
 		openedAt <- IO.monotonic
-		writes <- Ref[IO].of(BatchWrites.empty)
-	yield OpenBatch(id, openedAt, writes)
+	yield OpenBatch(id, openedAt, BatchWrites.empty)
 
 object TransactionAllocator {
 	def resource: Resource[IO, TransactionAllocator] =
