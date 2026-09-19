@@ -29,12 +29,12 @@ val commonSettings = Seq(
 
     // test
     ++ (
-      Seq("weaver-cats", "weaver-scalacheck").map("com.disneystreaming" %% _ % "0.8.3")
+      Seq("weaver-cats", "weaver-scalacheck").map("org.typelevel" %% _ % "0.13.0")
       ++ Seq(
-        "net.gfxmonk" %% "flogger-weaver" % floggerVersion,
+        // "net.gfxmonk" %% "flogger-weaver" % floggerVersion,
         logbackClassic,
         "net.gfxmonk" %% "auditspec" % "0.3.1",
-        "org.scalacheck" %% "scalacheck" % "1.18.0",
+        // "org.scalacheck" %% "scalacheck" % "1.18.0",
       )
     ).map(_ % Test)
   )
