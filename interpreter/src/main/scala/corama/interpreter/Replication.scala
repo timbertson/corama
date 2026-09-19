@@ -8,6 +8,8 @@ import cats.syntax.all.*
 import scala.concurrent.duration.*
 import corama._
 import cats.effect.Async
+import flogger.Log
+import flogger.IOLogging
 
 case class TxId(value: Long)
 
@@ -35,37 +37,44 @@ trait Follower {
 	def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck]
 }
 
-/** The leader's handle on one follower: a long-lived channel exposing a
-	*  per-batch request/response.
-	*/
-trait ReplicationChannel {
-	def send(update: ReplicationUpdate): IO[ReplicationAck]
+class ReplicationChannel(
+	queue: Queue[IO, ReplicationUpdate],
+	waiters: Ref[IO, Map[TxId, Deferred[IO, ReplicationAck]]],
+	follower: Follower,
+)(using log: Log[IO]) extends IOLogging {
+	def send(update: ReplicationUpdate): IO[ReplicationAck] = Deferred[IO, ReplicationAck].flatMap { d =>
+		waiters.update(_.updated(update.id, d)) *>
+			queue.offer(update) *>
+			d.get.guarantee(waiters.update(_.removed(update.id)).void)
+	}
+
+	def ackLoop: IO[Nothing] = {
+		singleAckLoop.handleErrorWith { e =>
+			log.warn("Follower failed; retrying in 3s ...") *> IO.sleep(3.seconds) >> ackLoop
+		}
+	}
+
+	private def singleAckLoop: IO[Nothing] = {
+		val ackStream = Stream.exec(log.info("Opening replication channel")) ++
+			follower.follow(Stream.fromQueueUnterminated(queue)).evalTap { ack =>
+				// route each ack to the send() waiting on its txId
+				waiters.get.flatMap(_.get(ack.id).fold(IO.unit)(_.complete(ack).void))
+			}
+		ackStream.compile.drain >> neverReached
+	}
 }
 
 private def neverReached: IO[Nothing] =
 	IO.raiseError(new IllegalStateException("neverReached: this should be impossible"))
 
-object ReplicationChannel {
-
-	def open(follower: Follower, config: LeaderConfig)(using Concurrent[IO]): ActiveResource[IO, ReplicationChannel] =
+object ReplicationChannel extends IOLogging {
+	def open(follower: Follower, config: LeaderConfig)(using Concurrent[IO])(using log: Log[IO]): ActiveResource[IO, ReplicationChannel] =
 		ActiveResource(for {
 			queue <- Resource.eval(Queue.bounded[IO, ReplicationUpdate](config.maxInFlight))
 			waiters <- Resource.eval(Ref.of[IO, Map[TxId, Deferred[IO, ReplicationAck]]](Map.empty))
-			ackStream = follower.follow(Stream.fromQueueUnterminated(queue)).evalTap { ack =>
-				// route each ack to the send() waiting on its txId
-				waiters.get.flatMap(_.get(ack.id).fold(IO.unit)(_.complete(ack).void))
-			}
-
 			// run the ack stream for the channel's lifetime; cancel on release
-			ackLoop = ackStream.compile.drain >> neverReached
-			channel = new ReplicationChannel {
-				def send(u: ReplicationUpdate): IO[ReplicationAck] = Deferred[IO, ReplicationAck].flatMap { d =>
-					waiters.update(_.updated(u.id, d)) *>
-						queue.offer(u) *>
-						d.get.guarantee(waiters.update(_.removed(u.id)).void)
-				}
-			}
-		} yield (channel, ackLoop))
+			channel = new ReplicationChannel(queue, waiters, follower)
+		} yield (channel, channel.ackLoop))
 }
 
 // A Resource[IO,A] with a background IO[Nothing]. When used, the background
@@ -76,7 +85,7 @@ case class ActiveResource[F[_], A](resource: Resource[F, (A, F[Nothing])])(impli
 			F.race(action(res), task).map(_.merge)
 		}
 	}
-	
+
 	def map[B](f: A => B): ActiveResource[F, B] = ActiveResource(resource.map { case (a, task) => (f(a), task) })
 }
 
@@ -126,7 +135,7 @@ final class TaskLeader private (
 	channels: Map[InstanceId, ReplicationChannel],
 	val taskStatus: Ref[IO, TaskStatus],
 	highWatermark: Ref[IO, TxId],
-):
+)(using log: Log[IO]) extends IOLogging {
 	// TODO: we could reuse a single deferred per batch instead of per op, but that might increase contention
 	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[Deferred[IO, Unit]] =
 		Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.AppendCmd(depot, appends, w)).as(w) }
@@ -136,22 +145,25 @@ final class TaskLeader private (
 
 	def replicationLoop: IO[Nothing] = {
 		def newBatchLoop: IO[Nothing] = {
+			log.debug("Awaiting next command...") *>
 			cmdQueue.take.flatMap { cmd =>
 				// only allocate once we have the first command in the batch
 				// (batch.openedAt should reflect the time of first append)
 				allocator.createBatch.flatMap { batch =>
-					continueBatchLoop(batch, cmd)
+					extendBatchLoop(batch, cmd)
 				}
 			}
 		}
+		
+		def flushAndContinue(batch: OpenBatch) = flush(batch) >> newBatchLoop
 
-		def continueBatchLoop(batch: OpenBatch, cmd: BatchCommand): IO[Nothing] = {
+		def extendBatchLoop(prevBatch: OpenBatch, cmd: BatchCommand): IO[Nothing] = {
 			// Add a command to a batch and either flush immediately or keep accumulating
-			val newBatch = batch.update(cmd)
+			val newBatch = prevBatch.update(cmd)
 			if (newBatch.writes.size >= config.maxBatchSize) {
-				flush(batch) >> newBatchLoop
+				flushAndContinue(newBatch)
 			} else {
-				waitingBatchLoop(batch)
+				waitingBatchLoop(newBatch)
 			}
 		}
 
@@ -160,14 +172,14 @@ final class TaskLeader private (
 			IO.monotonic.flatMap { now =>
 				val elapsed = now - batch.openedAt
 				if (elapsed >= config.maxBatchDelay) then {
-					flush(batch) >> newBatchLoop
+					flushAndContinue(batch)
 				} else {
 					IO.race(
 						cmdQueue.take,
 						IO.sleep(config.maxBatchDelay - elapsed)
 					).flatMap {
-						case Left(cmd) => continueBatchLoop(batch, cmd)
-						case Right(timeout) => flush(batch) >> newBatchLoop
+						case Left(cmd) => extendBatchLoop(batch, cmd)
+						case Right(timeout) => flushAndContinue(batch)
 					}
 				}
 			}
@@ -180,23 +192,26 @@ final class TaskLeader private (
 		val writes = b.writes
 		val update = ReplicationUpdate(
 			b.txId,
-			writes.depotAppends.toList.map { case (id, v)	=> DepotAppends(id, v) },
+			writes.depotAppends.toList.map { case (id, v) => DepotAppends(id, v) },
 			writes.pstateUpdates.toList.map { case (id, v) => PStateUpdates(id, v) },
 		)
 		for {
+			_ <- log.debug(s"Flushing batch ${b.txId} of size ${b.writes.size}")
 			// (id, acked?) — maxLag-bounded; timeout or transport error => not acked
 			results <- channels.toList.parTraverse { case (followerId, ch) =>
 				ch.send(update).as(followerId -> true)
 					.timeout(config.maxLag)
-					.handleError { e =>
-						println(s"Follower $followerId didn't acknowledge: $e")
-						followerId -> false
+					.handleErrorWith { e =>
+						log.warn(s"Follower $followerId didn't acknowledge: $e").as(followerId -> false)
 					}
 			}
 			ackedFollowers = results.mapFilter { case (followerId, success) => Option.when(success)(followerId) }
 			_ <- taskStatus.update(ts => ts.copy(isr = ackedFollowers))
+			_ <- log.debug(s"batch ${b.txId} acknowledged by ${ackedFollowers.size} followers")
 			_ <- if (ackedFollowers.size >= config.minISR - 1) {
-					advanceHighWatermark(b.txId) *> writes.waiters.traverse_(_.complete(()).void)
+					log.debug(s"advancing HW to ${b.txId} and completing ${writes.waiters.size} waiters") *>
+						advanceHighWatermark(b.txId) *>
+						writes.waiters.traverse_(_.complete(()).void)
 				} else {
 					IO.raiseError(ReplicationStalled(b.txId))
 				}
@@ -205,20 +220,23 @@ final class TaskLeader private (
 
 	private def advanceHighWatermark(to: TxId): IO[Unit] =
 		highWatermark.update(h => if to.value > h.value then to else h)
+}
 
-object TaskLeader {
+object TaskLeader extends IOLogging {
 	// A leader resource including the running replication loop for each follower
 	def resource(
 		taskId: TaskId,
 		instanceId: InstanceId,
 		config: LeaderConfig,
 		followers: Map[InstanceId, Follower],
-	)(using Concurrent[IO]): ActiveResource[IO, TaskLeader] = {
+	)(using Concurrent[IO])(using rootLog: Log[IO]): ActiveResource[IO, TaskLeader] = {
+		given log: Log[IO] = rootLog.addContext("task" -> taskId.value.toString)
 		ActiveResource(for {
 			allocator <- TransactionAllocator.resource
 			cmdQueue <- Resource.eval(Queue.bounded[IO, BatchCommand](config.maxBatchSize))
 			// res[io, (task, Map[...])
 			channelPairs <- followers.toList.traverse { case (followerId, follower) =>
+				given Log[IO] = log.addContext("follower" -> followerId.id)
 				ReplicationChannel.open(follower, config).resource.map { case (channel, bg) =>
 					followerId -> (channel, bg)
 				}
@@ -234,7 +252,11 @@ object TaskLeader {
 			channels = channelPairs.view.mapValues(_._1).toMap
 			channelSendTask = channelPairs.values.map(_._2).toList.parTraverse_(identity) >> neverReached
 			leader = new TaskLeader(instanceId, config, allocator, cmdQueue, channels, taskStatusRef, hw)
-		} yield (leader, IO.race(leader.replicationLoop, channelSendTask).map(_.merge)))
+			background = {
+				log.info("Starting leader task") *>
+				IO.race(leader.replicationLoop, channelSendTask).map(_.merge)
+			}
+		} yield (leader, background))
 	}
 }
 

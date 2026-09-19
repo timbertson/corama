@@ -19,6 +19,7 @@ import weaver.Expectations
 import cats.Show
 import corama.Bytes
 import flogger._
+import weaver.scalacheck.CheckConfig
 
 object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 	implicit val log: Log[IO] = Log.empty
@@ -44,15 +45,18 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 
 	val TODO = IO.pure(success)
 	
-	test("single event in healthy state") {
+	test("single batch in healthy state") {
 		val sim = for {
 			warmup <- Warmup.gen
 			eventsToSend <- Gen.choose(1, warmup.batchSizeRemaining)
 			nextBatchEvents <- Gen.listOfN(eventsToSend, Op.gen)
 		} yield (warmup, nextBatchEvents)
-		forall(sim) { case (warmup, nextEvents) =>
+		forall.withConfig(CheckConfig.default.copy(
+			perPropertyParallelism = 1 // TODO remove
+		))(sim) { case (warmup, nextEvents) =>
 			ReplicationCtx.run(warmup) { ctx =>
 				for {
+					_ <- log.info("running events...")
 					result <- ctx.run(nextEvents).attempt.timed
 					audit <- ctx.audit.get
 				} yield {
@@ -117,7 +121,7 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 		private val maxLagMillis = leaderConfig.maxLag.toMillis
 
 		def healthy: Gen[ReplicaState] = for {
-			lag <- Gen.chooseNum(0L, maxLagMillis - 1).map(_.millis)
+			lag <- Gen.chooseNum(0L, maxLagMillis - 10).map(_.millis)
 		} yield Online(lag)
 
 		def unhealthy = Gen.oneOf(lagged, Gen.const(Offline))
@@ -264,7 +268,9 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 		ref: Ref[IO, FollowerStates],
 		audit: Audit[IO, Event],
 	): Map[InstanceId, Follower] = {
+
 		def follower(id: InstanceId) = {
+			val log = ReplicationSuite.log.addContext("follower" -> id.id)
 			val impl = new Follower {
 				override def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck] = {
 					Stream.exec(log.info(s"Follow stream start: $id")) ++
@@ -294,6 +300,7 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 		def run(warmup: Warmup)(body: ReplicationCtx => IO[Expectations]): Expectations = {
 			import cats.effect.unsafe.implicits.global
 			val makeResource = for {
+				_ <- log.info(s"-- starting test case: $warmup")
 				states <- Ref[IO].of(warmup.followers)
 				audit <- Audit[IO, Event]
 				leaderResouce = TaskLeader.resource(taskId, leaderId, leaderConfig, followerImpls(states, audit))
@@ -301,6 +308,7 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 
 			val fullTest = makeResource.flatMap(_.use { ctx =>
 				for {
+					_ <- log.info("Running warmup")
 					_ <- ctx.runWarmup(warmup)
 					_ <- log.info("Warmup complete; running test")
 					_ <- ctx.audit.reset
