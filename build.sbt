@@ -15,7 +15,7 @@ val ceVersion = "3.5.4"
 
 val fs2Version = "3.13.0"
 
-val floggerVersion = "1.0.0"
+val floggerVersion = "1.1.0"
 
 val logbackClassic = "ch.qos.logback" % "logback-classic" % "1.5.6"
 
@@ -31,7 +31,7 @@ val commonSettings = Seq(
     ++ (
       Seq("weaver-cats", "weaver-scalacheck").map("org.typelevel" %% _ % "0.13.0")
       ++ Seq(
-        // "net.gfxmonk" %% "flogger-weaver" % floggerVersion,
+        "net.gfxmonk" %% "flogger-weaver" % floggerVersion,
         logbackClassic,
         "net.gfxmonk" %% "auditspec" % "0.3.1",
         // "org.scalacheck" %% "scalacheck" % "1.18.0",

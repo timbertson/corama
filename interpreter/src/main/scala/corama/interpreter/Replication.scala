@@ -111,9 +111,9 @@ object LeaderConfig {
 }
 
 case class TaskStatus(
-	taskId: TaskId,
-	isr: List[InstanceId],
-	replicas: List[InstanceId],
+	isf: Set[InstanceId],
+	followers: Set[InstanceId],
+	highWatermark: TxId,
 )
 
 class ReplicationStalled(val txId: TxId)
@@ -141,7 +141,6 @@ final class TaskLeader private (
 	cmdQueue: Queue[IO, BatchCommand],
 	channels: Map[InstanceId, ReplicationChannel],
 	val taskStatus: Ref[IO, TaskStatus],
-	highWatermark: Ref[IO, TxId],
 )(using log: Log[IO]) extends IOLogging {
 	// TODO: we could reuse a single deferred per batch instead of per op, but that might increase contention
 	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[OpenBatch] =
@@ -215,21 +214,24 @@ final class TaskLeader private (
 					}
 			}
 			ackedFollowers = results.mapFilter { case (followerId, success) => Option.when(success)(followerId) }
-			_ <- taskStatus.update(ts => ts.copy(isr = ackedFollowers))
 			_ <- log.debug(s"batch ${b.txId} acknowledged by ${ackedFollowers.size} followers")
-			_ <- if (ackedFollowers.size >= config.minISR - 1) {
-					log.debug(s"advancing HW to ${b.txId}") *>
-						advanceHighWatermark(b.txId) *>
-						b.acknowledged.complete(())
+			enoughAcks = ackedFollowers.size >= config.minISR - 1
+			_ <- taskStatus.update { status =>
+						val newHw = if enoughAcks then b.txId else status.highWatermark
+						status.copy(
+							isf = ackedFollowers.toSet,
+							highWatermark = newHw,
+						)
+					}
+			_ <- if (enoughAcks) {
+					log.debug(s"advanced HW to ${b.txId}") *>
+					b.acknowledged.complete(())
 				} else {
 					val err = ReplicationStalled(b.txId) // TODO report OOS replicas
 					IO.raiseError(err)
 				}
 		} yield ()
 	}
-
-	private def advanceHighWatermark(to: TxId): IO[Unit] =
-		highWatermark.update(h => if to.value > h.value then to else h)
 }
 
 object TaskLeader extends IOLogging {
@@ -251,9 +253,8 @@ object TaskLeader extends IOLogging {
 					followerId -> (channel, bg)
 				}
 			}.map(_.toMap)
-			replicas = instanceId :: followers.keys.toList
-			taskStatus = TaskStatus(taskId = taskId, isr = replicas, replicas = replicas)
-			taskStatusRef <- Resource.eval(Ref[IO].of(taskStatus))
+			followerIds = followers.keys.toSet.incl(instanceId)
+			taskStatusRef <- Resource.eval(Ref[IO].of(TaskStatus(isf = followerIds, followers = followerIds, highWatermark = TxId(0L))))
 			hw <- Resource.eval(Ref[IO].of(TxId(0L)))
 
 			// channels are given to TaskLeader so it can offer items, whereas
@@ -261,7 +262,7 @@ object TaskLeader extends IOLogging {
 			// are not exposed outside of this resource
 			channels = channelPairs.view.mapValues(_._1).toMap
 			channelSendTask = channelPairs.values.map(_._2).toList.parTraverse_(identity) >> neverReached
-			leader = new TaskLeader(instanceId, config, allocator, cmdQueue, channels, taskStatusRef, hw)
+			leader = new TaskLeader(instanceId, config, allocator, cmdQueue, channels, taskStatusRef)
 			background = {
 				log.info("Starting leader task") *>
 				IO.race(leader.replicationLoop, channelSendTask).map(_.merge)
