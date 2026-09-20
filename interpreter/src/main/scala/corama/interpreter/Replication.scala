@@ -12,6 +12,9 @@ import flogger.Log
 import flogger.IOLogging
 
 case class TxId(value: Long)
+object TxId {
+	implicit val ord: Ordering[TxId] = Ordering.by(_.value)
+}
 
 // There are `n` tasks in an `n` node setup.
 // Each task is also replicated to 3 nodes (leader + 2)
@@ -49,8 +52,9 @@ class ReplicationChannel(
 	}
 
 	def ackLoop: IO[Nothing] = {
+		// TODO: handle reconnection
 		singleAckLoop.handleErrorWith { e =>
-			log.warn("Follower failed; retrying in 3s ...") *> IO.sleep(3.seconds) >> ackLoop
+			log.warn("Follower failed; TODO reconnect", e) *> IO.never
 		}
 	}
 
@@ -118,9 +122,12 @@ class ReplicationStalled(val txId: TxId)
 // /** Commands into the single batcher fiber. One fiber owns the current batch, so
 // 	*  there are no races between appends joining a batch and the batch being
 // 	*  sealed — the Kafka-producer accumulator model. */
-private enum BatchCommand {
-	case AppendCmd(depot: DepotId, appends: Vector[DepotAppend], waiter: Deferred[IO, Unit])
-	case UpdateCmd(pstate: PStateId, updates: Vector[PStateUpdate], waiter: Deferred[IO, Unit])
+sealed trait BatchCommand {
+	val accepted: Deferred[IO, OpenBatch]
+}
+private object BatchCommand {
+	case class AppendCmd(depot: DepotId, appends: Vector[DepotAppend], accepted: Deferred[IO, OpenBatch]) extends BatchCommand
+	case class UpdateCmd(pstate: PStateId, updates: Vector[PStateUpdate], accepted: Deferred[IO, OpenBatch]) extends BatchCommand
 }
 
 /** The leader for one task. Appends and pstate updates go into a single
@@ -137,11 +144,11 @@ final class TaskLeader private (
 	highWatermark: Ref[IO, TxId],
 )(using log: Log[IO]) extends IOLogging {
 	// TODO: we could reuse a single deferred per batch instead of per op, but that might increase contention
-	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[Deferred[IO, Unit]] =
-		Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.AppendCmd(depot, appends, w)).as(w) }
+	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[OpenBatch] =
+		Deferred[IO, OpenBatch].flatMap { w => cmdQueue.offer(BatchCommand.AppendCmd(depot, appends, w)) *> w.get }
 
-	def update(pstate: PStateId, updates: Vector[PStateUpdate]): IO[Deferred[IO, Unit]] =
-		Deferred[IO, Unit].flatMap { w => cmdQueue.offer(BatchCommand.UpdateCmd(pstate, updates, w)).as(w) }
+	def update(pstate: PStateId, updates: Vector[PStateUpdate]): IO[OpenBatch] =
+		Deferred[IO, OpenBatch].flatMap { w => cmdQueue.offer(BatchCommand.UpdateCmd(pstate, updates, w)) *> w.get }
 
 	def replicationLoop: IO[Nothing] = {
 		def newBatchLoop: IO[Nothing] = {
@@ -160,11 +167,13 @@ final class TaskLeader private (
 		def extendBatchLoop(prevBatch: OpenBatch, cmd: BatchCommand): IO[Nothing] = {
 			// Add a command to a batch and either flush immediately or keep accumulating
 			val newBatch = prevBatch.update(cmd)
-			if (newBatch.writes.size >= config.maxBatchSize) {
-				flushAndContinue(newBatch)
-			} else {
-				waitingBatchLoop(newBatch)
-			}
+			cmd.accepted.complete(newBatch) *> (
+				if (newBatch.writes.size >= config.maxBatchSize) {
+					flushAndContinue(newBatch)
+				} else {
+					waitingBatchLoop(newBatch)
+				}
+			)
 		}
 
 		def waitingBatchLoop(batch: OpenBatch): IO[Nothing] = {
@@ -209,11 +218,12 @@ final class TaskLeader private (
 			_ <- taskStatus.update(ts => ts.copy(isr = ackedFollowers))
 			_ <- log.debug(s"batch ${b.txId} acknowledged by ${ackedFollowers.size} followers")
 			_ <- if (ackedFollowers.size >= config.minISR - 1) {
-					log.debug(s"advancing HW to ${b.txId} and completing ${writes.waiters.size} waiters") *>
+					log.debug(s"advancing HW to ${b.txId}") *>
 						advanceHighWatermark(b.txId) *>
-						writes.waiters.traverse_(_.complete(()).void)
+						b.acknowledged.complete(())
 				} else {
-					IO.raiseError(ReplicationStalled(b.txId))
+					val err = ReplicationStalled(b.txId) // TODO report OOS replicas
+					IO.raiseError(err)
 				}
 		} yield ()
 	}
@@ -263,31 +273,29 @@ object TaskLeader extends IOLogging {
 case class BatchWrites(
 	depotAppends: Map[DepotId, Vector[DepotAppend]],
 	pstateUpdates: Map[PStateId, Vector[PStateUpdate]],
-	waiters: List[Deferred[IO, Unit]],
 	size: Int,
 ) {
 	def update(cmd: BatchCommand): BatchWrites = cmd match {
 		case BatchCommand.AppendCmd(depot, appends, w) => copy(
 			depotAppends = depotAppends.updatedWith(depot)(v => Some(v.getOrElse(Vector.empty) ++ appends)),
-			waiters = w :: waiters,
 			size = size + appends.size
 		)
 
 		case BatchCommand.UpdateCmd(pstate, updates, w) => copy(
 			pstateUpdates = pstateUpdates.updatedWith(pstate)(v => Some(v.getOrElse(Vector.empty) ++ updates)),
-			waiters = w :: waiters,
 			size = size + updates.size
 		)
 	}
 }
 
 object BatchWrites {
-	val empty = BatchWrites(Map.empty, Map.empty, List.empty, 0)
+	val empty = BatchWrites(Map.empty, Map.empty, 0)
 }
 
 case class OpenBatch(
 	txId: TxId,
 	openedAt: FiniteDuration,
+	acknowledged: Deferred[IO, Unit],
 	writes: BatchWrites,
 ) {
 
@@ -298,7 +306,8 @@ class TransactionAllocator(nextId: Ref[IO, Long]):
 	def createBatch: IO[OpenBatch] = for
 		id <- nextId.updateAndGet(_ + 1).map(TxId.apply)
 		openedAt <- IO.monotonic
-	yield OpenBatch(id, openedAt, BatchWrites.empty)
+		completion <- Deferred[IO, Unit]
+	yield OpenBatch(id, openedAt, completion, BatchWrites.empty)
 
 object TransactionAllocator {
 	def resource: Resource[IO, TransactionAllocator] =

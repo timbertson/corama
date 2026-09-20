@@ -50,9 +50,9 @@ object Event {
 	case class OpSent(timestamp: FiniteDuration, op: Op) extends OpEvent
 	
 	// placed in pending buffer
-	case class OpAccepted(timestamp: FiniteDuration, op: Op) extends OpEvent
+	case class OpAccepted(timestamp: FiniteDuration, op: Op, batch: TxId) extends OpEvent
 
-	case class OpCompleted(timestamp: FiniteDuration, op: Op) extends OpEvent
+	case class OpCompleted(timestamp: FiniteDuration, op: Op, batch: TxId) extends OpEvent
 
 	case class ReplicationAcknowledged(timestamp: FiniteDuration, id: TxId, follower: InstanceId) extends TxEvent
 	// case class NewIsrs(timestamp: FiniteDuration, isrs: Set[InstanceId]) extends Event
@@ -149,21 +149,25 @@ case class Warmup(
 	followers: FollowerStates,
 	acknowledgedOps: List[Op],
 	inFlightOps: List[Op],
-) {
-	// TODO: this will be hard to calculate if we move to more granular size information
-	def batchSizeRemaining = leaderConfig.maxBatchSize - inFlightOps.length
-}
+	sendDelay: FiniteDuration,
+)
 
 object Warmup {
 	def MAX_WARMUP_OPS = 3 // 100
+	def MAX_INFLIGHT_OPS = 3 // 100
+	def MAX_SEND_DELAY = 1.second // 100
 	def gen: Gen[Warmup] = for {
 		states <- FollowerStates.healthy
 		numAcknowledged <- Gen.choose(0, MAX_WARMUP_OPS)
 		acknowledgedOps <- Gen.listOfN(numAcknowledged, Op.gen)
-
-		numInFlight <- Gen.choose(0, leaderConfig.maxBatchSize - 1)
+		sendDelay <- Gen.choose(0L, MAX_SEND_DELAY.toMillis).map(_.millis)
+		numInFlight <- Gen.choose(0, MAX_INFLIGHT_OPS)
 		inFlightOps <- Gen.listOfN(numInFlight, Op.gen)
-	} yield Warmup(states, acknowledgedOps, inFlightOps)
+	} yield Warmup(states, acknowledgedOps, inFlightOps, sendDelay)
+}
+
+private def logAndRecord(audit: Audit[IO, Event], event: Event)(implicit log: Log[IO]) = {
+	log.debug(event.toString()) *> audit.record(event)
 }
 
 class ReplicationCtx(
@@ -172,40 +176,50 @@ class ReplicationCtx(
 	val leader: TaskLeader,
 ) {
 	def runWarmup(warmup: Warmup): IO[Unit] = {
-		run(warmup.acknowledgedOps)
-	}
-
-	def run(ops: List[Op]): IO[Unit] = {
-		enqueueAll(ops).flatMap(awaitAll)
-	}
-
-	def events = audit.get.map(Events.apply)
-
-	private def enqueueAll(ops: List[Op]): IO[List[IO[Op]]] = {
-		ops.traverse { op =>
-			for {
-				ts <- IO.monotonic
-				_ <- log.debug(s"Sending op: $op")
-				_ <- audit.record(Event.OpSent(ts, op))
-				result <- op match {
-					case Op.Append(depot, appends) => leader.append(depot, appends)
-					case Op.Update(pstate, updates) => leader.update(pstate, updates)
+		import scala.math.Ordering.Implicits._
+		run(warmup.acknowledgedOps, delay = warmup.sendDelay) *> enqueueAll(warmup.inFlightOps).flatMap { enqueues =>
+			// wait for batches that have definitely been sent, either because
+			// they're full, or they're prior to the latest batch
+			val lastTx = enqueues.lastOption.map(_._2.txId)
+			enqueues.traverse { case (op, batch) =>
+				IO.whenA(lastTx.exists(_ > batch.txId) || batch.writes.size >= leaderConfig.maxBatchSize) {
+					batch.acknowledged.get
 				}
-				ts2 <- IO.monotonic
-				_ <- log.debug(s"Accepted op: $op")
-				_ <- audit.record(Event.OpAccepted(ts2, op))
-			} yield result.get.as(op)
+			}.void
 		}
 	}
 
-	private def awaitAll(deferreds: List[IO[Op]]): IO[Unit] = {
-		deferreds.traverse_ { acked =>
+	def run(ops: List[Op], delay: FiniteDuration = Duration.Zero): IO[List[TxId]] = {
+		enqueueAll(ops, delay).flatMap(awaitAll)
+	}
+
+	def events = audit.get.map(Events.apply)
+	
+	def record(event: Event): IO[Unit] = logAndRecord(audit, event)
+
+	private def enqueueAll(ops: List[Op], delay: FiniteDuration = Duration.Zero): IO[List[(Op, OpenBatch)]] = {
+		ops.traverse { op =>
 			for {
-				op <- acked
 				ts <- IO.monotonic
-				_ <- log.debug(s"Completed op: $op")
-				_ <- audit.record(Event.OpCompleted(ts, op))
-			} yield ()
+				_ <- record(Event.OpSent(ts, op))
+				batch <- op match {
+					case Op.Append(depot, appends) => leader.append(depot, appends)
+					case Op.Update(pstate, updates) => leader.update(pstate, updates)
+				}
+				_ <- IO.sleep(delay)
+				ts2 <- IO.monotonic
+				_ <- record(Event.OpAccepted(ts2, op, batch.txId))
+			} yield (op, batch)
+		}
+	}
+
+	private def awaitAll(batches: List[(Op, OpenBatch)]): IO[List[TxId]] = {
+		batches.traverse { case (op, batch) =>
+			for {
+				_ <- batch.acknowledged.get
+				ts <- IO.monotonic
+				_ <- record(Event.OpCompleted(ts, op, batch.txId))
+			} yield batch.txId
 		}
 	}
 }
@@ -226,14 +240,12 @@ def followerImpls(
 						states <- ref.get
 						myState = states.get(id)
 						ts <- IO.monotonic
-						_ <- audit.record(Event.ReplicationSent(ts, update.id, id))
-						_ <- log.debug(s"Replication sent[$id]: ${update.id}, state $myState")
+						_ <- logAndRecord(audit, Event.ReplicationSent(ts, update.id, id))
 						result <- myState match {
 							case ReplicaState.Online(lag) => IO.sleep(lag).as(ReplicationAck(update.id))
 							case ReplicaState.Offline => IO.raiseError(new RuntimeException(s"Follower $id is offline"))
 						}
-						_ <- audit.record(Event.ReplicationAcknowledged(ts, update.id, id))
-						_ <- log.debug(s"Replication acknowledged[$id]: ${update.id}")
+						_ <- logAndRecord(audit, Event.ReplicationAcknowledged(ts, update.id, id))
 					} yield result
 				}
 			}
