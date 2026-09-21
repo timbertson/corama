@@ -8,7 +8,13 @@ import org.tpolecat.sourcepos.*
 // base AST
 // ---------------------------------------------------------------------------
 
-private[corama] sealed trait Node
+case class Dependencies(val inputs: List[VarId], val output: Option[VarId])
+
+private[corama] sealed trait Node {
+	val deps: Dependencies
+	val children: List[List[Node]] = Nil
+}
+
 private[corama] object Node {
 	// operations backed by a user-supplied function
 	sealed trait DynamicOp
@@ -20,22 +26,44 @@ private[corama] object Node {
 
 	// Dynamic node represents anything with a user-supplied function.
 	// The `op` contains the output var, if present
-	case class Dynamic(pos: SourcePos, ins: List[VarId], fn: List[Any] => Any, op: DynamicOp) extends Node
+	case class Dynamic(pos: SourcePos, ins: List[VarId], fn: List[Any] => Any, op: DynamicOp) extends Node {
+		val deps = {
+			val opDeps = op match {
+				case DynamicOp.Map(out) => Dependencies(Nil, Some(out))
+				case DynamicOp.Explode(out) => Dependencies(Nil, Some(out))
+				case DynamicOp.Filter(cond) => Dependencies(List(cond), None)
+			}
+			
+			opDeps.copy(inputs = ins ++ opDeps.inputs)
+		}
+	}
 
-	case class Assign(in: VarId, out: VarId) extends Node
+	case class Assign(in: VarId, out: VarId) extends Node {
+		val deps = Dependencies(List(in), Some(out))
+	}
 
 	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
 	  * it. Unused by `interp` backend.
 		*/
 	// case class Filter(pos: SourcePos, fn: Any => Boolean, in: VarId, flag: VarId) extends Node
 
-	case class Partition(in: VarId) extends Node
+	case class Partition(in: VarId) extends Node {
+		val deps = Dependencies(List(in), None)
+	}
 
-	case class If(cond: VarId, ifBlock: List[Node], elseBlock: List[Node], out: VarId) extends Node
+	case class If(cond: VarId, ifBlock: List[Node], elseBlock: List[Node], out: VarId) extends Node {
+		val deps = Dependencies(List(cond), Some(out))
+		override val children = List(ifBlock, elseBlock)
+	}
 
-	case class Combine(block: List[Node], agg: corama.Agg[?], collectFrom: VarId, out: VarId) extends Node
+	case class Combine(block: List[Node], agg: corama.Agg[?], collectFrom: VarId, out: VarId) extends Node {
+		val deps = Dependencies(List(collectFrom), Some(out))
+		override val children = List(block)
+	}
 
-	case class LocalAppend(depot: Identity, arg: VarId) extends Node
+	case class LocalAppend(depot: Identity, arg: VarId) extends Node {
+		val deps = Dependencies(List(arg), None)
+	}
 
 	sealed trait PStateOp
 	object PStateOp {
@@ -47,14 +75,28 @@ private[corama] object Node {
 		case class Get(intermediate: VarId, out: VarId) extends PStateOp
 
 		case class Put(v: VarId) extends PStateOp
-		// case class Delete(v: VarId) extends PStateOp
 	}
 
-	case class PStateNode(pstate: Identity, path: CompiledPath, op: PStateOp) extends Node
+	case class PStateNode(pstate: Identity, path: CompiledPath, op: PStateOp) extends Node {
+		val deps = {
+			val opDeps = op match {
+				case PStateOp.Add(v) => Dependencies(List(v), None)
+				case PStateOp.Remove(v) => Dependencies(List(v), None)
+				case PStateOp.Put(v) => Dependencies(List(v), None)
+
+				case PStateOp.Select(_, v, _) => Dependencies(Nil, Some(v))
+				case PStateOp.Get(_, v) => Dependencies(Nil, Some(v))
+			}
+			opDeps.copy(inputs = opDeps.inputs ++ path.ins)
+		}
+	}
+
 	case class PStateUpdate(
 		pos: SourcePos, pstate: Identity, path: CompiledPath, ins: List[VarId],
 		fn: (Option[Any], List[Any]) => Option[Any]
-	) extends Node
+	) extends Node {
+		val deps = Dependencies(ins ++ path.ins, None)
+	}
 
 	/** Compiles the higher-order [[Flow]] to a [[Node]] list.
 		*

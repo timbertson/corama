@@ -2,7 +2,6 @@ package example
 
 import cats.Eq
 import cats.syntax.all._
-import cats.data.Op
 import corama._
 import com.rpl.rama.RamaModule
 import com.rpl.rama
@@ -43,7 +42,7 @@ class RamaExample extends RamaModule {
 	val fullTickets = topologies.pstateKV[JLong, FullTicket]("fullTicket")
 
 	// upstream ticket changes update the fullTicket view
-	topologies.stream_(upstreamTicket) { ticket =>
+	val _ = topologies.stream_(upstreamTicket) { ticket =>
 		for {
 			id <- ticket.map(_.id)
 			_ <- fullTickets.key(id).updateWith(ticket) { (full, upstream) =>
@@ -93,7 +92,7 @@ class RamaExample extends RamaModule {
 
 	// When user changes (from either userRegistration or userNameChange),
 	// update the user view in $$userTickets
-	topologies.stream_(mergedUserChange) { user =>
+	val _ = topologies.stream_(mergedUserChange) { user =>
 		for {
 			userId <- user.map(_.id)
 			_ <- user.foreach { user => println(s"Applying merged user change: $user") }
@@ -106,7 +105,7 @@ class RamaExample extends RamaModule {
 		} yield Var.unit
 	}
 
-	topologies.stream(ticketAssignment, Result.agg[Unit]) { assignment =>
+	val _ = topologies.stream(ticketAssignment, Result.agg[Unit]) { assignment =>
 		for {
 			_ <- assignment.foreach(a => println(s"Assignment: $a"))
 			userId <- assignment.map(_.assigneeId)
@@ -140,7 +139,7 @@ class RamaExample extends RamaModule {
 		} yield result
 	}
 
-	topologies.stream_(propagateTicketAssignment) { assignment =>
+	val _ = topologies.stream_(propagateTicketAssignment) { assignment =>
 		for {
 			_ <- assignment.foreach(a => println(s"Propagating assignment $a"))
 			ticketId <- assignment.map(_.ticketId)
@@ -169,7 +168,7 @@ class RamaExample extends RamaModule {
 		UserTicketsResponse(a.tickets ++ b.tickets, a.nextCursor.orElse(b.nextCursor))
 	})
 
-	topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
+	val _ = topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
 		val userTicketsPageSize = 10
 		for {
 			userId <- query.map(_.userId)

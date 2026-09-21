@@ -24,7 +24,7 @@ private[corama] final class VarId(private[corama] val id: Int, private[corama] v
 		case that: VarId => that.id == id
 		case _           => false
 	}
-	override def hashCode: Int = id
+	override def hashCode: Int = id.hashCode
 	override def toString: String = s"${hint}_${id}"
 }
 
