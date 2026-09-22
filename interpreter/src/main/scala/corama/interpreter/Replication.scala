@@ -5,11 +5,13 @@ import cats.effect.{IO, Concurrent}
 import cats.effect.{Deferred, Ref, Resource}
 import cats.effect.std.Queue
 import cats.syntax.all.*
+import corama.error.Util.neverReached
 import scala.concurrent.duration.*
 import corama._
 import cats.effect.Async
 import flogger.Log
 import flogger.IOLogging
+import cats.Eq
 
 case class TxId(value: Long)
 object TxId {
@@ -18,7 +20,10 @@ object TxId {
 
 // There are `n` tasks in an `n` node setup.
 // Each task is also replicated to 3 nodes (leader + 2)
-case class TaskId(value: Int)
+case class TaskId(id: Int)
+object TaskId {
+	implicit val eq: Eq[TaskId] = Eq.fromUniversalEquals
+}
 
 case class PStateUpdate(key: Bytes, value: Option[Bytes])
 case class PStateUpdates(id: PStateId, updates: Vector[PStateUpdate])
@@ -35,10 +40,6 @@ case class ReplicationUpdate(
 case class ReplicationAck(
 	id: TxId,
 )
-
-trait Follower {
-	def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck]
-}
 
 class ReplicationChannel(
 	queue: Queue[IO, ReplicationUpdate],
@@ -67,9 +68,6 @@ class ReplicationChannel(
 		ackStream.compile.drain >> neverReached
 	}
 }
-
-private def neverReached: IO[Nothing] =
-	IO.raiseError(new IllegalStateException("neverReached: this should be impossible"))
 
 object ReplicationChannel extends IOLogging {
 	def open(follower: Follower, config: LeaderConfig)(using Concurrent[IO])(using log: Log[IO]): ActiveResource[IO, ReplicationChannel] =
@@ -242,7 +240,7 @@ object TaskLeader extends IOLogging {
 		config: LeaderConfig,
 		followers: Map[InstanceId, Follower],
 	)(using Concurrent[IO])(using rootLog: Log[IO]): ActiveResource[IO, TaskLeader] = {
-		given log: Log[IO] = rootLog.addContext("task" -> taskId.value.toString)
+		given log: Log[IO] = rootLog.addContext("task" -> taskId.id.toString)
 		ActiveResource(for {
 			allocator <- TransactionAllocator.resource
 			cmdQueue <- Resource.eval(Queue.bounded[IO, BatchCommand](config.maxBatchSize))

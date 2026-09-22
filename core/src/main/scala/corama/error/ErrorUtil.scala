@@ -1,6 +1,7 @@
 package corama.error
 
 import cats.ApplicativeError
+import cats.effect.IO
 
 object Util {
 	// private [corama] def formatError(e: Throwable) = {
@@ -16,6 +17,10 @@ object Util {
 	// }
 
 	def err(s: String) = new RuntimeException(s)
+
+	def neverReached: IO[Nothing] =
+		IO.raiseError(new IllegalStateException("neverReached: this should be impossible"))
+
 
 	def withContext[F[_], T](desc: => String, value: F[T])(implicit E: ApplicativeError[F, Throwable]): F[T] = {
 		E.handleErrorWith(value) { e =>

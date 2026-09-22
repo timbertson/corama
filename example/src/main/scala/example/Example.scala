@@ -5,6 +5,7 @@ import corama.interpreter.Interpreter
 import cats.syntax.all._
 import cats.effect._
 import java.lang.{Long => JLong}
+import corama.interpreter.ClusterMetadata
 
 /** A slice of `example.HelloWorldModule` rewritten in [[Flow]], as an API check.
   *
@@ -101,47 +102,52 @@ object Example extends IOApp {
 			Ticket(2, "Troubles McGee", "I don't have water"),
 			Ticket(3, "Passerby", "There seems to be a fire"))
 
-		val interp = new Interpreter(topologies)
-		interp.running {
-			for {
-				_ <- tickets.traverse_ { t =>
-					interp.access(fullTickets, t.id).put(FullTicket(t, Some(111L)))
-				}
-				_ <- interp.access(userTickets, 111L).put(Set(1L, 2L))
-				_ <- interp.access(userTickets, 222).put(Set(3L))
+		Interpreter.createCluster(
+			topologies,
+			Vector("node0", "node1", "node2").map(InstanceId.apply),
+			numPartitions = 12
+		).flatMap { interp =>
+			interp.running {
+				for {
+					_ <- tickets.traverse_ { t =>
+						interp.access(fullTickets, t.id).flatMap(_.put(FullTicket(t, Some(111L))))
+					}
+					_ <- interp.access(userTickets, 111L).flatMap(_.put(Set(1L, 2L)))
+					_ <- interp.access(userTickets, 222).flatMap(_.put(Set(3L)))
 
-				_ = println("Getting user tickets")
-				listed <- interp.invoke(userTicketsQuery, 111L)
-				_ = println(s"  user 111 tickets: $listed")
+					_ = println("Getting user tickets")
+					listed <- interp.invoke(userTicketsQuery, 111L)
+					_ = println(s"  user 111 tickets: $listed")
 
-				expected = List(tickets(0), tickets(1))
-				_ = assert(listed == expected, s"expected $expected, got $listed")
-				
+					expected = List(tickets(0), tickets(1))
+					_ = assert(listed == expected, s"expected $expected, got $listed")
+					
 
-				// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
-				acks <- interp.append(ticketAssignment, Assignment(1L, 222L))
+					// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
+					acks <- interp.append(ticketAssignment, Assignment(1L, 222L))
 
-				// And the ack *return* carries a value back: who owned the ticket before.
-				previous <- IO.fromTry(acks.unique(assigning))
-				_ = println(s"  reassigned ticket 1, previously owned by: $previous")
-				_ = assert(previous == Some(111L), s"ack return: $previous")
+					// And the ack *return* carries a value back: who owned the ticket before.
+					previous <- IO.fromTry(acks.unique(assigning))
+					_ = println(s"  reassigned ticket 1, previously owned by: $previous")
+					_ = assert(previous == Some(111L), s"ack return: $previous")
 
-				_ <- interp.access(userTickets, 222L).get.map { result =>
-					assert(result === Some(Set(3L, 1L)), s"new owner: ${result}")
-				}
-				_ <- interp.access(userTickets, 111L).get.map { result =>
-					assert(result === Some(Set(2L)), s"old owner: ${result}")
-				}
-				_ <- interp.access(fullTickets, 1L).get.map { result =>
-					assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
-				}
+					_ <- interp.access(userTickets, 222L).flatMap(_.get).map { result =>
+						assert(result === Some(Set(3L, 1L)), s"new owner: ${result}")
+					}
+					_ <- interp.access(userTickets, 111L).flatMap(_.get).map { result =>
+						assert(result === Some(Set(2L)), s"old owner: ${result}")
+					}
+					_ <- interp.access(fullTickets, 1L).flatMap(_.get).map { result =>
+						assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
+					}
 
-				// Reassigning to the same owner must not remove the ticket.
-				_ <- interp.append(ticketAssignment, Assignment(1L, 222L))
-				_ <- interp.access(userTickets, 222L).get.map { result =>
-					assert(result == Some(Set(3L, 1L)), s"self-reassign: ${result}")
-				}
-			} yield ExitCode.Success
+					// Reassigning to the same owner must not remove the ticket.
+					_ <- interp.append(ticketAssignment, Assignment(1L, 222L))
+					_ <- interp.access(userTickets, 222L).flatMap(_.get).map { result =>
+						assert(result == Some(Set(3L, 1L)), s"self-reassign: ${result}")
+					}
+				} yield ExitCode.Success
+			}
 		}
 	}
 }

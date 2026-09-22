@@ -1,4 +1,4 @@
-package corama.interpreter
+/* package corama.interpreter
 
 import cats.data.NonEmptyList
 import cats.effect.IO
@@ -465,3 +465,4 @@ class Partition(interpreter: Interpreter) {
 				} *> continue(tail, envs, ack)
 		}
 }
+ */
