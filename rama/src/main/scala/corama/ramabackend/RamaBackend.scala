@@ -133,26 +133,26 @@ object RamaBackend {
 
 	def compileVar[A](v: Var[A]): String = compileVar(v.vid)
 
-	private def eachStep(fn: List[Any] => Any, ins: List[String], out: String): Block.Impl =
-		ins match {
-			case Nil => {
-				Block.each(fn0[Any](() => fn(Nil))).out(out)
-			}
-			case List(a) => {
-				Block.each(fn1[Any, Any](x => fn(List(x))), a).out(out)
-			}
-			case List(a, b) =>
-				val f2 = new RamaFunction2[Any, Any, Any] {
-					def invoke(x: Any, y: Any): Any = fn(List(x, y))
-				}
-				Block.each(f2, a, b).out(out)
-			case other =>
-				throw new UnsupportedOperationException(
-					s"eachStep: arity ${other.length} not wired up yet (inputs: $other)")
-		}
+	// private def eachStep(fn: List[Any] => Any, ins: List[String], out: String): Block.Impl =
+	// 	ins match {
+	// 		case Nil => {
+	// 			Block.each(fn0[Any](() => fn(Nil))).out(out)
+	// 		}
+	// 		case List(a) => {
+	// 			Block.each(fn1[Any, Any](x => fn(List(x))), a).out(out)
+	// 		}
+	// 		case List(a, b) =>
+	// 			val f2 = new RamaFunction2[Any, Any, Any] {
+	// 				def invoke(x: Any, y: Any): Any = fn(List(x, y))
+	// 			}
+	// 			Block.each(f2, a, b).out(out)
+	// 		case other =>
+	// 			throw new UnsupportedOperationException(
+	// 				s"eachStep: arity ${other.length} not wired up yet (inputs: $other)")
+	// 	}
 
 
-	private def compileNode(node: Node): Block.Impl = node match {
+	private def compileNode(node: Node): Block.Impl = node.op match {
 		case Node.Dynamic(pos, ins, fn, op) => {
 			// TODO: error reporting using the `pos`
 			val inVars = ins.map(compileVar)

@@ -1,12 +1,19 @@
 package corama
 
+import cats.syntax.all.*
 import corama.internal.*
 import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
 
 import scala.annotation.unused
+import scala.util.Try
+import cats.Eq
+import corama.error.Util.err
 
 final case class TopologyId(value: Int) extends AnyVal
+object TopologyId {
+	implicit val eq: Eq[TopologyId] = Eq.fromUniversalEquals
+}
 
 enum TopologyKind {
 	// TODO: add MicroBatch
@@ -48,6 +55,13 @@ final class Topologies {
 	def pstates: List[PState] = builtPstates.reverse
 
 	private[corama] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
+
+	private[corama] def continuationAfter(id: TopologyId, afterNode: NodeId): Try[List[Node]] = {
+		topologies.find(_.id === id)
+			.toRight(err(s"Unknown topology ID: ${id}"))
+			.toTry
+			.flatMap(_.continuationAfter(afterNode))
+	}
 
 	private def claim(identity: Identity): Identity = {
 		if (ids.contains(identity)) {
@@ -122,11 +136,70 @@ final case class Topology[S, R](
 	flow: Flow[R, Nothing],
 	agg: Agg[R]) {
 	def input: Var[S] = builder.input
+	
+	def id = builder.id
 
 	// only used in rama backend
 	val queryOutputVar: Var[R] = builder.vars.add("queryOutput", null /* TODO */, implicitly[SourcePos])
 
-	val compiled = Node.compile(builder, flow)
+	val compiled = Node.compile(builder, new NodeBuilder(), flow)
+	
+	private [corama] def continuationAfter(afterNode: NodeId): Try[List[Node]] = {
+		continuationAfterOpt(afterNode, compiled._1)
+			.toRight(err(s"Node $afterNode not found in topology $id"))
+			.toTry
+	}
+
+	private def continuationAfterOpt(
+		afterNode: NodeId,
+		remainingNodes: List[Node] // remaining nodes at this level
+	): Option[List[Node]] = {
+		remainingNodes match {
+			case Nil => None
+			case node :: tail => {
+				if (node.id === afterNode) {
+					Some(tail)
+				} else {
+					node.op match {
+						// non-branching nodes just continue onto tail
+						case _ : Node.Dynamic
+							| _ : Node.Assign
+							| _ : Node.Partition
+							| _ : Node.PStateNode
+							| _ : Node.PStateUpdate
+							| _ : Node.LocalAppend
+								=> continuationAfterOpt(afterNode, tail)
+
+						case Node.If(cond, ifBranch, elseBranch, out) =>
+							continuationAfterBranches(afterNode, List(ifBranch, elseBranch), tail)
+
+						case Node.Combine(block, agg, collectFrom, out) =>
+							continuationAfterBranches(afterNode, List(block), tail)
+					}
+				}
+			}
+		}
+	}
+
+	private def continuationAfterBranches(
+		afterNode: NodeId,
+		branches: List[List[Node]],
+		parentTail: List[Node] // remaining nodes at the parent level
+	): Option[List[Node]] = {
+		branches match {
+			case Nil =>
+				// not found in any branch, resume search at parent level
+				continuationAfterOpt(afterNode, parentTail)
+
+			case headBranch :: tailBranches => continuationAfterOpt(afterNode, headBranch) match {
+				// found node headBranch. Return the remaining branch nodes plus all the parent ones
+				case Some(value) => Some(value ++ parentTail)
+
+				// not in this branch, search next
+				case None => continuationAfterBranches(afterNode, tailBranches, parentTail)
+			}
+		}
+	}
 }
 
 // wrappers for the different types of topology

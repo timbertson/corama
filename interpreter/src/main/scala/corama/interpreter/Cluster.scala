@@ -10,14 +10,19 @@ import fs2.Stream
 
 import scala.util.Random
 
-// Represents a specific peer's continuation interface
-trait Peer {
-	def continue(topology: TopologyId, envs: List[Env], position: NodePath, sink: EvalSink): IO[Unit]
-}
+case class PartitionBatch[A](value: List[(PartitionId, List[A])])
 
-// The router receives partitioned continuations and routes them to the current leader
-trait PartitionRouter {
-	def continue(partition: PartitionId, topology: TopologyId, envs: List[Env], position: NodePath, sink: EvalSink): IO[Unit]
+/*
+The executor receives partitioned continuations and routes them to the current leader.
+This is implemented by the GRPC service to a _specific_ peer, where it fails if the peer is
+not leader for the task.
+
+It's also implemented by the task router, in which case it finds the appropriate peer to invoke.
+
+Execution continues *after* the provided nodeId, since that's trivial to provide & serialize.
+*/
+trait TaskExecutor {
+	def continue(task: TaskId, topology: TopologyId, afterNode: NodeId, envs: PartitionBatch[Env], sink: EvalSink): IO[Unit]
 }
 
 case class Epoch(value: Long)

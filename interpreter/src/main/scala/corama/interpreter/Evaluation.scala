@@ -34,8 +34,6 @@ case class EvalSink(origin: InstanceId, id: EvalId)
 type Env = Map[VarId, Any]
 class EvalError(msg: String, pos: SourcePos, cause: Throwable) extends RuntimeException(s"$msg defined at $pos", cause) with NoStackTrace
 
-case class PartitionBatch[A](value: List[(PartitionId, List[A])])
-
 object Storage {
 	class PState() {
 		val inner = Ref.unsafe[IO, Map[Any,Any]](Map.empty)
@@ -146,7 +144,12 @@ private[corama] object AckTracker {
 		} yield new AckTracker(pending, returns, done)
 }
 
-class Interpreter(val topologies: Topologies, metadata: ClusterMetadata, val instances: Vector[InstancePartitions]) {
+class Interpreter(
+	val topologies: Topologies,
+	metadata: ClusterMetadata,
+	val instances: Vector[InstancePartitions],
+	val router: TaskExecutor
+) {
 	import Interpreter._
 	def run: IO[Nothing] = {
 		instances.parTraverse_(_.run(this)) *> neverReached
@@ -214,7 +217,7 @@ class Interpreter(val topologies: Topologies, metadata: ClusterMetadata, val ins
 		val env: Env = Map(topology.builder.input.vid -> value)
 		val agg = topology.agg
 		partition(metadata.randomPartition).flatMap { partition =>
-			partition.continue(this, topology.compiled._1, List(env)).map { resultEnvs =>
+			partition.continue(this, topology.id, topology.compiled._1, List(env)).map { resultEnvs =>
 				resultEnvs.foldLeft(agg.zero) { (acc, resultEnv) =>
 					agg.combineAny(acc, resultEnv.getOrElse(topology.compiled._2.vid, throw new RuntimeException("output var not present in query result")))
 				}
@@ -234,7 +237,7 @@ object Interpreter {
 		metadata.instances.traverse { instance =>
 			InstancePartitions(instance, topologies, metadata)
 		}.map { instancePartitions =>
-			new Interpreter(topologies, metadata, instancePartitions)
+			new Interpreter(topologies, metadata, instancePartitions, ???)
 		}
 	}
 }
@@ -246,6 +249,19 @@ class InstancePartitions(
 	metadata: ClusterMetadata,
 	partitions: Ref[IO, Map[PartitionId, Partition]]
 ) {
+	def taskExecutor(interpreter: Interpreter): TaskExecutor = new TaskExecutor {
+		def continue(task: TaskId, topology: TopologyId, afterNode: NodeId, envs: PartitionBatch[Env], sink: EvalSink): IO[Unit] = {
+			// TODO: capture node continuation
+			IO.fromTry(topologies.continuationAfter(topology, afterNode)).flatMap { nodes =>
+				envs.value.parTraverse_ { case (partitionId, envs) =>
+					get(task, partitionId).flatMap { partition =>
+						partition.continue(interpreter, topology, nodes, envs, None /* TODO: sink */)
+					}
+				}
+			}
+		}
+	}
+
 	// TODO: only if we are currently leader for task
 	def get(task: TaskId, partition: PartitionId): IO[Partition] = {
 		if (metadata.taskFor(partition) === task) {
@@ -321,7 +337,7 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 				// `continue` returning means the whole event tree for this record is
 				// exhausted — every fanned-out branch, on every partition it reached.
 				// `IO.defer` ensures exceptions in user functions (like each) don't escape.
-				IO.defer(continue(interpreter, top.compiled._1, List(env), ack)).void.attempt.flatMap {
+				IO.defer(continue(interpreter, top.id, top.compiled._1, List(env), ack)).void.attempt.flatMap {
 					case Right(_) => record.tracker.traverse_(_.finish)
 
 					// One bad record must not stop the topology: Rama retries the record and
@@ -379,7 +395,17 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 		* everywhere else, including across a partition hop, since Rama routes an ack return
 		* to the *appender* rather than to the task that produced it.
 		*/
-	private [corama] def continue(interpreter: Interpreter, nodes: List[Node], envs: List[Env], ack: Option[AckSink] = None): IO[List[Env]] =
+	private [corama] def continue(
+		interpreter: Interpreter,
+		topologyId: TopologyId,
+		nodes: List[Node],
+		envs: List[Env],
+		ack: Option[AckSink] = None
+	): IO[List[Env]] = {
+		def continueTopology(nodes: List[Node], envs: List[Env], ack: Option[AckSink]) =
+			// supplies interpreter & topologyId since those don't change
+			continue(interpreter, topologyId, nodes, envs, ack)
+
 		import Node.DynamicOp
 		import Node.PStateOp
 
@@ -389,130 +415,133 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 					sink.addResults(envs)
 				}.as(envs)
 			}
-
-			case Node.Dynamic(pos, ins, fn, op) :: tail => {
-				val results = try {
-					op match {
-						case DynamicOp.Map(out) =>
-							envs.map(env => env.updated(out, fn(ins.map(env(_)))))
-						case DynamicOp.Explode(out) =>
-							// in each env, `in` holds an `A`
-							// `fn` takes A and yields a Seq of values.
-							// we expand each of these into `out` in a
-							// copy of the parent env
-							envs.flatMap { env =>
-								fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
-									env.updated(out, value)
-								}
-							}
-						case DynamicOp.Filter(_) =>
-							envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
-					}
-				} catch {
-					case e => throw new EvalError(s"Error evaluating node", pos, e)
-				}
-				continue(interpreter, tail, results, ack)
-			}
-
-			case Node.Assign(in, out) :: tail =>
-				continue(interpreter, tail, envs.map { env =>
-					env.updated(out, env(in))
-				})
-
-			case Node.If(cond, ifBranch, elseBranch, out) :: tail =>
-				envs.flatTraverse { env =>
-					if (env(cond).asInstanceOf[Boolean]) {
-						continue(interpreter, ifBranch ++ tail, List(env))
-					} else {
-						continue(interpreter, elseBranch ++ tail, List(env))
-					}
-				}
-
-			case Node.Partition(in) :: tail => {
-				// todo: parallel, but we shouldn't be returning the envs from here
-				metadata.partitionBatches(envs, env => env(in)).toList.flatTraverse { case (taskId, partitionedEnvs) =>
-					partitionedEnvs.value.flatTraverse { case (partitionId, penvs) =>
-						interpreter.partition(partitionId).flatMap { partition =>
-							partition.continue(interpreter, tail, penvs, ack)
-						}
-					}
-				}
-			}
-
-			case Node.Combine(block, agg, collectFrom, out) :: tail => {
-				envs.traverse { env =>
-					continue(interpreter, block, List(env), ack).map { innerEnvs =>
-						env.updated(out, innerEnvs.foldLeft(agg.zero) { (acc, innerEnv) =>
-							agg.combineAny(acc, innerEnv(collectFrom))
-						})
-					}
-				}.flatMap { outputEnvs =>
-					continue(interpreter, tail, outputEnvs, ack)
-				}
-			}
 			
-			case Node.PStateNode(ps, path, op) :: tail =>
-				val state = pstate(ps.name)
-				envs.traverse { env =>
-					val rawPath = compilePath(path, env)
-					def applyOp(current: Option[Any]): (Option[Any], Env) = {
-						def currentSet: Set[Any] = {
-							println(s"accessing current set @ $rawPath: ${current}")
-							current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
-						}
-						op match {
-							case PStateOp.Add(v) => (Some(currentSet.incl(env(v))), env)
-							case PStateOp.Remove(v) => (Some(currentSet.excl(env(v))), env)
-							case PStateOp.Select(_intermediate, out, options) => {
-								// TODO: implement limit
-								val ord: Ordering[Any] = options.ord.asInstanceOf[Ordering[Any]]
-								val fullList = currentSet.toList.sorted(using ord)
-								val result = options match {
-									case SelectOptions(afterVar, maxItems, _) =>
-										val afterList = afterVar.fold(fullList){ afterVar =>
-											val afterVal = env(afterVar.vid)
-											fullList.dropWhile(x => ord.lteq(x, afterVal))
+			case node :: tail => {
+				node.op match {
+					case Node.Dynamic(pos, ins, fn, op) => {
+						val results = try {
+							op match {
+								case DynamicOp.Map(out) =>
+									envs.map(env => env.updated(out, fn(ins.map(env(_)))))
+								case DynamicOp.Explode(out) =>
+									// in each env, `in` holds an `A`
+									// `fn` takes A and yields a Seq of values.
+									// we expand each of these into `out` in a
+									// copy of the parent env
+									envs.flatMap { env =>
+										fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
+											env.updated(out, value)
 										}
-										val afterLimit = maxItems.fold(afterList) { max =>
-											afterList.take(max)
-										}
-										afterLimit
-								}
-								println(s"Select returned $result into var $out")
-								(current, env.updated(out, result))
+									}
+								case DynamicOp.Filter(_) =>
+									envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
 							}
+						} catch {
+							case e => throw new EvalError(s"Error evaluating node", pos, e)
+						}
+						continueTopology(tail, results, ack)
+					}
 
-							case PStateOp.Get(_intermediate, out: VarId) => (current, env.updated(out, current))
-							case PStateOp.Put(v: VarId) => (Some(env(v)), env)
-							// case PStateOp.Delete(v: VarId) => (None, env)
+					case Node.Assign(in, out) =>
+						continueTopology(tail, envs.map { env =>
+							env.updated(out, env(in))
+						}, ack)
+
+					case Node.If(cond, ifBranch, elseBranch, out) =>
+						envs.flatTraverse { env =>
+							if (env(cond).asInstanceOf[Boolean]) {
+								continueTopology(ifBranch ++ tail, List(env), ack)
+							} else {
+								continueTopology(elseBranch ++ tail, List(env), ack)
+							}
+						}
+
+					case Node.Partition(in) => {
+						// todo: parallel, but we shouldn't be returning the envs from here
+						metadata.partitionBatches(envs, env => env(in)).toList.flatTraverse { case (taskId, partitionedEnvs) =>
+							interpreter.router.continue(taskId, topologyId, node.id, partitionedEnvs, ???).void.as(Nil /* TODO */)
 						}
 					}
-					state.modify(rawPath)(applyOp)
-				}.flatMap { updatedEnvs =>
-					continue(interpreter, tail, updatedEnvs, ack)
-				}
 
-			case Node.PStateUpdate(_pos, ps, path, ins, fn) :: tail =>
-				val f = fn // TODO is this necessary?
-				val state = pstate(ps.name)
-				envs.traverse_ { env =>
-					val rawPath = compilePath(path, env)
-					def applyOp(current: Option[Any]): (Option[Any], Unit) = {
-						val args = ins.map(env(_))
-						(f(current, args), ())
+					case Node.Combine(block, agg, collectFrom, out) => {
+						envs.traverse { env =>
+							// TODO: this doesn't work across instances
+							continueTopology(block, List(env), ack).map { innerEnvs =>
+								env.updated(out, innerEnvs.foldLeft(agg.zero) { (acc, innerEnv) =>
+									agg.combineAny(acc, innerEnv(collectFrom))
+								})
+							}
+						}.flatMap { outputEnvs =>
+							continueTopology(tail, outputEnvs, ack)
+						}
 					}
-					state.modify(rawPath)(applyOp)
-				}.flatMap { _ =>
-					continue(interpreter, tail, envs, ack)
-				}
+					
+					case Node.PStateNode(ps, path, op) =>
+						val state = pstate(ps.name)
+						envs.traverse { env =>
+							val rawPath = compilePath(path, env)
+							def applyOp(current: Option[Any]): (Option[Any], Env) = {
+								def currentSet: Set[Any] = {
+									println(s"accessing current set @ $rawPath: ${current}")
+									current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
+								}
+								op match {
+									case PStateOp.Add(v) => (Some(currentSet.incl(env(v))), env)
+									case PStateOp.Remove(v) => (Some(currentSet.excl(env(v))), env)
+									case PStateOp.Select(_intermediate, out, options) => {
+										// TODO: implement limit
+										val ord: Ordering[Any] = options.ord.asInstanceOf[Ordering[Any]]
+										val fullList = currentSet.toList.sorted(using ord)
+										val result = options match {
+											case SelectOptions(afterVar, maxItems, _) =>
+												val afterList = afterVar.fold(fullList){ afterVar =>
+													val afterVal = env(afterVar.vid)
+													fullList.dropWhile(x => ord.lteq(x, afterVal))
+												}
+												val afterLimit = maxItems.fold(afterList) { max =>
+													afterList.take(max)
+												}
+												afterLimit
+										}
+										println(s"Select returned $result into var $out")
+										(current, env.updated(out, result))
+									}
 
-			case Node.LocalAppend(dep, value) :: tail =>
-				val state = depot(dep.name)
-				envs.traverse_ { env =>
-					val v = env(value)
-					// `None`: the new record starts its own event tree rather than extending
-					// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
-					state.inner.update(_.appended(Record(v, None)))
-				} *> continue(interpreter, tail, envs, ack)
-		}
+									case PStateOp.Get(_intermediate, out: VarId) => (current, env.updated(out, current))
+									case PStateOp.Put(v: VarId) => (Some(env(v)), env)
+									// case PStateOp.Delete(v: VarId) => (None, env)
+								}
+							}
+							state.modify(rawPath)(applyOp)
+						}.flatMap { updatedEnvs =>
+							continueTopology(tail, updatedEnvs, ack)
+						}
+
+					case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
+						val f = fn // TODO is this necessary?
+						val state = pstate(ps.name)
+						envs.traverse_ { env =>
+							val rawPath = compilePath(path, env)
+							def applyOp(current: Option[Any]): (Option[Any], Unit) = {
+								val args = ins.map(env(_))
+								(f(current, args), ())
+							}
+							state.modify(rawPath)(applyOp)
+						}.flatMap { _ =>
+							continueTopology(tail, envs, ack)
+						}
+
+					case Node.LocalAppend(dep, value) =>
+						val state = depot(dep.name)
+						envs.traverse_ { env =>
+							val v = env(value)
+							// `None`: the new record starts its own event tree rather than extending
+							// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
+							state.inner.update(_.appended(Record(v, None)))
+						} *> continueTopology(tail, envs, ack)
+				}
+				}
+			}
+
+	}
 }

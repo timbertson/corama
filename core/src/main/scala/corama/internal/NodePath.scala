@@ -10,21 +10,22 @@ sealed trait PathIndex
 
 case class NodeIndex(value: Int) extends PathIndex {
 	def next: NodeIndex = NodeIndex(value + 1)
-	def child(branch: Int): NodeBranch = NodeBranch(value, branch)
+	def child(branch: Int): NodeBranch = NodeBranch(this, branch)
 }
 
 object NodeIndex {
 	val zero = NodeIndex(0)
 }
 
-case class NodeBranch(step: Int, branch: Int) extends PathIndex {
-	def stepIndex: NodeIndex = NodeIndex(step)
-	def raw: List[Int] = List(step, branch)
+case class NodeBranch(step: NodeIndex, branch: Int) extends PathIndex {
+	def raw: List[Int] = List(step.value, branch)
 }
 
 case class NodePath(branches: Queue[NodeBranch], leaf: NodeIndex) {
 	def raw: Seq[Int] = branches.flatMap(_.raw).appended(leaf.value)
 	def rawString: String = raw.mkString(".")
+	def child(branch: Int) = copy(branches = branches.appended(leaf.child(branch)), leaf = NodeIndex.zero)
+	def next = copy(leaf = leaf.next)
 }
 
 object NodePath {
@@ -34,7 +35,7 @@ object NodePath {
 			case p0 :: p1 :: path => {
 				// nested node branch
 				fromRaw(path).map { inner =>
-					NodePath(inner.branches.appended(NodeBranch(p0, p1)), inner.leaf)
+					NodePath(inner.branches.appended(NodeBranch(NodeIndex(p0), p1)), inner.leaf)
 				}
 			}
 
@@ -85,7 +86,7 @@ case class ExecutionStack(index: NodeIndex, remainingNodes: List[Node], stack: L
 	}
 
 	def enterBranch(branch: NodeBranch): Try[ExecutionStack] = {
-		skip(branch.step).toRight(err(s"${branch} Not enough steps")).toTry
+		skip(branch.step.value).toRight(err(s"${branch} Not enough steps")).toTry
 			.flatMap(_.enterBranchAtHead(branch.branch))
 	}
 
@@ -154,14 +155,14 @@ object ExecutionStack {
 
 case class DependencySet(requires: Set[VarId], produces: Set[VarId]) {
 	def add(step: Node) = {
-		val newProduces = produces.union(step.deps.output.toSet)
+		val newProduces = produces.union(step.op.deps.output.toSet)
 
 		// we accumulate child requirements but not depends (those don't escape their scope)
-		val childRequirements = step.children.flatMap { steps =>
+		val childRequirements = step.op.children.flatMap { steps =>
 			this.addAll(steps.toList).requires
 		}.toSet
 
-		val newRequires = requires.union(step.deps.inputs.toSet).union(childRequirements)
+		val newRequires = requires.union(step.op.deps.inputs.toSet).union(childRequirements)
 
 		DependencySet(requires = newRequires.diff(produces), produces = newProduces)
 	}
