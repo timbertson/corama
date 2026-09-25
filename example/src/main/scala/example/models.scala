@@ -2,21 +2,9 @@ package example
 
 import scala.jdk.CollectionConverters._
 import com.rpl.rama._
-import com.rpl.rama.module._
-import com.rpl.rama.ops.Ops
-import com.rpl.rama.test._
-import cats.data.Op
 import com.rpl.rama.ops.RamaFunction2
 import com.rpl.rama.ops.RamaFunction1
-import com.rpl.rama.impl.NativeDepotPartitioning
-import com.rpl.rama.impl.NativeRamaFunction1
-import scala.annotation.unused
-import com.rpl.rama.impl.NativeRamaFunction2
-import java.util.Arrays
 import java.lang.{Long => JLong}
-import com.strobel.collections.ListBuffer
-import java.time.Instant
-import algebra.Monoid
 
 type JLong = java.lang.Long
 

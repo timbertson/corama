@@ -58,11 +58,13 @@ final class Topologies {
 
 	private[corama] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
 
-	private[corama] def continuationAfter(id: TopologyId, afterNode: NodeId): Try[List[Node]] = {
+	private[corama] def get(id: TopologyId): Try[Topology[?, ?]] =
 		topologies.find(_.id === id)
 			.toRight(err(s"Unknown topology ID: ${id}"))
 			.toTry
-			.flatMap(_.continuationAfter(afterNode))
+
+	private[corama] def continuationAfter(id: TopologyId, afterNode: NodeId): Try[Continuation] = {
+		get(id).flatMap(_.continuationAfter(afterNode))
 	}
 
 	private def claim(identity: Identity): Identity = {
@@ -149,8 +151,10 @@ final case class Topology[S, R](
 	val queryOutputVar: Var[R] = builder.vars.add("queryOutput", null /* TODO */, implicitly[SourcePos])
 
 	val compiled = Node.compile(builder, new NodeBuilder(), flow)
+
+	private [corama] def output: Var[R] = compiled._2
 	
-	private [corama] def continuationAfter(afterNode: NodeId): Try[List[Node]] = {
+	private [corama] def continuationAfter(afterNode: NodeId): Try[Continuation] = {
 		continuationAfterOpt(afterNode, compiled._1)
 			.toRight(err(s"Node $afterNode not found in topology $id"))
 			.toTry
@@ -159,12 +163,12 @@ final case class Topology[S, R](
 	private def continuationAfterOpt(
 		afterNode: NodeId,
 		remainingNodes: List[Node] // remaining nodes at this level
-	): Option[List[Node]] = {
+	): Option[Continuation] = {
 		remainingNodes match {
 			case Nil => None
 			case node :: tail => {
 				if (node.id === afterNode) {
-					Some(tail)
+					Some(Continuation.Basic(tail))
 				} else {
 					node.op match {
 						// non-branching nodes just continue onto tail
@@ -176,34 +180,55 @@ final case class Topology[S, R](
 							| _ : Node.LocalAppend
 								=> continuationAfterOpt(afterNode, tail)
 
-						case Node.If(cond, ifBranch, elseBranch, out) =>
-							continuationAfterBranches(afterNode, List(ifBranch, elseBranch), tail)
+						case Node.If(cond, ifBranch, elseBranch, _branchOut) =>
+							continuationInBranches(afterNode, List(ifBranch, elseBranch)) match {
+								case None => continuationAfterOpt(afterNode, tail)
+								case Some(cont) => Some(cont.withParent(tail))
+							}
 
-						case Node.Combine(block, agg, collectFrom, out) =>
-							continuationAfterBranches(afterNode, List(block), tail)
+						case combine: Node.Combine =>
+							continuationInBranches(afterNode, List(combine.block)) match {
+								case None => continuationAfterOpt(afterNode, tail)
+								case Some(cont) => Some(cont.withinAggregation(combine))
+							}
 					}
 				}
 			}
 		}
 	}
 
-	private def continuationAfterBranches(
+	private def continuationInBranches(
 		afterNode: NodeId,
 		branches: List[List[Node]],
-		parentTail: List[Node] // remaining nodes at the parent level
-	): Option[List[Node]] = {
+	): Option[Continuation] = {
 		branches match {
-			case Nil =>
-				// not found in any branch, resume search at parent level
-				continuationAfterOpt(afterNode, parentTail)
-
-			case headBranch :: tailBranches => continuationAfterOpt(afterNode, headBranch) match {
-				// found node headBranch. Return the remaining branch nodes plus all the parent ones
-				case Some(value) => Some(value ++ parentTail)
-
+			case Nil => None
+			case headBranch :: tailBranches => continuationAfterOpt(afterNode, headBranch).orElse {
 				// not in this branch, search next
-				case None => continuationAfterBranches(afterNode, tailBranches, parentTail)
+				continuationInBranches(afterNode, tailBranches)
 			}
+		}
+	}
+}
+
+private [corama] sealed trait Continuation {
+	def withParent(tail: List[Node]): Continuation
+	def withinAggregation(node: Node.Combine): Continuation
+	val nodes: List[Node]
+}
+
+object Continuation {
+	case class WithinAggregation(agg: Agg[?], out: VarId, nodes: List[Node]) extends Continuation {
+		// aggregations terminate at the end of the block, continuation of parent tail
+		// occurs back on the original (aggregating) node
+		override def withParent(tail: List[Node]) = this
+		override def withinAggregation(combine: Node.Combine): Continuation = this
+	}
+
+	case class Basic(nodes: List[Node]) extends Continuation {
+		override def withParent(tail: List[Node]) = copy(nodes = nodes ++ tail)
+		override def withinAggregation(combine: Node.Combine): Continuation = {
+			Continuation.WithinAggregation(combine.agg, combine.out, nodes)
 		}
 	}
 }

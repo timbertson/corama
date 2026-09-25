@@ -19,6 +19,7 @@ import scala.util.*
 import scala.util.control.NoStackTrace
 import flogger.*
 import cats.effect.Resource
+import scala.annotation.unused
 
 /**
 	* An environment is one *instance* of a topology execution, mapping vars to values.
@@ -95,8 +96,9 @@ private[corama] final class TopologiesResults(results: Map[TopologyId, LocalTopo
 
 private[corama] object TopologiesResults {
 	def apply(topologies: List[Topology[?, ?]])(using Log[IO]): IO[TopologiesResults] = {
-		topologies.traverse {
-			top => TopologyResults.local[top.Result](top, EdgeId.union(topologies.map(_.startingEdge))).map(top.id -> _)
+		topologies.traverse { topology =>
+			TopologyResults.local[topology.Result](topology.output.vid, topology.agg, EdgeId.union(topologies.map(_.startingEdge)))
+				.map(topology.id -> _)
 		}.map { topologyResults =>
 			new TopologiesResults(topologyResults.toMap)
 		}
@@ -207,22 +209,58 @@ class InstancePartitions(
 	metadata: ClusterMetadata,
 	partitions: Ref[IO, Map[PartitionId, Partition]]
 ) {
-	def taskExecutor(interpreter: Interpreter)(using Log[IO]): TaskExecutor = new TaskExecutor {
-		override def continue(origin: Origin, task: TaskId, afterNode: NodeId, edge: EdgeId, envs: PartitionBatch[Env]): IO[Unit] = {
-			IO.fromTry(topologies.continuationAfter(origin.topologyId, afterNode)).flatMap { nodes =>
-				envs.value.parTraverse_ { case (partitionId, envs) =>
-					get(task, partitionId).flatMap { partition =>
-						partition.continue(origin, interpreter, ???, edge, nodes, envs)
-					}
-				}
+	private def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, @unused origin: Origin) = {
+		val (outVarId, agg) = continuation match {
+			case _: Continuation.Basic => (topology.output.vid, topology.agg)
+			case c: Continuation.WithinAggregation => (c.out, c.agg)
+		}
+		new TopologyResults[R] {
+			override val varId: VarId = outVarId
+
+			override def notify(edge: EdgeId, value: Option[R]): IO[Unit] = {
+				// TODO: notify origin over GRPC
+				???
 			}
+
+			override def completeList(edge: EdgeId, values: List[R]): IO[Unit] =
+				notify(edge, Option.when(values.nonEmpty) {
+					(agg.asInstanceOf[Agg[R]]).merge(values)
+				})
+		}
+	}
+
+	def taskExecutor(interpreter: Interpreter)(using Log[IO]): TaskExecutor = new TaskExecutor {
+		override def continue(
+			task: TaskId,
+			topologyId: TopologyId,
+			afterNode: NodeId,
+			edge: EdgeId,
+			envs: PartitionBatch[Env],
+			origin: Origin,
+		): IO[Unit] = {
+			for {
+				topology <- IO.fromTry(topologies.get(topologyId))
+				continuation <- IO.fromTry(topology.continuationAfter(afterNode))
+				// TODO: we need the correct Agg instance!
+				// Can we derive it from afterNode?
+				results = remoteResults(topology, continuation, origin)
+				
+				newEdges <- envs.value.parTraverse { case (partitionId, envs) =>
+					for {
+						newEdge <- EdgeId.generate
+						partition <- get(task, partitionId)
+						_ <- partition.continue(origin, interpreter, topologyId, results, newEdge, continuation.nodes, envs)
+					} yield newEdge
+				}
+				_ <- results.notify(EdgeId.union(edge :: newEdges), None)
+			} yield ()
 		}
 	}
 
 	// TODO: only if we are currently leader for task
 	def get(task: TaskId, partition: PartitionId): IO[Partition] = {
 		if (metadata.taskFor(partition) === task) {
-			val newPartition = new Partition(partition, metadata, topologies)
+			val newPartition = new Partition(instance, metadata, topologies)
 			partitions.modify { map =>
 				map.get(partition) match {
 					case None => {
@@ -260,10 +298,8 @@ object InstancePartitions {
 	}
 }
 
-class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies: Topologies) {
+class Partition(instanceId: InstanceId, metadata: ClusterMetadata, topologies: Topologies) {
 	import Storage._
-	private val taskId = metadata.taskFor(partitionId)
-
 	private val idList = topologies.ids.toList
 
 	private val pstates: Map[String, PState] = {
@@ -284,65 +320,55 @@ class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies:
 		}
 	}.toMap
 
-	// Resource for an origin which is live until the resource is released
-	private def installResultsSink[R](dest: LocalTopologyResults[R]): Resource[IO, Origin] = {
+	// Run a topology over some values by installing its results into the global GRPC service until completion
+	private def runTopologyEval[R](
+		interpreter: Interpreter,
+		topologyId: TopologyId,
+		output: VarId,
+		agg: Agg[R],
+		start: EdgeId,
+		nodes: List[Node],
+		envs: List[Env],
+	)(using Log[IO]): IO[R] = {
 		// TODO: actually hook into the running GRPC interface to deliver incoming results
 		val acquire = for {
 			evalId <- EvalId.generate
-		} yield Origin(dest.topologyId, taskId, evalId)
+			results <- TopologyResults.local(output, agg, start)
+		} yield (Origin(instanceId, evalId), results)
 		
-		Resource.make(acquire)(_ => IO.unit)
+		val resource = Resource.make(acquire)(_ => IO.unit)
+		resource.use { case (origin, results) =>
+			// continue could throw (from user functions), so wrap it in IO.defer
+			val continue = this.continue(origin, interpreter, topologyId, results, start, nodes, envs)
+			IO.defer(continue).attempt.flatMap {
+				// TODO: how to apply backpressure if clients are not waiting?
+				case Right(_) => IO.unit
+
+				// One bad record must not stop the topology: Rama retries the record and
+				// keeps consuming. There is no retry here, so the failure is reported to
+				// whoever appended it and consumption continues.
+				case Left(e) => results.fail(e)
+			} *> results.await
+		}
 	}
 
 	def invoke[S, A, R](interpreter: Interpreter, q: QueryTopology[S, R], value: S)(using Log[IO]): IO[R] = {
-		val topology = q.topology
-		val env: Env = Map(topology.builder.input.vid -> value)
-		val startingEdge = topology.startingEdge
-
-		for {
-			results <- TopologyResults.local(topology, startingEdge)
-			result <- installResultsSink(results).use { origin =>
-				safeContinue(continue(origin, interpreter, results, startingEdge, topology.compiled._1, List(env)), results) *>
-					results.await
-			}
-		} yield result
-	}
-	
-	// TODO usage of this method is a mess, clean up
-	private def safeContinue[R](continue: => IO[Unit], results: LocalTopologyResults[R]) = {
-		IO.defer(continue).attempt.flatMap {
-			// TODO: how to apply backpressure if clients are not waiting?
-			case Right(_) => IO.unit
-
-			// One bad record must not stop the topology: Rama retries the record and
-			// keeps consuming. There is no retry here, so the failure is reported to
-			// whoever appended it and consumption continues.
-			case Left(e) => results.fail(e)
-		}
+		val t = q.topology
+		val env: Env = Map(t.builder.input.vid -> value)
+		runTopologyEval(interpreter, t.id, t.output.vid, t.agg, t.startingEdge, t.compiled._1, List(env))
 	}
 
 	// TODO: cancel running when this node no longer owns this partition
 	def run(interpreter: Interpreter)(using Log[IO]): IO[Nothing] = {
-		interpreter.topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { top =>
+		interpreter.topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { topology =>
 			// TODO: parallel? / chunks?
-			this.depots(top.builder.source.name).stream.foreach { record =>
-				val env = Map(top.input.vid -> record.value)
-				
+			this.depots(topology.builder.source.name).stream.foreach { record =>
+				val env = Map(topology.input.vid -> record.value)
 				for {
-					resultsOpt <- record.tracker.traverse(tracker => IO.fromTry(tracker.forTopology(top)))
+					resultsOpt <- record.tracker.traverse(tracker => IO.fromTry(tracker.forTopology(topology)))
 					// TODO: skip all this when results are not tracked
 					results = resultsOpt.getOrElse(???)
-					_ <- installResultsSink(results).use { origin =>
-						// `continue` runs the node list locally, but execution may continue on other nodes.
-						// It's not fully done until the tracker is complete.
-						//
-						// TODO: manage backpressure consistently, this currently backpressures only
-						// as long as the execution stays on the current node
-						safeContinue(
-							continue(origin, interpreter, results, top.startingEdge, top.compiled._1, List(env)),
-							results
-						) *> results.await
-					}
+					_ <- runTopologyEval(interpreter, topology.id, topology.output.vid, topology.agg, topology.startingEdge, topology.compiled._1, List(env))
 				} yield ()
 			}.compile.drain *> IO.raiseError(new RuntimeException("depot consume terminated"))
 		} *> IO.never
@@ -387,6 +413,7 @@ class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies:
 	private [corama] def continue[R](
 		origin: Origin,
 		interpreter: Interpreter,
+		topologyId: TopologyId,
 		results: TopologyResults[R],
 		edgeId: EdgeId,
 		nodes: List[Node],
@@ -394,7 +421,7 @@ class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies:
 	)(using Log[IO]): IO[Unit] = {
 		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
 			// supplies interpreter & results since those don't change
-			continue(origin, interpreter, results, nextEdgeId, nodes, envs)
+			continue(origin, interpreter, topologyId, results, nextEdgeId, nodes, envs)
 
 		import Node.DynamicOp
 		import Node.PStateOp
@@ -454,8 +481,7 @@ class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies:
 						val taskPartitions = metadata.partitionBatches(envs, env => env(in)).toList
 						taskPartitions.parTraverse { case (taskId, partitionedEnvs) =>
 							EdgeId.generate.flatMap { childEdge =>
-								// each partition is derived from the branchId
-								interpreter.router.continue(origin, taskId, node.id, childEdge, partitionedEnvs).as(childEdge)
+								interpreter.router.continue(taskId, topologyId, node.id, childEdge, partitionedEnvs, origin).as(childEdge)
 							}
 						}.flatMap { spawnedEdges =>
 							val closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))
@@ -464,21 +490,13 @@ class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies:
 					}
 
 					case Node.Combine(block, agg, collectFrom, out) => {
-						// TODO: create edges for each node
 						envs.parTraverse { env =>
 							// TODO: skip all the bookkeeping if there aren't any
 							// partition jumps in `block`?
-							for {
-								// TODO: is it confusing to reuse edgeId? The different evalId means
-								// they won't get mixed up
-								nestedResults <- TopologyResults.local(results.topology, edgeId)
-								result <- installResultsSink(nestedResults).use { origin =>
-									safeContinue(
-										continue(origin, interpreter, nestedResults, edgeId, block, List(env)),
-										nestedResults
-									) *> nestedResults.await
-								}
-							} yield env.updated(out, result)
+							// Note: reusing parent `edgeId` here, but there's no confusion because this is a new EvalId
+							runTopologyEval(interpreter, topologyId, out, agg, edgeId, block, List(env)).map { result =>
+								env.updated(out, result)
+							}
 						}.flatMap { outputEnvs =>
 							continueTopology(tail, outputEnvs)
 						}

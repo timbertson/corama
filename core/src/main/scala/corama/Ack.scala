@@ -72,11 +72,7 @@ object EdgeId {
 case class Notification[R](edge: EdgeId, result: Option[R])
 
 trait TopologyResults[R] {
-	val topology: Topology[?, R]
-
-	def varId: VarId = topology.compiled._2.vid
-
-	def topologyId: TopologyId = topology.id
+	val varId: VarId
 
 	def notify(edge: EdgeId, value: Option[R]): IO[Unit]
 
@@ -90,7 +86,8 @@ trait TopologyResults[R] {
  * This technique is based on https://storm.apache.org/releases/2.6.0/Acking-framework-implementation.html
  */
 private[corama] final class LocalTopologyResults[R](
-	val topology: Topology[?, R],
+	val varId: VarId,
+	agg: Agg[R],
 	log: Log[IO],
 	xorState: Ref[IO, Long],
 	acc: Ref[IO, R],
@@ -102,19 +99,19 @@ private[corama] final class LocalTopologyResults[R](
 	// and the new one is opened atomically)
 	def notify(edge: EdgeId, value: Option[R]) = {
 		for {
-			_ <- value.traverse_(value => acc.updateAndGet(x => topology.agg.combine(x, value)))
+			_ <- value.traverse_(value => acc.updateAndGet(x => agg.combine(x, value)))
 			xorValue <- xorState.updateAndGet(x => x ^ edge.id)
 			_ <- IO.whenA(xorValue === 0L) {
 				acc.get.flatMap(x => done.complete(Success(x))).flatMap { wasFirst =>
 					IO.whenA(!wasFirst) {
-						log.warn(s"Topology results for ${topology.id} returned more than once")
+						log.warn(s"results returned more than once")
 					}
 				}
 			}
 		} yield ()
 	}
 
-	def completeList(edge: EdgeId, values: List[R]) = notify(edge, Option.when(!values.isEmpty)(topology.agg.merge(values)))
+	def completeList(edge: EdgeId, values: List[R]) = notify(edge, Option.when(!values.isEmpty)(agg.merge(values)))
 
 	def fail(t: Throwable): IO[Unit] = done.complete(Failure(t)).void
 	
@@ -122,11 +119,11 @@ private[corama] final class LocalTopologyResults[R](
 }
 
 private [corama] object TopologyResults {
-	def local[R](topology: Topology[?, R], start: EdgeId)(using log: Log[IO]): IO[LocalTopologyResults[R]] = {
+	def local[R](out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): IO[LocalTopologyResults[R]] = {
 		for {
 			xorState <- Ref[IO].of(start.id)
-			acc <- Ref[IO].of(topology.agg.zero)
+			acc <- Ref[IO].of(agg.zero)
 			done <- Deferred[IO, Try[R]]
-		} yield new LocalTopologyResults(topology, log, xorState, acc, done)
+		} yield new LocalTopologyResults(out, agg, log, xorState, acc, done)
 	}
 }

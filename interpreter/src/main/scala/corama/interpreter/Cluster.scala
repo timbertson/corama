@@ -9,14 +9,11 @@ import corama.internal.*
 import corama.interpreter.Env
 import fs2.Stream
 
-import cats.effect.Resource
-
 case class PartitionBatch[A](value: List[(PartitionId, List[A])])
 
 case class Origin(
-	topologyId: TopologyId,
-	originTaskId: TaskId, // where acks must be routed
-	evalId: EvalId, // matches the specific append
+	instanceId: InstanceId,
+	evalId: EvalId, // unique key for this specific append / query root
 )
 
 /*
@@ -29,7 +26,14 @@ It's also implemented by the task router, in which case it finds the appropriate
 Execution continues *after* the provided nodeId, since that's trivial to provide & serialize.
 */
 trait TaskExecutor {
-	def continue(origin: Origin, task: TaskId, afterNode: NodeId, edge: EdgeId, envs: PartitionBatch[Env]): IO[Unit]
+	def continue(
+		task: TaskId,
+		topologyId: TopologyId,
+		afterNode: NodeId,
+		edge: EdgeId,
+		envs: PartitionBatch[Env],
+		origin: Origin,
+	): IO[Unit]
 }
 
 // EvalId is dynamically minted each time we perform a fanout or repartitioning
