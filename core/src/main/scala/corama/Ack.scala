@@ -1,10 +1,15 @@
 package corama
 
 import cats.syntax.all.*
-
+import cats.effect.std.Random
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
+import flogger.Log
+import cats.effect.IO
+import cats.effect.Ref
+import cats.effect.Deferred
+import flogger.IOLogging
 
 sealed trait AckLevel[R]
 
@@ -21,22 +26,20 @@ object AckLevel {
 }
 
 /** The ack returns from one depot append, keyed by the topology that produced each.
-  *
-  * Values arrive as a list per topology. TODO: these could be pre-combined with agg?
   */
 final class AckReturns private[corama] (
-	private val values: Map[TopologyId, List[Any]],
+	private val values: Map[TopologyId, Any],
 	private val topologies: Topologies) {
 
-	// Results are stored as type A, the aggregation. `mapOutput` is performed when the result is returned.
 	def result[S, R](stream: StreamTopology[S, R]): R = {
 		val t = stream.topology
 		require(
 			topologies.declared(t),
 			s"${t.builder.source} was not declared in the module this append went to")
 
-		val agg: Agg[R] = t.agg
-		values.getOrElse(t.builder.id, Nil).foldLeft(agg.zero)(agg.combineAny)
+		values.get(t.builder.id).map(_.asInstanceOf[R]).getOrElse(
+			throw new RuntimeException(s"no result recorded for topology ${t.id}")
+		)
 	}
 
 	def unique[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[T] = {
@@ -49,4 +52,81 @@ final class AckReturns private[corama] (
 	}
 
 	override def toString: String = s"AckReturns(${values.size})"
+}
+
+case class EdgeId(id: Long) {
+	// A single ID with parent & ID XOR'd can close the parent edge and atomically spawn a child edge
+	def xor(other: EdgeId) = EdgeId(id ^ other.id)
+}
+
+object EdgeId {
+	val empty = EdgeId(0L)
+
+	def generate(using rnd: Random[IO]): IO[EdgeId] = {
+		rnd.nextLong.map(apply)
+	}
+	
+	def union(ids: List[EdgeId]) = ids.foldLeft(empty)(_.xor(_))
+}
+
+case class Notification[R](edge: EdgeId, result: Option[R])
+
+trait TopologyResults[R] {
+	val topology: Topology[?, R]
+
+	def varId: VarId = topology.compiled._2.vid
+
+	def topologyId: TopologyId = topology.id
+
+	def notify(edge: EdgeId, value: Option[R]): IO[Unit]
+
+	def completeList(edge: EdgeId, values: List[R]): IO[Unit]
+}
+
+/* A tracker for a single topology & execution. Performs aggregation, and tracks the event tree.
+ * The tree is extended by xoring a (randomly generated) edge ID, and is complete when every edge extension
+ * is canceled out (i.e. the state returns to zero).
+ *
+ * This technique is based on https://storm.apache.org/releases/2.6.0/Acking-framework-implementation.html
+ */
+private[corama] final class LocalTopologyResults[R](
+	val topology: Topology[?, R],
+	log: Log[IO],
+	xorState: Ref[IO, Long],
+	acc: Ref[IO, R],
+	done: Deferred[IO, Try[R]],
+) extends TopologyResults[R] with IOLogging {
+
+	// NOTE: this can open a new edge, close an edge, or do _both_
+	// (by xoring an open edge with a new edge, the open one is closed
+	// and the new one is opened atomically)
+	def notify(edge: EdgeId, value: Option[R]) = {
+		for {
+			_ <- value.traverse_(value => acc.updateAndGet(x => topology.agg.combine(x, value)))
+			xorValue <- xorState.updateAndGet(x => x ^ edge.id)
+			_ <- IO.whenA(xorValue === 0L) {
+				acc.get.flatMap(x => done.complete(Success(x))).flatMap { wasFirst =>
+					IO.whenA(!wasFirst) {
+						log.warn(s"Topology results for ${topology.id} returned more than once")
+					}
+				}
+			}
+		} yield ()
+	}
+
+	def completeList(edge: EdgeId, values: List[R]) = notify(edge, Option.when(!values.isEmpty)(topology.agg.merge(values)))
+
+	def fail(t: Throwable): IO[Unit] = done.complete(Failure(t)).void
+	
+	def await: IO[R] = done.get.flatMap(IO.fromTry)
+}
+
+private [corama] object TopologyResults {
+	def local[R](topology: Topology[?, R], start: EdgeId)(using log: Log[IO]): IO[LocalTopologyResults[R]] = {
+		for {
+			xorState <- Ref[IO].of(start.id)
+			acc <- Ref[IO].of(topology.agg.zero)
+			done <- Deferred[IO, Try[R]]
+		} yield new LocalTopologyResults(topology, log, xorState, acc, done)
+	}
 }

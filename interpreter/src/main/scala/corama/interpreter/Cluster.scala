@@ -1,5 +1,6 @@
 package corama.interpreter
 
+import cats.effect.std.Random
 import cats.effect.IO
 import cats.effect.kernel.Ref
 import cats.syntax.all.*
@@ -8,9 +9,15 @@ import corama.internal.*
 import corama.interpreter.Env
 import fs2.Stream
 
-import scala.util.Random
+import cats.effect.Resource
 
 case class PartitionBatch[A](value: List[(PartitionId, List[A])])
+
+case class Origin(
+	topologyId: TopologyId,
+	originTaskId: TaskId, // where acks must be routed
+	evalId: EvalId, // matches the specific append
+)
 
 /*
 The executor receives partitioned continuations and routes them to the current leader.
@@ -22,7 +29,13 @@ It's also implemented by the task router, in which case it finds the appropriate
 Execution continues *after* the provided nodeId, since that's trivial to provide & serialize.
 */
 trait TaskExecutor {
-	def continue(task: TaskId, topology: TopologyId, afterNode: NodeId, envs: PartitionBatch[Env], sink: EvalSink): IO[Unit]
+	def continue(origin: Origin, task: TaskId, afterNode: NodeId, edge: EdgeId, envs: PartitionBatch[Env]): IO[Unit]
+}
+
+// EvalId is dynamically minted each time we perform a fanout or repartitioning
+case class EvalId(id: Long)
+object EvalId {
+	def generate(using rand: Random[IO]): IO[EvalId] = rand.nextLong.map(EvalId.apply)
 }
 
 case class Epoch(value: Long)
@@ -71,8 +84,8 @@ class ClusterMetadata(
 
 	def partitionKey(value: Any) = PartitionId(rawPartitionKey(value))
 
-	def randomPartition: PartitionId = {
-		PartitionId(Random.nextInt(numPartitions))
+	def randomPartition(using rnd: Random[IO]): IO[PartitionId] = {
+		rnd.nextIntBounded(numPartitions).map(PartitionId.apply)
 	}
 
 	// TODO make much better

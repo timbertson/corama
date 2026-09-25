@@ -1,11 +1,10 @@
 package corama.interpreter
 
+import cats.syntax.all.*
 import cats.data.NonEmptyList
 import cats.effect.IO
-import cats.effect.kernel.Deferred
 import cats.effect.kernel.Ref
 import cats.effect.unsafe
-import cats.syntax.all.*
 import corama.*
 import corama.error.Util.*
 import corama.internal.*
@@ -18,9 +17,8 @@ import org.tpolecat.sourcepos.SourcePos
 
 import scala.util.*
 import scala.util.control.NoStackTrace
-
-case class EvalId(id: Long)
-case class EvalSink(origin: InstanceId, id: EvalId)
+import flogger.*
+import cats.effect.Resource
 
 /**
 	* An environment is one *instance* of a topology execution, mapping vars to values.
@@ -81,67 +79,28 @@ object Storage {
 	*
 	* `tracker` is `None` for `emit`, where nobody is waiting.
 	*/
-private[corama] final case class Record(value: Any, tracker: Option[AckTracker])
+private[corama] final case class Record(value: Any, tracker: Option[TopologiesResults])
 
-/** Watches one append's event tree, and collects what its topologies ack return.
-	*
-	* The tree is tracked by counting: the append registers one pending slot per topology
-	* subscribed to the depot, each reports when its flow has run to completion, and the
-	* last one out completes the append.
-	*
-	* The count is fixed up front rather than incremented as topologies pick the record up.
-	*
-	* `PartitionAppend` deliberately does *not* extend the tree; TODO verify this matches
-	* rama's behaviour.
-	*/
-private[corama] final class AckTracker(
-	pending: Ref[IO, Int],
-	returns: Ref[IO, Map[TopologyId, List[Any]]],
-	done: Deferred[IO, Either[Throwable, Map[TopologyId, List[Any]]]]) {
+// Tracker for every topology spawned by a given depot append (or query)
+private[corama] final class TopologiesResults(results: Map[TopologyId, LocalTopologyResults[?]]) {
+	def forTopology[R](topology: Topology[?, R]): Try[LocalTopologyResults[R]] =
+		results.get(topology.id)
+			.toRight(err(s"TopologyResults(${topology.id}) not found")).toTry
+			.map(_.asInstanceOf[LocalTopologyResults[R]])
 
-	/** Add a value to the return set for a specific topology
-		*/
-	def ackReturn(topology: TopologyId, value: Any): IO[Unit] =
-		returns.update(m => m.updated(topology, m.getOrElse(topology, Nil) :+ value))
-
-	/** One topology finished; the last one out completes the append. */
-	def finish: IO[Unit] =
-		pending.updateAndGet(_ - 1).flatMap { remaining =>
-			if (remaining <= 0) returns.get.flatMap(r => done.complete(Right(r)).void) else IO.unit
-		}
-
-	/** A topology failed. Rama retries the record; here the append fails.
-	 * TODO reconsider this.
-	 */
-	def fail(err: Throwable): IO[Unit] = done.complete(Left(err)).void
-
-	def await: IO[Map[TopologyId, List[Any]]] = done.get.rethrow
+	def await: IO[Map[TopologyId, Any]] = results.toList.traverse { (id, results) =>
+		results.await.map(id -> _)
+	}.map(_.toMap)
 }
 
-/** An [[AckTracker]] with the identity of the topology reporting into it. */
-private[corama] final case class AckSink(topology: TopologyId, outVar: VarId, tracker: AckTracker) {
-	def addResults(envs: List[Env]) = {
-		envs.traverse_ { env =>
-			tracker.ackReturn(topology, env(outVar))
+private[corama] object TopologiesResults {
+	def apply(topologies: List[Topology[?, ?]])(using Log[IO]): IO[TopologiesResults] = {
+		topologies.traverse {
+			top => TopologyResults.local[top.Result](top, EdgeId.union(topologies.map(_.startingEdge))).map(top.id -> _)
+		}.map { topologyResults =>
+			new TopologiesResults(topologyResults.toMap)
 		}
 	}
-	def fail(err: Throwable): IO[Unit] = tracker.fail(err)
-	def finish: IO[Unit] = tracker.finish
-}
-
-private[corama] object AckTracker {
-
-	/** `subscribers` is how many topologies must report before the append completes.
-		* Zero means a depot nothing consumes, which completes immediately — the append is
-		* done once it is durable, since there is no event tree to wait for.
-		*/
-	def create(subscribers: Int): IO[AckTracker] =
-		for {
-			pending <- Ref.of[IO, Int](subscribers)
-			returns <- Ref.of[IO, Map[TopologyId, List[Any]]](Map.empty)
-			done		<- Deferred[IO, Either[Throwable, Map[TopologyId, List[Any]]]]
-			_				<- IO.whenA(subscribers == 0)(done.complete(Right(Map.empty)).void)
-		} yield new AckTracker(pending, returns, done)
 }
 
 class Interpreter(
@@ -151,17 +110,21 @@ class Interpreter(
 	val router: TaskExecutor
 ) {
 	import Interpreter._
-	def run: IO[Nothing] = {
+	def run(using Log[IO]): IO[Nothing] = {
 		instances.parTraverse_(_.run(this)) *> neverReached
 	}
 	
-	def running[A](block: IO[A]): IO[A] = {
+	def running[A](block: IO[A])(using Log[IO]): IO[A] = {
 		IO.race(block, run).map(_.merge)
+	}
+
+	private[interpreter] def leader(taskId: TaskId): IO[InstancePartitions] = {
+		IO.pure(instances(taskId.id))
 	}
 	
 	private[interpreter] def partition(partitionId: PartitionId): IO[Partition] = {
 		val taskId = metadata.taskFor(partitionId)
-		instances(taskId.id).get(taskId, partitionId)
+		leader(taskId).flatMap(_.get(taskId, partitionId))
 	}
 	
 	private def accessPath[V](pstate: corama.PState, path: NonEmptyList[Any]): IO[Storage.Lens[V]] =
@@ -185,23 +148,23 @@ class Interpreter(
 		// TODO use the depot's partitioning strategy
 		partition(metadata.partitionKey(value)).flatMap(_.emit(depot, value))
 
-	/** Topologies driven by this depot — the count an [[AckTracker]] waits for. */
+	/** Topologies driven by this depot — used to populate [[TopologiesResults]] */
 	private[corama] def subscribers(depot: Identity): List[Topology[?, ?]] =
 		topologies.topologies.filter(_.builder.source == depot)
 
-	def append[A, R](depot: corama.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack): IO[R] =
+	def append[A, R](depot: corama.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack)(using Log[IO]): IO[R] =
 		level match {
 			// TODO: these branches should differ when we model replication
-			case AckLevel.NoAck			=> emit(depot, value)
+			case AckLevel.NoAck => emit(depot, value)
 			case AckLevel.AppendAck => emit(depot, value)
 
 			case AckLevel.Ack =>
 				for {
-					tracker <- AckTracker.create(subscribers(depot.id).length)
+					results <- TopologiesResults(subscribers(depot.id))
 					// TODO use the depot's partitioning strategy
 					partition <- partition(metadata.partitionKey(value))
-					_				<- partition.append(depot, value, tracker)
-					raw			<- tracker.await
+					_ <- partition.spawn(depot, value, results)
+					raw <- results.await
 				} yield new AckReturns(raw, topologies)
 		}
 
@@ -212,17 +175,12 @@ class Interpreter(
 
 	/** Invoke a query topology, as a client would.
 		*/
-	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
-		val topology = q.topology
-		val env: Env = Map(topology.builder.input.vid -> value)
-		val agg = topology.agg
-		partition(metadata.randomPartition).flatMap { partition =>
-			partition.continue(this, topology.id, topology.compiled._1, List(env)).map { resultEnvs =>
-				resultEnvs.foldLeft(agg.zero) { (acc, resultEnv) =>
-					agg.combineAny(acc, resultEnv.getOrElse(topology.compiled._2.vid, throw new RuntimeException("output var not present in query result")))
-				}
-			}
-		}
+	def invoke[S, A, R](q: QueryTopology[S, R], value: S)(using Log[IO]): IO[R] = {
+		for {
+			partitionId <- metadata.randomPartition
+			partition <- partition(partitionId)
+			result <- partition.invoke(this, q, value)
+		} yield result
 	}
 }
 
@@ -249,13 +207,12 @@ class InstancePartitions(
 	metadata: ClusterMetadata,
 	partitions: Ref[IO, Map[PartitionId, Partition]]
 ) {
-	def taskExecutor(interpreter: Interpreter): TaskExecutor = new TaskExecutor {
-		def continue(task: TaskId, topology: TopologyId, afterNode: NodeId, envs: PartitionBatch[Env], sink: EvalSink): IO[Unit] = {
-			// TODO: capture node continuation
-			IO.fromTry(topologies.continuationAfter(topology, afterNode)).flatMap { nodes =>
+	def taskExecutor(interpreter: Interpreter)(using Log[IO]): TaskExecutor = new TaskExecutor {
+		override def continue(origin: Origin, task: TaskId, afterNode: NodeId, edge: EdgeId, envs: PartitionBatch[Env]): IO[Unit] = {
+			IO.fromTry(topologies.continuationAfter(origin.topologyId, afterNode)).flatMap { nodes =>
 				envs.value.parTraverse_ { case (partitionId, envs) =>
 					get(task, partitionId).flatMap { partition =>
-						partition.continue(interpreter, topology, nodes, envs, None /* TODO: sink */)
+						partition.continue(origin, interpreter, ???, edge, nodes, envs)
 					}
 				}
 			}
@@ -265,7 +222,7 @@ class InstancePartitions(
 	// TODO: only if we are currently leader for task
 	def get(task: TaskId, partition: PartitionId): IO[Partition] = {
 		if (metadata.taskFor(partition) === task) {
-			val newPartition = new Partition(metadata, topologies)
+			val newPartition = new Partition(partition, metadata, topologies)
 			partitions.modify { map =>
 				map.get(partition) match {
 					case None => {
@@ -280,7 +237,7 @@ class InstancePartitions(
 	}
 	
 	// TODO: respond /guard against changes in leadership
-	def run(interpreter: Interpreter) = {
+	def run(interpreter: Interpreter)(using Log[IO]) = {
 		metadata.leaders.get.flatMap { leaders =>
 			leaders.toList.mapFilter { case (task, leadership) =>
 				Option.when(leadership.instance === instance)(task)
@@ -303,8 +260,9 @@ object InstancePartitions {
 	}
 }
 
-class Partition(metadata: ClusterMetadata, topologies: Topologies) {
+class Partition(partitionId: PartitionId, metadata: ClusterMetadata, topologies: Topologies) {
 	import Storage._
+	private val taskId = metadata.taskFor(partitionId)
 
 	private val idList = topologies.ids.toList
 
@@ -325,32 +283,67 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 			None
 		}
 	}.toMap
+
+	// Resource for an origin which is live until the resource is released
+	private def installResultsSink[R](dest: LocalTopologyResults[R]): Resource[IO, Origin] = {
+		// TODO: actually hook into the running GRPC interface to deliver incoming results
+		val acquire = for {
+			evalId <- EvalId.generate
+		} yield Origin(dest.topologyId, taskId, evalId)
+		
+		Resource.make(acquire)(_ => IO.unit)
+	}
+
+	def invoke[S, A, R](interpreter: Interpreter, q: QueryTopology[S, R], value: S)(using Log[IO]): IO[R] = {
+		val topology = q.topology
+		val env: Env = Map(topology.builder.input.vid -> value)
+		val startingEdge = topology.startingEdge
+
+		for {
+			results <- TopologyResults.local(topology, startingEdge)
+			result <- installResultsSink(results).use { origin =>
+				safeContinue(continue(origin, interpreter, results, startingEdge, topology.compiled._1, List(env)), results) *>
+					results.await
+			}
+		} yield result
+	}
 	
+	// TODO usage of this method is a mess, clean up
+	private def safeContinue[R](continue: => IO[Unit], results: LocalTopologyResults[R]) = {
+		IO.defer(continue).attempt.flatMap {
+			// TODO: how to apply backpressure if clients are not waiting?
+			case Right(_) => IO.unit
+
+			// One bad record must not stop the topology: Rama retries the record and
+			// keeps consuming. There is no retry here, so the failure is reported to
+			// whoever appended it and consumption continues.
+			case Left(e) => results.fail(e)
+		}
+	}
+
 	// TODO: cancel running when this node no longer owns this partition
-	def run(interpreter: Interpreter): IO[Nothing] = {
+	def run(interpreter: Interpreter)(using Log[IO]): IO[Nothing] = {
 		interpreter.topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { top =>
+			// TODO: parallel? / chunks?
 			this.depots(top.builder.source.name).stream.foreach { record =>
-				// TODO: chunks?
 				val env = Map(top.input.vid -> record.value)
-				val ack = record.tracker.map(tracker => AckSink(top.builder.id, top.compiled._2.vid, tracker))
-
-				// `continue` returning means the whole event tree for this record is
-				// exhausted — every fanned-out branch, on every partition it reached.
-				// `IO.defer` ensures exceptions in user functions (like each) don't escape.
-				IO.defer(continue(interpreter, top.id, top.compiled._1, List(env), ack)).void.attempt.flatMap {
-					case Right(_) => record.tracker.traverse_(_.finish)
-
-					// One bad record must not stop the topology: Rama retries the record and
-					// keeps consuming. There is no retry here, so the failure is reported to
-					// whoever appended it and consumption continues.
-					case Left(e) =>
-						record.tracker match {
-							case Some(tracker) => tracker.fail(e)
-							// Nobody is waiting, so swallowing would lose the error entirely.
-							// Failing `run` is better than silently discarding
-							case None => IO.raiseError(e)
-						}
-				}
+				
+				for {
+					resultsOpt <- record.tracker.traverse(tracker => IO.fromTry(tracker.forTopology(top)))
+					// TODO: skip all this when results are not tracked
+					results = resultsOpt.getOrElse(???)
+					_ <- installResultsSink(results).use { origin =>
+						// `continue` runs the node list locally, but execution may continue on other nodes.
+						// It's not fully done until the tracker is complete.
+						//
+						// TODO: manage backpressure consistently, this currently backpressures only
+						// as long as the execution stays on the current node
+						safeContinue(
+							continue(origin, interpreter, results, top.startingEdge, top.compiled._1, List(env)),
+							results
+						) *> results.await
+					}
+				} yield ()
 			}.compile.drain *> IO.raiseError(new RuntimeException("depot consume terminated"))
 		} *> IO.never
 	}
@@ -367,9 +360,11 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 		this.depot(depot.id.name).inner.update(vec => vec.appended(Record(value, None)))
 	}
 
-	/** As `emit`, but the record carries a tracker for the topologies it will trigger. */
-	def append[A](depot: corama.Depot[A], value: A, tracker: AckTracker): IO[Unit] = {
-		this.depot(depot.id.name).inner.update(vec => vec.appended(Record(value, Some(tracker))))
+	/** As `emit`, but with ack tracking */
+	def spawn[A](depot: corama.Depot[A], value: A, tracker: TopologiesResults): IO[Unit] = {
+		this.depot(depot.id.name).inner.update { vec =>
+			vec.appended(Record(value, Some(tracker)))
+		}
 	}
 
 	def readDepot[A](depot: corama.Depot[A]): IO[Vector[A]] = {
@@ -387,34 +382,26 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 		}
 	}
 
-
-	/** Runs a list of nodes with the given envs. Returns the resulting list of envs.
-		*
-		* `ack` is where `Node.AckReturn` reports, and is `None` for a query or for a record
-		* appended with `emit` — nobody is waiting on either. It is passed along untouched
-		* everywhere else, including across a partition hop, since Rama routes an ack return
-		* to the *appender* rather than to the task that produced it.
+	/** Runs a list of nodes with the given envs. Results are returned to `results`.
 		*/
-	private [corama] def continue(
+	private [corama] def continue[R](
+		origin: Origin,
 		interpreter: Interpreter,
-		topologyId: TopologyId,
+		results: TopologyResults[R],
+		edgeId: EdgeId,
 		nodes: List[Node],
 		envs: List[Env],
-		ack: Option[AckSink] = None
-	): IO[List[Env]] = {
-		def continueTopology(nodes: List[Node], envs: List[Env], ack: Option[AckSink]) =
-			// supplies interpreter & topologyId since those don't change
-			continue(interpreter, topologyId, nodes, envs, ack)
+	)(using Log[IO]): IO[Unit] = {
+		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
+			// supplies interpreter & results since those don't change
+			continue(origin, interpreter, results, nextEdgeId, nodes, envs)
 
 		import Node.DynamicOp
 		import Node.PStateOp
 
 		nodes match {
-			case Nil => {
-				ack.traverse_ { sink =>
-					sink.addResults(envs)
-				}.as(envs)
-			}
+			case Nil =>
+				results.completeList(edgeId, envs.map(_(results.varId).asInstanceOf[R]))
 			
 			case node :: tail => {
 				node.op match {
@@ -439,40 +426,61 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 						} catch {
 							case e => throw new EvalError(s"Error evaluating node", pos, e)
 						}
-						continueTopology(tail, results, ack)
+						continueTopology(tail, results)
 					}
 
 					case Node.Assign(in, out) =>
 						continueTopology(tail, envs.map { env =>
 							env.updated(out, env(in))
-						}, ack)
+						})
 
 					case Node.If(cond, ifBranch, elseBranch, out) =>
-						envs.flatTraverse { env =>
+						// TODO: I don't think we can break up envs like this! Need to statically extend execution tree.
+						// TODO: is single-exec batching even useful? We should batch multiple appends instead
+						envs.traverse_ { env =>
 							if (env(cond).asInstanceOf[Boolean]) {
-								continueTopology(ifBranch ++ tail, List(env), ack)
+								continueTopology(ifBranch ++ tail, List(env))
 							} else {
-								continueTopology(elseBranch ++ tail, List(env), ack)
+								continueTopology(elseBranch ++ tail, List(env))
 							}
 						}
 
 					case Node.Partition(in) => {
-						// todo: parallel, but we shouldn't be returning the envs from here
-						metadata.partitionBatches(envs, env => env(in)).toList.flatTraverse { case (taskId, partitionedEnvs) =>
-							interpreter.router.continue(taskId, topologyId, node.id, partitionedEnvs, ???).void.as(Nil /* TODO */)
+						/*
+						A partition node fans out to multiple partitions. These child edges are
+						started in parallel. The result notification of this edge being complete is
+						combined (via xor) with the opening of all fanout edges at once.
+						*/
+						val taskPartitions = metadata.partitionBatches(envs, env => env(in)).toList
+						taskPartitions.parTraverse { case (taskId, partitionedEnvs) =>
+							EdgeId.generate.flatMap { childEdge =>
+								// each partition is derived from the branchId
+								interpreter.router.continue(origin, taskId, node.id, childEdge, partitionedEnvs).as(childEdge)
+							}
+						}.flatMap { spawnedEdges =>
+							val closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))
+							results.notify(closeOriginAndOpenChildren, None)
 						}
 					}
 
 					case Node.Combine(block, agg, collectFrom, out) => {
-						envs.traverse { env =>
-							// TODO: this doesn't work across instances
-							continueTopology(block, List(env), ack).map { innerEnvs =>
-								env.updated(out, innerEnvs.foldLeft(agg.zero) { (acc, innerEnv) =>
-									agg.combineAny(acc, innerEnv(collectFrom))
-								})
-							}
+						// TODO: create edges for each node
+						envs.parTraverse { env =>
+							// TODO: skip all the bookkeeping if there aren't any
+							// partition jumps in `block`?
+							for {
+								// TODO: is it confusing to reuse edgeId? The different evalId means
+								// they won't get mixed up
+								nestedResults <- TopologyResults.local(results.topology, edgeId)
+								result <- installResultsSink(nestedResults).use { origin =>
+									safeContinue(
+										continue(origin, interpreter, nestedResults, edgeId, block, List(env)),
+										nestedResults
+									) *> nestedResults.await
+								}
+							} yield env.updated(out, result)
 						}.flatMap { outputEnvs =>
-							continueTopology(tail, outputEnvs, ack)
+							continueTopology(tail, outputEnvs)
 						}
 					}
 					
@@ -514,7 +522,7 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 							}
 							state.modify(rawPath)(applyOp)
 						}.flatMap { updatedEnvs =>
-							continueTopology(tail, updatedEnvs, ack)
+							continueTopology(tail, updatedEnvs)
 						}
 
 					case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
@@ -528,7 +536,7 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 							}
 							state.modify(rawPath)(applyOp)
 						}.flatMap { _ =>
-							continueTopology(tail, envs, ack)
+							continueTopology(tail, envs)
 						}
 
 					case Node.LocalAppend(dep, value) =>
@@ -538,10 +546,9 @@ class Partition(metadata: ClusterMetadata, topologies: Topologies) {
 							// `None`: the new record starts its own event tree rather than extending
 							// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
 							state.inner.update(_.appended(Record(v, None)))
-						} *> continueTopology(tail, envs, ack)
-				}
+						} *> continueTopology(tail, envs)
 				}
 			}
-
+		}
 	}
 }

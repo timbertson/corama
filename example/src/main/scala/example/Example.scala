@@ -4,8 +4,7 @@ import corama._
 import corama.interpreter.Interpreter
 import cats.syntax.all._
 import cats.effect._
-import java.lang.{Long => JLong}
-import corama.interpreter.ClusterMetadata
+import flogger.Log
 
 /** A slice of `example.HelloWorldModule` rewritten in [[Flow]], as an API check.
   *
@@ -18,6 +17,7 @@ import corama.interpreter.ClusterMetadata
   * is invisible in the types. Here the same shape typechecks, and `Interp` runs it.
   */
 object Example extends IOApp {
+	implicit val log: Log[IO] = Log.empty
 
 	case class Ticket(id: Long, requester: String, description: String)
 	case class FullTicket(ticket: Ticket, assignee: Option[Long])
