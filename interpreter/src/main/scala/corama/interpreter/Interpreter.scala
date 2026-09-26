@@ -9,17 +9,14 @@ import corama.internal.*
 import corama.interpreter.Env
 import izumi.reflect.Tag
 
-import scala.util.*
 import flogger.*
 import cats.effect.Resource
 import cats.effect.kernel.Deferred
 
 class Interpreter(
 	val topologies: Topologies,
-	// val router: ClusterRouter,
 	metadata: ClusterMetadata,
 	val getInstances: IO[Vector[ClusterInstance]]
-	// val instances: IO[Vector[ClusterInstance]],
 )(using Log[IO]) extends Router {
 	import Interpreter._
 
@@ -54,10 +51,10 @@ class Interpreter(
 	def access[V: Tag](pstate: corama.PState, root: Any, path: Any*): IO[Storage.Lens[V]] =
 		accessPath[V](pstate, NonEmptyList(root, path.toList))
 
-	// def getKeys[K, V](pstate: corama.PStateKV[K, V]): IO[Set[K]] =
-	// 	this.partitions.all.flatTraverse { partition =>
-	// 		partition.getKeys(pstate).map(_.toList)
-	// 	}.map(_.toSet)
+	def getKeys[K, V](pstate: corama.PStateKV[K, V]): IO[Set[K]] =
+		metadata.allPartitions.toList.flatTraverse { partitionId =>
+			partition(partitionId).flatMap(_.getKeys(pstate).map(_.toList))
+		}.map(_.toSet)
 
 	def emit[A](depot: corama.Depot[A], value: A): IO[Unit] =
 		// TODO use the depot's partitioning strategy
@@ -83,10 +80,10 @@ class Interpreter(
 				} yield new AckReturns(raw, topologies)
 		}
 
-	// def readDepot[A](depot: corama.Depot[A]): IO[Vector[A]] =
-	// 	this.partitions.all.toVector.flatTraverse { partition =>
-	// 		partition.readDepot(depot)
-	// 	}
+	def readDepot[A](depot: corama.Depot[A]): IO[Vector[A]] =
+		metadata.allPartitions.toVector.flatTraverse { partitionId =>
+			partition(partitionId).flatMap(_.readDepot(depot))
+		}
 
 	/** Invoke a query topology, as a client would.
 		*/
@@ -142,13 +139,14 @@ object Interpreter {
 				.flatMap(metadata => apply(topologies, metadata).resource)
 		)
 
-	def apply(topologies: Topologies, metadata: ClusterMetadata)(using Log[IO]): ActiveResource[IO, Interpreter] = {
+	def apply(topologies: Topologies, metadata: ClusterMetadata)(using baseLog: Log[IO]): ActiveResource[IO, Interpreter] = {
 		ActiveResource(for {
 			instancesRef <- Resource.eval(Deferred[IO, Vector[ClusterInstance]])
 			interpreter = new Interpreter(topologies, metadata, instancesRef.get)
 			clusterInstances <- metadata.instances.traverse { instance =>
 				EvalReceivers(instance).flatMap { receivers =>
-					Resource.eval(ClusterInstance(instance, topologies, metadata, interpreter, receivers))
+					val log = baseLog.addContext("instance" -> instance.id)
+					Resource.eval(ClusterInstance(instance, topologies, metadata, interpreter, receivers, log))
 				}
 			}
 			_ <- Resource.eval(instancesRef.complete(clusterInstances))

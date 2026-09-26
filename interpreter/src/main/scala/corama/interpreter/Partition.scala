@@ -15,9 +15,12 @@ class Partition(
 	receivers: EvalReceivers,
 	metadata: ClusterMetadata,
 	topologies: Topologies,
-	taskRouter: TaskRouter
-) {
+	taskRouter: TaskRouter,
+	log: Log[IO],
+) extends IOLogging {
 	import Storage._
+	given Log[IO] = log
+
 	private val idList = topologies.ids.toList
 
 	private val pstates: Map[String, PState] = {
@@ -46,13 +49,12 @@ class Partition(
 		start: EdgeId,
 		nodes: List[Node],
 		envs: List[Env],
-	)(using Log[IO]): IO[R] = {
+	): IO[R] = {
 		EvalSink.local(output, agg, start).flatMap { results =>
 			// install into GRPC listener so other partitions can send results
 			receivers.addRunning(results) { origin =>
 				// continue could throw (from user functions), so wrap it in IO.defer
-				val continue = this.continue(origin, topologyId, results, start, nodes, envs)
-				IO.defer(continue).attempt.flatMap {
+				this.continue(origin, topologyId, results, start, nodes, envs).attempt.flatMap {
 					// TODO: how to apply backpressure if clients are not waiting?
 					case Right(_) => IO.unit
 
@@ -65,14 +67,14 @@ class Partition(
 		}
 	}
 
-	def invoke[S, A, R](q: QueryTopology[S, R], value: S)(using Log[IO]): IO[R] = {
+	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
 		val t = q.topology
 		val env: Env = Map(t.builder.input.vid -> value)
 		runTopologyEval(t.id, t.output.vid, t.agg, EdgeId.startingEdge(t.id), t.compiled._1, List(env))
 	}
 
 	// TODO: cancel running when this node no longer owns this partition
-	def run(using Log[IO]): IO[Nothing] = {
+	def run: IO[Nothing] = {
 		topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { topology =>
 			// TODO: parallel? / chunks?
 			this.depots(topology.builder.source.name).stream.foreach { record =>
@@ -122,8 +124,6 @@ class Partition(
 		}
 	}
 
-	/** Runs a list of nodes with the given envs. Results are returned to `results`.
-		*/
 	private [corama] def continue[R](
 		origin: Origin,
 		topologyId: TopologyId,
@@ -131,10 +131,34 @@ class Partition(
 		edgeId: EdgeId,
 		nodes: List[Node],
 		envs: List[Env],
-	)(using Log[IO]): IO[Unit] = {
+	): IO[Unit] = {
+		// TODO: skip if not debug?
+		val continueLog = log.addContext(
+			"origin" -> origin.instanceId.id,
+			"evalId" -> origin.evalId.toString(),
+			"topology" -> topologyId.value.toString(),
+			"edge" -> edgeId.id.toString(),
+		)
+		val continue = continueLog.debug("Continuing computation") *>
+			this.continueInner(origin, topologyId, evalSink, edgeId, nodes, envs, continueLog)
+
+		IO.defer(continue)
+	}
+
+	/** Runs a list of nodes with the given envs. Results are returned to `results`.
+		*/
+	private def continueInner[R](
+		origin: Origin,
+		topologyId: TopologyId,
+		evalSink: EvalSink[R],
+		edgeId: EdgeId,
+		nodes: List[Node],
+		envs: List[Env],
+		log: Log[IO],
+	): IO[Unit] = {
 		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
-			// supplies evalSink since those don't change
-			continue(origin, topologyId, evalSink, nextEdgeId, nodes, envs)
+			// supplies origin / topology / evalSink since those don't change
+			continueInner(origin, topologyId, evalSink, nextEdgeId, nodes, envs, log)
 
 		import Node.DynamicOp
 		import Node.PStateOp

@@ -44,7 +44,7 @@ class ClusterMetadata(
 	def instanceFor(taskId: TaskId): InstanceId = instances(taskId.id)
 	def add(taskId: TaskId, diff: Int): TaskId = TaskId(wrapTaskIndex(taskId.id + diff))
 	
-	private def allPartitions = (0 until numPartitions).map(PartitionId.apply)
+	def allPartitions = (0 until numPartitions).map(PartitionId.apply)
 
 	def partitionsIn(task: TaskId): List[PartitionId] = {
 		allPartitions.filter(p => taskFor(p) === task).toList
@@ -107,4 +107,3 @@ object ClusterMetadata {
 trait Follower {
 	def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck]
 }
-

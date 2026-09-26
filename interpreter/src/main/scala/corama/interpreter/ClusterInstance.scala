@@ -19,9 +19,9 @@ class ClusterInstance(
 	metadata: ClusterMetadata,
 	val receivers: EvalReceivers,
 	router: Router,
-	partitions: Ref[IO, Map[PartitionId, Partition]]
+	partitions: Ref[IO, Map[PartitionId, Partition]],
+	log: Log[IO],
 ) {
-
 	def continue(
 		task: TaskId,
 		topologyId: TopologyId,
@@ -29,7 +29,7 @@ class ClusterInstance(
 		edge: EdgeId,
 		envs: PartitionBatch[Env],
 		origin: Origin,
-	)(using Log[IO]): IO[Unit] = {
+	): IO[Unit] = {
 		for {
 			topology <- IO.fromTry(topologies.get(topologyId))
 			continuation <- IO.fromTry(topology.continuationAfter(afterNode))
@@ -38,6 +38,7 @@ class ClusterInstance(
 				for {
 					newEdge <- EdgeId.generate
 					partition <- get(task, partitionId)
+					// TODO: continuing can throw, where does that go?
 					_ <- partition.continue(origin, topologyId, results, newEdge, continuation.nodes, envs)
 				} yield newEdge
 			}
@@ -48,7 +49,7 @@ class ClusterInstance(
 	// TODO: only if we are currently leader for task
 	def get(task: TaskId, partition: PartitionId): IO[Partition] = {
 		if (metadata.taskFor(partition) === task) {
-			val newPartition = new Partition(receivers, metadata, topologies, router)
+			val newPartition = new Partition(receivers, metadata, topologies, router, log.addContext("partition" -> partition.id.toString))
 			partitions.modify { map =>
 				map.get(partition) match {
 					case None => {
@@ -63,7 +64,7 @@ class ClusterInstance(
 	}
 	
 	// TODO: respond /guard against changes in leadership
-	def run(using Log[IO]) = {
+	def run = {
 		metadata.leaders.get.flatMap { leaders =>
 			leaders.toList.mapFilter { case (task, leadership) =>
 				Option.when(leadership.instance === instance)(task)
@@ -83,8 +84,9 @@ object ClusterInstance {
 		metadata: ClusterMetadata,
 		router: Router,
 		receivers: EvalReceivers,
+		log: Log[IO],
 	) = Ref[IO].of(Map.empty[PartitionId, Partition]).map { partitionMap =>
-		new ClusterInstance(instance, topologies, metadata, receivers, router, partitionMap)
+		new ClusterInstance(instance, topologies, metadata, receivers, router, partitionMap, log)
 	}
 }
 
