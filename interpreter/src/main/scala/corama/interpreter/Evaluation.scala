@@ -19,7 +19,6 @@ import scala.util.*
 import scala.util.control.NoStackTrace
 import flogger.*
 import cats.effect.Resource
-import scala.annotation.unused
 
 /**
 	* An environment is one *instance* of a topology execution, mapping vars to values.
@@ -109,16 +108,15 @@ class Interpreter(
 	val topologies: Topologies,
 	metadata: ClusterMetadata,
 	val instances: Vector[InstancePartitions],
-	val router: TaskExecutor
-) {
+)(using Log[IO]) {
 	import Interpreter._
-	def run(using Log[IO]): IO[Nothing] = {
+	val run: IO[Nothing] = {
 		instances.parTraverse_(_.run(this)) *> neverReached
 	}
 	
-	def running[A](block: IO[A])(using Log[IO]): IO[A] = {
-		IO.race(block, run).map(_.merge)
-	}
+	// def running[A](block: IO[A])(using Log[IO]): IO[A] = {
+	// 	IO.race(block, run).map(_.merge)
+	// }
 
 	private[interpreter] def leader(taskId: TaskId): IO[InstancePartitions] = {
 		IO.pure(instances(taskId.id))
@@ -127,6 +125,10 @@ class Interpreter(
 	private[interpreter] def partition(partitionId: PartitionId): IO[Partition] = {
 		val taskId = metadata.taskFor(partitionId)
 		leader(taskId).flatMap(_.get(taskId, partitionId))
+	}
+
+	private[interpreter] def instance(instanceId: InstanceId): IO[InstancePartitions] = {
+		IO.fromEither(instances.find(_.instance === instanceId).toRight(err(s"Unknown instance: $instanceId")))
 	}
 	
 	private def accessPath[V](pstate: corama.PState, path: NonEmptyList[Any]): IO[Storage.Lens[V]] =
@@ -184,6 +186,45 @@ class Interpreter(
 			result <- partition.invoke(this, q, value)
 		} yield result
 	}
+
+	val taskExecutor: TaskExecutor = {
+		val interpreter = this
+		new TaskExecutor {
+			override def continue(
+				task: TaskId,
+				topologyId: TopologyId,
+				afterNode: NodeId,
+				edge: EdgeId,
+				envs: PartitionBatch[Env],
+				origin: Origin,
+			): IO[Unit] = {
+				// TODO seems inefficient
+				leader(task).flatMap(_.taskExecutor(interpreter).continue(task, topologyId, afterNode, edge, envs, origin))
+			}
+		}
+	}
+
+	val router: ResultsRouter = new ResultsRouter {
+		def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin): TopologyResults[R] = {
+			val (outVarId, agg) = continuation match {
+				case _: Continuation.Basic => (topology.output.vid, topology.agg)
+				case c: Continuation.WithinAggregation => (c.out, c.agg)
+			}
+
+			new TopologyResults[R] {
+				override val varId: VarId = outVarId
+
+				override def notify(edge: EdgeId, value: Option[R]): IO[Unit] = {
+					instance(origin.instanceId).flatMap(_.receivers.invoke(origin, edge, value))
+				}
+
+				override def completeList(edge: EdgeId, values: List[R]): IO[Unit] =
+					notify(edge, Option.when(values.nonEmpty) {
+						(agg.asInstanceOf[Agg[R]]).merge(values)
+					})
+			}
+		}
+	}
 }
 
 object Interpreter {
@@ -191,43 +232,32 @@ object Interpreter {
 		topologies: Topologies,
 		instances: Vector[InstanceId],
 		numPartitions: Int,
-	) = ClusterMetadata(instances, numPartitions).flatMap(metadata => apply(topologies, metadata))
+	)(using Log[IO]): ActiveResource[IO, Interpreter] =
+		ActiveResource(
+			Resource.eval(ClusterMetadata(instances, numPartitions))
+				.flatMap(metadata => apply(topologies, metadata).resource)
+		)
 
-	def apply(topologies: Topologies, metadata: ClusterMetadata) = {
-		metadata.instances.traverse { instance =>
-			InstancePartitions(instance, topologies, metadata)
+	def apply(topologies: Topologies, metadata: ClusterMetadata)(using Log[IO]): ActiveResource[IO, Interpreter] = {
+		ActiveResource(metadata.instances.traverse { instance =>
+			EvalReceivers(instance).flatMap { receivers =>
+				Resource.eval(InstancePartitions(instance, topologies, metadata, receivers))
+			}
 		}.map { instancePartitions =>
-			new Interpreter(topologies, metadata, instancePartitions, ???)
-		}
+			val interpreter = new Interpreter(topologies, metadata, instancePartitions)
+			(interpreter, interpreter.run)
+		})
 	}
 }
 
 // The partitions this instance is leader for
 class InstancePartitions(
-	instance: InstanceId,
+	val instance: InstanceId,
 	topologies: Topologies,
 	metadata: ClusterMetadata,
+	val receivers: EvalReceivers,
 	partitions: Ref[IO, Map[PartitionId, Partition]]
 ) {
-	private def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, @unused origin: Origin) = {
-		val (outVarId, agg) = continuation match {
-			case _: Continuation.Basic => (topology.output.vid, topology.agg)
-			case c: Continuation.WithinAggregation => (c.out, c.agg)
-		}
-		new TopologyResults[R] {
-			override val varId: VarId = outVarId
-
-			override def notify(edge: EdgeId, value: Option[R]): IO[Unit] = {
-				// TODO: notify origin over GRPC
-				???
-			}
-
-			override def completeList(edge: EdgeId, values: List[R]): IO[Unit] =
-				notify(edge, Option.when(values.nonEmpty) {
-					(agg.asInstanceOf[Agg[R]]).merge(values)
-				})
-		}
-	}
 
 	def taskExecutor(interpreter: Interpreter)(using Log[IO]): TaskExecutor = new TaskExecutor {
 		override def continue(
@@ -241,10 +271,7 @@ class InstancePartitions(
 			for {
 				topology <- IO.fromTry(topologies.get(topologyId))
 				continuation <- IO.fromTry(topology.continuationAfter(afterNode))
-				// TODO: we need the correct Agg instance!
-				// Can we derive it from afterNode?
-				results = remoteResults(topology, continuation, origin)
-				
+				results = interpreter.router.remoteResults(topology, continuation, origin)
 				newEdges <- envs.value.parTraverse { case (partitionId, envs) =>
 					for {
 						newEdge <- EdgeId.generate
@@ -260,7 +287,7 @@ class InstancePartitions(
 	// TODO: only if we are currently leader for task
 	def get(task: TaskId, partition: PartitionId): IO[Partition] = {
 		if (metadata.taskFor(partition) === task) {
-			val newPartition = new Partition(instance, metadata, topologies)
+			val newPartition = new Partition(receivers, metadata, topologies)
 			partitions.modify { map =>
 				map.get(partition) match {
 					case None => {
@@ -293,12 +320,13 @@ object InstancePartitions {
 		instance: InstanceId,
 		topologies: Topologies,
 		metadata: ClusterMetadata,
+		receivers: EvalReceivers,
 	) = Ref[IO].of(Map.empty[PartitionId, Partition]).map { partitionMap =>
-		new InstancePartitions(instance, topologies, metadata, partitionMap)
+		new InstancePartitions(instance, topologies, metadata, receivers, partitionMap)
 	}
 }
 
-class Partition(instanceId: InstanceId, metadata: ClusterMetadata, topologies: Topologies) {
+class Partition(receivers: EvalReceivers, metadata: ClusterMetadata, topologies: Topologies) {
 	import Storage._
 	private val idList = topologies.ids.toList
 
@@ -330,25 +358,21 @@ class Partition(instanceId: InstanceId, metadata: ClusterMetadata, topologies: T
 		nodes: List[Node],
 		envs: List[Env],
 	)(using Log[IO]): IO[R] = {
-		// TODO: actually hook into the running GRPC interface to deliver incoming results
-		val acquire = for {
-			evalId <- EvalId.generate
-			results <- TopologyResults.local(output, agg, start)
-		} yield (Origin(instanceId, evalId), results)
-		
-		val resource = Resource.make(acquire)(_ => IO.unit)
-		resource.use { case (origin, results) =>
-			// continue could throw (from user functions), so wrap it in IO.defer
-			val continue = this.continue(origin, interpreter, topologyId, results, start, nodes, envs)
-			IO.defer(continue).attempt.flatMap {
-				// TODO: how to apply backpressure if clients are not waiting?
-				case Right(_) => IO.unit
+		TopologyResults.local(output, agg, start).flatMap { results =>
+			// install into GRPC listener so other partitions can send results
+			receivers.addRunning(results) { origin =>
+				// continue could throw (from user functions), so wrap it in IO.defer
+				val continue = this.continue(origin, interpreter, topologyId, results, start, nodes, envs)
+				IO.defer(continue).attempt.flatMap {
+					// TODO: how to apply backpressure if clients are not waiting?
+					case Right(_) => IO.unit
 
-				// One bad record must not stop the topology: Rama retries the record and
-				// keeps consuming. There is no retry here, so the failure is reported to
-				// whoever appended it and consumption continues.
-				case Left(e) => results.fail(e)
-			} *> results.await
+					// One bad record must not stop the topology: Rama retries the record and
+					// keeps consuming. There is no retry here, so the failure is reported to
+					// whoever appended it and consumption continues.
+					case Left(e) => results.fail(e)
+				} *> results.await
+			}
 		}
 	}
 
@@ -481,7 +505,7 @@ class Partition(instanceId: InstanceId, metadata: ClusterMetadata, topologies: T
 						val taskPartitions = metadata.partitionBatches(envs, env => env(in)).toList
 						taskPartitions.parTraverse { case (taskId, partitionedEnvs) =>
 							EdgeId.generate.flatMap { childEdge =>
-								interpreter.router.continue(taskId, topologyId, node.id, childEdge, partitionedEnvs, origin).as(childEdge)
+								interpreter.taskExecutor.continue(taskId, topologyId, node.id, childEdge, partitionedEnvs, origin).as(childEdge)
 							}
 						}.flatMap { spawnedEdges =>
 							val closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))

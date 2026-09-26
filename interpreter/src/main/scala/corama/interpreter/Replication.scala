@@ -90,6 +90,7 @@ case class ActiveResource[F[_], A](resource: Resource[F, (A, F[Nothing])])(impli
 
 	def map[B](f: A => B): ActiveResource[F, B] = ActiveResource(resource.map { case (a, task) => (f(a), task) })
 }
+// TODO: build algebras for activeresource
 
 case class LeaderConfig(
 	maxBatchSize: Int, // currently an update count, but maybe a byte size eventually

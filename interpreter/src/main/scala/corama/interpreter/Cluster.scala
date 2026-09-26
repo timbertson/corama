@@ -8,6 +8,9 @@ import corama.*
 import corama.internal.*
 import corama.interpreter.Env
 import fs2.Stream
+import cats.effect.std.Queue
+import cats.effect.kernel.Resource
+import corama.error.Util.err
 
 case class PartitionBatch[A](value: List[(PartitionId, List[A])])
 
@@ -34,6 +37,11 @@ trait TaskExecutor {
 		envs: PartitionBatch[Env],
 		origin: Origin,
 	): IO[Unit]
+}
+
+trait ResultsRouter {
+	// a TopologyResults instance which sends acks back to the origin
+	def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin): TopologyResults[R]
 }
 
 // EvalId is dynamically minted each time we perform a fanout or repartitioning
@@ -120,4 +128,35 @@ object ClusterMetadata {
 
 trait Follower {
 	def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck]
+}
+
+// manages incoming eval messages for a single instance
+class EvalReceivers(instance: InstanceId, slots: Ref[IO, Map[EvalId, LocalTopologyResults[Any]]])(using Random[IO]) {
+	// not exposing a bare resource so we can eagerly terminate the block if the server has too many outstanding evals
+	def addRunning[A, B](destination: LocalTopologyResults[A])(f: Origin => IO[B]): IO[B] = {
+		val acquire = for {
+			evalId <- EvalId.generate
+			queue <- Queue.bounded[IO, LocalTopologyResults[?]](10)
+			origin = Origin(instance, evalId)
+			_ <- slots.update(_.updated(evalId, destination.asInstanceOf[LocalTopologyResults[Any]]))
+		} yield origin
+		Resource.make(acquire) { origin =>
+			slots.update(_.removed(origin.evalId))
+		}.use(f)
+	}
+	
+	def invoke(origin: Origin, edge: EdgeId, value: Option[Any]): IO[Unit] = {
+		for {
+			map <- slots.get
+			slot <- map.get(origin.evalId).fold(IO.raiseError(err(s"No slot for ${origin}")))(IO.pure)
+			_ <- slot.notify(edge, value)
+		} yield ()
+	}
+}
+
+object EvalReceivers {
+	def apply(instance: InstanceId): Resource[IO, EvalReceivers] = {
+		val acquire = Ref[IO].of(Map.empty[EvalId, LocalTopologyResults[Any]]).map(new EvalReceivers(instance, _))
+		Resource.make(acquire)(_ => IO.unit)
+	}
 }
