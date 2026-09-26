@@ -3,9 +3,9 @@ package corama.rama
 import com.rpl.rama.RamaCustomSerialization
 import java.io.DataOutput
 import java.io.ObjectOutputStream
-import java.io.{DataOutput, OutputStream}
+import java.io.{OutputStream}
 import java.io.DataInput
-import java.io.{DataInput, EOFException, InputStream}
+import java.io.{EOFException, InputStream}
 import java.io.ObjectInputStream
 
 class ListCodec extends RamaCustomSerialization[List[Serializable]] {

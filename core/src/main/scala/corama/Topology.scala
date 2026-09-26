@@ -1,6 +1,5 @@
 package corama
 
-import flogger.*
 import cats.syntax.all.*
 import corama.internal.*
 import izumi.reflect.Tag
@@ -10,7 +9,6 @@ import scala.annotation.unused
 import scala.util.Try
 import cats.Eq
 import corama.error.Util.err
-import cats.effect.IO
 
 final case class TopologyId(value: Int) extends AnyVal
 object TopologyId {
@@ -144,8 +142,6 @@ final case class Topology[S, R](
 	def input: Var[S] = builder.input
 	
 	def id = builder.id
-
-	private[corama] val startingEdge = EdgeId(id.value.toLong)
 
 	// only used in rama backend
 	val queryOutputVar: Var[R] = builder.vars.add("queryOutput", null /* TODO */, implicitly[SourcePos])

@@ -8,27 +8,9 @@ import corama.*
 import corama.internal.*
 import corama.interpreter.Env
 import fs2.Stream
-import cats.effect.std.Queue
-import cats.effect.kernel.Resource
-import corama.error.Util.err
 
-case class PartitionBatch[A](value: List[(PartitionId, List[A])])
-
-case class Origin(
-	instanceId: InstanceId,
-	evalId: EvalId, // unique key for this specific append / query root
-)
-
-/*
-The executor receives partitioned continuations and routes them to the current leader.
-This is implemented by the GRPC service to a _specific_ peer, where it fails if the peer is
-not leader for the task.
-
-It's also implemented by the task router, in which case it finds the appropriate peer to invoke.
-
-Execution continues *after* the provided nodeId, since that's trivial to provide & serialize.
-*/
-trait TaskExecutor {
+// continue evaluation on another task
+trait TaskRouter {
 	def continue(
 		task: TaskId,
 		topologyId: TopologyId,
@@ -39,16 +21,12 @@ trait TaskExecutor {
 	): IO[Unit]
 }
 
-trait ResultsRouter {
-	// a TopologyResults instance which sends acks back to the origin
-	def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin): TopologyResults[R]
+// send eval results to origin
+trait EvalRouter {
+	def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin): EvalSink[R]
 }
 
-// EvalId is dynamically minted each time we perform a fanout or repartitioning
-case class EvalId(id: Long)
-object EvalId {
-	def generate(using rand: Random[IO]): IO[EvalId] = rand.nextLong.map(EvalId.apply)
-}
+trait Router extends TaskRouter with EvalRouter
 
 case class Epoch(value: Long)
 case class Leadership(instance: InstanceId, epoch: Epoch)
@@ -130,33 +108,3 @@ trait Follower {
 	def follow(updates: Stream[IO, ReplicationUpdate]): Stream[IO, ReplicationAck]
 }
 
-// manages incoming eval messages for a single instance
-class EvalReceivers(instance: InstanceId, slots: Ref[IO, Map[EvalId, LocalTopologyResults[Any]]])(using Random[IO]) {
-	// not exposing a bare resource so we can eagerly terminate the block if the server has too many outstanding evals
-	def addRunning[A, B](destination: LocalTopologyResults[A])(f: Origin => IO[B]): IO[B] = {
-		val acquire = for {
-			evalId <- EvalId.generate
-			queue <- Queue.bounded[IO, LocalTopologyResults[?]](10)
-			origin = Origin(instance, evalId)
-			_ <- slots.update(_.updated(evalId, destination.asInstanceOf[LocalTopologyResults[Any]]))
-		} yield origin
-		Resource.make(acquire) { origin =>
-			slots.update(_.removed(origin.evalId))
-		}.use(f)
-	}
-	
-	def invoke(origin: Origin, edge: EdgeId, value: Option[Any]): IO[Unit] = {
-		for {
-			map <- slots.get
-			slot <- map.get(origin.evalId).fold(IO.raiseError(err(s"No slot for ${origin}")))(IO.pure)
-			_ <- slot.notify(edge, value)
-		} yield ()
-	}
-}
-
-object EvalReceivers {
-	def apply(instance: InstanceId): Resource[IO, EvalReceivers] = {
-		val acquire = Ref[IO].of(Map.empty[EvalId, LocalTopologyResults[Any]]).map(new EvalReceivers(instance, _))
-		Resource.make(acquire)(_ => IO.unit)
-	}
-}

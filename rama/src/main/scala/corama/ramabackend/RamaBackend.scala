@@ -4,12 +4,10 @@ import cats.syntax.all._
 import com.rpl.rama.{Agg, Block, Path}
 import com.rpl.rama
 import com.rpl.rama.module.StreamSourceOptions
-import com.rpl.rama.ops.{RamaAccumulatorAgg1, RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
+import com.rpl.rama.ops.{RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
 import com.rpl.rama.RamaModule.Setup
 import com.rpl.rama.RamaModule
 import corama.IdentityNamespace.Query
-import com.rpl.rama.module.StreamTopology
-import com.rpl.rama.ops.RamaAccumulatorAgg
 import com.rpl.rama.ops.RamaFunction0
 import scala.jdk.CollectionConverters._
 
@@ -85,14 +83,6 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 object RamaBackend {
 	def apply(setup: RamaModule.Setup, topologies: RamaModule.Topologies) = new RamaBackend(setup, topologies)
 
-	private def fn1[A, B](f: A => B): RamaFunction1[A, B] = new RamaFunction1[A, B] {
-		def invoke(a: A): B = f(a)
-	}
-
-	private def fn0[A](f: () => A): RamaFunction0[A] = new RamaFunction0[A] {
-		def invoke(): A = f()
-	}
-
 	// generate a rama varname for the given identity
 	private def compileIdentity(id: Identity) = {
 		id.namespace match {
@@ -123,7 +113,7 @@ object RamaBackend {
 
 	// generate a rama path
 	private[corama] def compilePath(path: CompiledPath): rama.Path.Impl = {
-		var p = Path.key(compilePathComponent(path.path.head))
+		val p = Path.key(compilePathComponent(path.path.head))
 		path.path.tail.foreach { part =>
 			// TODO: key vs mapKey?
 			p.key(compilePathComponent(part))

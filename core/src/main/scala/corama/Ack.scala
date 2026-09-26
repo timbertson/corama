@@ -1,15 +1,9 @@
 package corama
 
 import cats.syntax.all.*
-import cats.effect.std.Random
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-import flogger.Log
-import cats.effect.IO
-import cats.effect.Ref
-import cats.effect.Deferred
-import flogger.IOLogging
 
 sealed trait AckLevel[R]
 
@@ -54,76 +48,3 @@ final class AckReturns private[corama] (
 	override def toString: String = s"AckReturns(${values.size})"
 }
 
-case class EdgeId(id: Long) {
-	// A single ID with parent & ID XOR'd can close the parent edge and atomically spawn a child edge
-	def xor(other: EdgeId) = EdgeId(id ^ other.id)
-}
-
-object EdgeId {
-	val empty = EdgeId(0L)
-
-	def generate(using rnd: Random[IO]): IO[EdgeId] = {
-		rnd.nextLong.map(apply)
-	}
-	
-	def union(ids: List[EdgeId]) = ids.foldLeft(empty)(_.xor(_))
-}
-
-case class Notification[R](edge: EdgeId, result: Option[R])
-
-trait TopologyResults[R] {
-	val varId: VarId
-
-	def notify(edge: EdgeId, value: Option[R]): IO[Unit]
-
-	def completeList(edge: EdgeId, values: List[R]): IO[Unit]
-}
-
-/* A tracker for a single topology & execution. Performs aggregation, and tracks the event tree.
- * The tree is extended by xoring a (randomly generated) edge ID, and is complete when every edge extension
- * is canceled out (i.e. the state returns to zero).
- *
- * This technique is based on https://storm.apache.org/releases/2.6.0/Acking-framework-implementation.html
- */
-private[corama] final class LocalTopologyResults[R](
-	val varId: VarId,
-	agg: Agg[R],
-	log: Log[IO],
-	xorState: Ref[IO, Long],
-	acc: Ref[IO, R],
-	done: Deferred[IO, Try[R]],
-) extends TopologyResults[R] with IOLogging {
-
-	// NOTE: this can open a new edge, close an edge, or do _both_
-	// (by xoring an open edge with a new edge, the open one is closed
-	// and the new one is opened atomically)
-	def notify(edge: EdgeId, value: Option[R]) = {
-		for {
-			_ <- value.traverse_(value => acc.updateAndGet(x => agg.combine(x, value)))
-			xorValue <- xorState.updateAndGet(x => x ^ edge.id)
-			_ <- IO.whenA(xorValue === 0L) {
-				acc.get.flatMap(x => done.complete(Success(x))).flatMap { wasFirst =>
-					IO.whenA(!wasFirst) {
-						log.warn(s"results returned more than once")
-					}
-				}
-			}
-		} yield ()
-	}
-
-	def completeList(edge: EdgeId, values: List[R]) = notify(edge, Option.when(!values.isEmpty)(agg.merge(values)))
-
-	def fail(t: Throwable): IO[Unit] = done.complete(Failure(t)).void
-	
-	def await: IO[R] = done.get.flatMap(IO.fromTry)
-}
-
-private [corama] object TopologyResults {
-	def local[R](out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): IO[LocalTopologyResults[R]] = {
-		for {
-			xorState <- Ref[IO].of(start.id)
-			acc <- Ref[IO].of(agg.zero)
-			done <- Deferred[IO, Try[R]]
-		} yield new LocalTopologyResults(out, agg, log, xorState, acc, done)
-	}
-}
