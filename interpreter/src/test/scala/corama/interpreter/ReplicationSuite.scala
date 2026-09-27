@@ -2,7 +2,6 @@ package corama.interpreter
 
 import cats.syntax.all._
 import scala.concurrent.duration._
-import weaver.SimpleIOSuite
 import cats.effect.IO
 import scala.concurrent.duration.FiniteDuration
 import weaver.scalacheck.Checkers
@@ -10,24 +9,26 @@ import weaver.Expect
 import weaver.Expectations
 import cats.Show
 import org.scalacheck.Gen
-import flogger._
+import flogger.*
 
-object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
-	import Fixtures._
+object ReplicationSutie extends CoramaSuite {
+	import Fixtures.*
+	import Replication.*
+	import TestUtil.*
+	
 	given showMillis: Show[FiniteDuration] = Show.show(d => s"${d.toMillis.toString()}ms")
-	implicit def show[A]: Show[A] = Show.fromToString
 
 	loggedTest("single event in healthy state") { implicit log =>
 		val sim = for {
 			warmup <- Warmup.gen()
 			nextEvent <- Op.gen
 		} yield (warmup, nextEvent)
-		forall.withConfig(
-			checkConfig
+
+		forall.withConfig(checkConfig
 			// .withPerPropertyParallelism(1) // TODO remove
 			// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("EfbDxjup3AnGUd5BCSLXuDpHQmEeFgHAt0ekC4uZ9zC=").toOption)
 		)(sim) { case (warmup, nextEvent) =>
-			ReplicationCtx.run(warmup) { ctx =>
+			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {
 					transactions <- ctx.run(List(nextEvent))
 					allEvents <- ctx.events
@@ -35,25 +36,25 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 					firstTransaction = transactions.headOption
 					transactionEvents = allEvents.transactions.filter { case (id, _) => firstTransaction.contains(id) }.toMap
 				} yield expectAll(
-						expect(
-							clue(transactions).size == 1,
-							"single event should be placed in a single transaction"),
+					expect(
+						clue(transactions).size == 1,
+						"single event should be placed in a single transaction"),
 
-						expectSuccessfulBatchTransactions(allEvents),
+					expectSuccessfulBatchTransactions(allEvents),
 
-						operationEvents match {
-							case List(sent: Event.OpSent, accepted: Event.OpAccepted, completed: Event.OpCompleted) => {
-								expect(
-									clue(clue(accepted.timestamp) - clue(sent.timestamp)) <= clue(leaderConfig.maxBatchDelay),
-									s"operation send within maxBatchDelay: $operationEvents") and
-								expect(
-									clue(clue(completed.timestamp) - clue(accepted.timestamp)) <= clue(leaderConfig.maxLag + leaderConfig.maxBatchDelay),
-									s"operation ack within maxLag + maxBatchDelay: $operationEvents")
-							}
-							case other => failure(s"couldn't match op events: ${operationEvents}")
-						},
-					)
-			}
+					operationEvents match {
+						case List(sent: Event.OpSent, accepted: Event.OpAccepted, completed: Event.OpCompleted) => {
+							expect(
+								clue(clue(accepted.timestamp) - clue(sent.timestamp)) <= clue(leaderConfig.maxBatchDelay),
+								s"operation send within maxBatchDelay: $operationEvents") and
+							expect(
+								clue(clue(completed.timestamp) - clue(accepted.timestamp)) <= clue(leaderConfig.maxLag + leaderConfig.maxBatchDelay),
+								s"operation ack within maxLag + maxBatchDelay: $operationEvents")
+						}
+						case other => failure(s"couldn't match op events: ${operationEvents}")
+					},
+				)
+			})
 		}
 	}
 
@@ -63,8 +64,8 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 			numEvents <- Gen.choose(0, 100)
 			nextEvents <- Gen.listOfN(numEvents, Gen.zip(Op.gen, Op.emitDelayGen))
 		} yield (warmup, nextEvents)
-		forall(sim) { case (warmup, nextEvents) =>
-			ReplicationCtx.run(warmup) { ctx =>
+		forall(sim) { (warmup, nextEvents) =>
+			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {
 					// enqueue with delay, then wait for all batches to be complete
 					enqueued <- nextEvents.flatTraverse { case (ev, delay) =>
@@ -73,7 +74,7 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 					_ <- ctx.awaitAll(enqueued)
 					allEvents <- ctx.events
 				} yield expectSuccessfulBatchTransactions(allEvents)
-			}
+			})
 		}
 	}
 
@@ -83,18 +84,14 @@ object ReplicationSuite extends SimpleIOSuite with Checkers with IOLogging {
 			degradedState <- FollowerStates.degraded
 			nextEvent <- Op.gen
 		} yield (warmup, nextEvent, degradedState)
-		forall.withConfig(
-			checkConfig
-			// .withPerPropertyParallelism(1) // TODO remove
-			// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("qg_V2dclR_3UES0-h1LAFCUQwxe91JWToVbtLwXPnMO=").toOption)
-		)(sim) { case (warmup, nextEvent, degradedState) =>
-			ReplicationCtx.run(warmup) { ctx =>
+		forall(sim) { (warmup, nextEvent, degradedState) =>
+			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {
 					_ <- ctx.setStates(degradedState)
 					_ <- ctx.run(List(nextEvent))
 					isfs <- ctx.leader.taskStatus.get.map(_.isf)
 				} yield expect(clue(isfs).size == 1)
-			}
+			})
 		}
 	}
 	

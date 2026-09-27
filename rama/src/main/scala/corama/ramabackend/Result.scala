@@ -1,10 +1,5 @@
 package corama
 
-import org.tpolecat.sourcepos._
-import cats.Functor
-import cats.Applicative
-import scala.annotation.unused
-import cats.Eq
 import com.rpl.rama.RamaSerializable
 import cats.Monoid
 
