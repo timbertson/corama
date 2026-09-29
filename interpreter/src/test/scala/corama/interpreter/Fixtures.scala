@@ -8,4 +8,6 @@ object Fixtures {
 	val taskId = TaskId(1)
 	val followerId1 = InstanceId("follower-1")
 	val followerId2 = InstanceId("follower-2")
+	
+	val clusterInstances = Vector("i1", "i2", "i3").map(InstanceId.apply)
 }

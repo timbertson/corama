@@ -17,25 +17,6 @@ abstract class CoramaSuite extends SimpleIOSuite with Checkers with RunSync
 trait RunSync {
 	import TestUtil.*
 	val runSync = new RunSyncFn
-	// extension (f: PartiallyAppliedForall) {
-	// 	def io[A](gen: Gen[A], config: CheckConfig = checkConfig)
-	// 		(body: A => IO[Expectations])(using Show[A])(using Log[IO]): IO[Expectations] =
-	// 	{
-	// 		val runner = new IORunner
-	// 		f.withConfig(config)(gen) { v =>
-	// 			runner.runSync(body(v))
-	// 		}
-	// 	}
-	// }
-
-	// def forallIO[A]
-	// 	(gen: Gen[A], config: CheckConfig = checkConfig)
-	// 	(body: A => IO[Expectations])(using Show[A])(using Log[IO]): IO[Expectations] = {
-	// 	val runner = new IORunner
-	// 	forall.withConfig(config)(gen) { v =>
-	// 		runner.runSync(body(v))
-	// 	}
-	// }
 }
 
 object TestUtil extends IOLogging {
@@ -58,10 +39,10 @@ object TestUtil extends IOLogging {
 
 	implicit def showAny[A]: Show[A] = Show.fromToString
 
-	class RunSyncFn {
+	class RunSyncFn extends Expectations.Helpers {
 		private val runNoCounter = new AtomicInteger(0)
 
-		def apply[A](io: Log[IO] ?=> IO[A])(using baseLog: Log[IO]): A = {
+		def apply(io: Log[IO] ?=> IO[Expectations])(using baseLog: Log[IO]): Expectations = {
 			import cats.effect.unsafe.implicits.global
 			val runNo = runNoCounter.incrementAndGet()
 			given log: Log[IO] = baseLog.addContext("run" -> runNo.toString())
@@ -69,12 +50,11 @@ object TestUtil extends IOLogging {
 			val fullTask =
 				log.info(s"-- starting test case $runNo") *> io
 
-			TestControl.executeEmbed(fullTask).unsafeRunSync()
+			try {
+				TestControl.executeEmbed(fullTask).unsafeRunSync()
+			} catch {
+				case e => failure(e.toString())
+			}
 		}
 	}
-	
-	// object IORunner {
-	// 	def apply(using Log[IO]): Resource[IO, IORunner] = Resource.eval(IO.delay(new IORunner))
-	// 	def use[A](f: IORunner => IO[A])(using Log[IO]): IO[A] = apply.use(f)
-	// }
 }

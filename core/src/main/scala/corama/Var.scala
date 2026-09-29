@@ -12,7 +12,6 @@ private[corama] class VarRegistry {
 	def add[A](hint: String, tag: Tag[A], pos: SourcePos): Var[A] = {
 		val v = new Var[A](new VarId(defined, hint), tag, pos)
 		defined += 1
-		println(s"Added var: $v")
 		v
 	}
 
@@ -107,10 +106,7 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 	def explode[B](implicit pos: SourcePos, tag: Tag[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
 
 	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = Flow.ExplodeOp(tag, pos, List(this.asAny), {
-		case List(a) => {
-			println(s"Exploding value: ${a}")
-			f(a.asInstanceOf[A])
-		}
+		case List(a) => f(a.asInstanceOf[A])
 		case other => impossible(s"explode with ${other.length}")
 	})
 

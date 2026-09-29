@@ -17,7 +17,7 @@ class Interpreter(
 	val topologies: Topologies,
 	metadata: ClusterMetadata,
 	val getInstances: IO[Vector[ClusterInstance]]
-)(using Log[IO]) extends Router {
+)(using Log[IO]) extends Router with IOLogging {
 	import Interpreter._
 
 	def leader(taskId: TaskId): IO[ClusterInstance] = {
@@ -64,7 +64,7 @@ class Interpreter(
 	private[corama] def subscribers(depot: Identity): List[Topology[?, ?]] =
 		topologies.topologies.filter(_.builder.source == depot)
 
-	def append[A, R](depot: corama.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack)(using Log[IO]): IO[R] =
+	def append[A, R](depot: corama.Depot[A], value: A, level: AckLevel[R] = AckLevel.Ack)(using log: Log[IO]): IO[R] =
 		level match {
 			// TODO: these branches should differ when we model replication
 			case AckLevel.NoAck => emit(depot, value)
@@ -76,7 +76,9 @@ class Interpreter(
 					// TODO use the depot's partitioning strategy
 					partition <- partition(metadata.partitionKey(value))
 					_ <- partition.spawn(depot, value, results)
+					_ <- log.debug(s"append: awaiting results ${results}")
 					raw <- results.await
+					_ <- log.debug(s"append: Got raw results: ${raw}")
 				} yield new AckReturns(raw, topologies)
 		}
 
@@ -107,7 +109,7 @@ class Interpreter(
 		leader(task).flatMap(_.continue(task, topologyId, afterNode, edge, envs, origin))
 	}
 
-	override def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin): EvalSink[R] = {
+	override def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin)(using log: Log[IO]): EvalSink[R] = {
 		val (outVarId, agg) = continuation match {
 			case _: Continuation.Basic => (topology.output.vid, topology.agg)
 			case c: Continuation.WithinAggregation => (c.out, c.agg)
@@ -117,7 +119,8 @@ class Interpreter(
 			override val varId: VarId = outVarId
 
 			override def notify(edge: EdgeId, value: Option[R]): IO[Unit] = {
-				instance(origin.instanceId).flatMap(_.receivers.invoke(origin, edge, value))
+				log.debug(s"Notifying $edge|${value.fold("None")(_ => "Some")}") *>
+					instance(origin.instanceId).flatMap(_.receivers.invoke(origin, edge, value))
 			}
 
 			override def completeList(edge: EdgeId, values: List[R]): IO[Unit] =

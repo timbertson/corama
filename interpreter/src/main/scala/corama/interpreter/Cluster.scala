@@ -8,6 +8,7 @@ import corama.*
 import corama.internal.*
 import corama.interpreter.Env
 import fs2.Stream
+import flogger.Log
 
 // continue evaluation on another task
 trait TaskRouter {
@@ -23,7 +24,11 @@ trait TaskRouter {
 
 // send eval results to origin
 trait EvalRouter {
-	def remoteResults[R](topology: Topology[?, ?], continuation: Continuation, origin: Origin): EvalSink[R]
+	def remoteResults[R](
+		topology: Topology[?, ?],
+		continuation: Continuation,
+		origin: Origin
+	)(using Log[IO]): EvalSink[R]
 }
 
 trait Router extends TaskRouter with EvalRouter

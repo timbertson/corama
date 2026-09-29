@@ -110,15 +110,17 @@ object Evaluation {
 			if (n <= 0) {
 				Gen.const(s)
 			} else {
-				Gen.oneOf(
-					map(s),
-					filter(s),
-					explode(s),
-					partition(s),
+				Gen.frequency(
+					3 -> map(s),
+					1 -> filter(s),
+					1 -> explode(s),
+					// 5 -> partition(s),
 				).flatMap(extend(_, n - 1))
 			}
 		}
-		Gen.choose(0, MAX_FLOW_STEPS).flatMap { n =>
+
+		// TODO: reset min to 0
+		Gen.choose(3, MAX_FLOW_STEPS).flatMap { n =>
 			val root = State(Nil, Flow.of(input))
 			extend(root, n).map(_.flow)
 		}

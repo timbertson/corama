@@ -33,7 +33,7 @@ class ClusterInstance(
 		for {
 			topology <- IO.fromTry(topologies.get(topologyId))
 			continuation <- IO.fromTry(topology.continuationAfter(afterNode))
-			results = router.remoteResults(topology, continuation, origin)
+			results = router.remoteResults(topology, continuation, origin)(using log)
 			newEdges <- envs.value.parTraverse { case (partitionId, envs) =>
 				for {
 					newEdge <- EdgeId.generate

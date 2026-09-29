@@ -26,7 +26,7 @@ final class TopologyBuilder[S] private[corama] (
 	val id: TopologyId,
 	// source may be a Depot or Query, it won't be a PState
 	val source: Identity,
-	tag: Tag[S],
+	private [corama] val tag: Tag[S],
 	pos: SourcePos
 ) {
 
@@ -147,6 +147,8 @@ final case class Topology[S, R](
 	val queryOutputVar: Var[R] = builder.vars.add("queryOutput", null /* TODO */, implicitly[SourcePos])
 
 	val compiled = Node.compile(builder, new NodeBuilder(), flow)
+	
+	def prettyPrint: String = PrettyPrint.format(this)
 
 	private [corama] def output: Var[R] = compiled._2
 	

@@ -43,34 +43,42 @@ class Partition(
 
 	// Run a topology over some values by installing its results into the global GRPC service until completion
 	private def runTopologyEval[R](
+		results: LocalEvalSink[R],
+		topology: Topology[?, R],
+		envs: List[Env],
+	): IO[R] = {
+		runTopologyEvalRaw(results, topology.id, EdgeId.startingEdge(topology.id), topology.compiled._1, envs)
+	}
+
+	// As above, but also used in sub-aggregations to collect the results of a block
+	private def runTopologyEvalRaw[R](
+		results: LocalEvalSink[R],
 		topologyId: TopologyId,
-		output: VarId,
-		agg: Agg[R],
 		start: EdgeId,
 		nodes: List[Node],
 		envs: List[Env],
 	): IO[R] = {
-		EvalSink.local(output, agg, start).flatMap { results =>
-			// install into GRPC listener so other partitions can send results
-			receivers.addRunning(results) { origin =>
-				// continue could throw (from user functions), so wrap it in IO.defer
-				this.continue(origin, topologyId, results, start, nodes, envs).attempt.flatMap {
-					// TODO: how to apply backpressure if clients are not waiting?
-					case Right(_) => IO.unit
+		// install into GRPC listener so other partitions can send results
+		receivers.addRunning(results) { origin =>
+			// continue could throw (from user functions), so wrap it in IO.defer
+			this.continue(origin, topologyId, results, start, nodes, envs).attempt.flatMap {
+				// TODO: how to apply backpressure if clients are not waiting?
+				case Right(_) => IO.unit
 
-					// One bad record must not stop the topology: Rama retries the record and
-					// keeps consuming. There is no retry here, so the failure is reported to
-					// whoever appended it and consumption continues.
-					case Left(e) => results.fail(e)
-				} *> results.await
-			}
+				// One bad record must not stop the topology: Rama retries the record and
+				// keeps consuming. There is no retry here, so the failure is reported to
+				// whoever appended it and consumption continues.
+				case Left(e) => results.fail(e)
+			} *> results.await.flatMap(r => log.debug(s"runTopologyEval got results: $r").as(r))
 		}
 	}
 
 	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
 		val t = q.topology
 		val env: Env = Map(t.builder.input.vid -> value)
-		runTopologyEval(t.id, t.output.vid, t.agg, EdgeId.startingEdge(t.id), t.compiled._1, List(env))
+		EvalSink.local(t.output.vid, t.agg, EdgeId.startingEdge(t.id)).flatMap { results =>
+			runTopologyEval(results, t, List(env))
+		}
 	}
 
 	// TODO: cancel running when this node no longer owns this partition
@@ -83,8 +91,7 @@ class Partition(
 					resultsOpt <- record.tracker.traverse(tracker => IO.fromTry(tracker.forTopology(topology)))
 					// TODO: skip all this when results are not tracked
 					results = resultsOpt.getOrElse(???)
-					startingEdge = EdgeId.startingEdge(topology.id)
-					_ <- runTopologyEval(topology.id, topology.output.vid, topology.agg, startingEdge, topology.compiled._1, List(env))
+					_ <- runTopologyEval(results, topology, List(env))
 				} yield ()
 			}.compile.drain *> IO.raiseError(new RuntimeException("depot consume terminated"))
 		} *> IO.never
@@ -135,9 +142,9 @@ class Partition(
 		// TODO: skip if not debug?
 		val continueLog = log.addContext(
 			"origin" -> origin.instanceId.id,
-			"evalId" -> origin.evalId.toString(),
+			"evalId" -> origin.evalId.hex,
 			"topology" -> topologyId.value.toString(),
-			"edge" -> edgeId.id.toString(),
+			"edge" -> edgeId.hex,
 		)
 		val continue = continueLog.debug("Continuing computation") *>
 			this.continueInner(origin, topologyId, evalSink, edgeId, nodes, envs, continueLog)
@@ -168,7 +175,8 @@ class Partition(
 				evalSink.completeList(edgeId, envs.map(_(evalSink.varId).asInstanceOf[R]))
 			
 			case node :: tail => {
-				node.op match {
+				log.debug(s"Executing node: ${node}") *>
+				(node.op match {
 					case Node.Dynamic(pos, ins, fn, op) => {
 						val results = try {
 							op match {
@@ -231,8 +239,10 @@ class Partition(
 							// TODO: skip all the bookkeeping if there aren't any
 							// partition jumps in `block`?
 							// Note: reusing parent `edgeId` here, but there's no confusion because this is a new EvalId
-							runTopologyEval(topologyId, out, agg, edgeId, block, List(env)).map { result =>
-								env.updated(out, result)
+							EvalSink.local(out, agg, edgeId).flatMap { results =>
+								runTopologyEvalRaw(results, topologyId, edgeId, block, List(env)).map { result =>
+									env.updated(out, result)
+								}
 							}
 						}.flatMap { outputEnvs =>
 							continueTopology(tail, outputEnvs)
@@ -302,7 +312,7 @@ class Partition(
 							// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
 							state.inner.update(_.appended(Record(v, None)))
 						} *> continueTopology(tail, envs)
-				}
+				})
 			}
 		}
 	}
