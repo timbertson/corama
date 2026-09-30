@@ -42,19 +42,19 @@ private[corama] final class EvalResults(results: Map[TopologyId, LocalEvalSink[?
 			.map(_.asInstanceOf[LocalEvalSink[R]])
 
 	def await: IO[Map[TopologyId, Any]] = results.toList.traverse { (id, results) =>
-		log.debug(s"Awaiting topology $id") *>
+		log.debug(s"Awaiting results for append on topology $id") *>
 		results.await.map(id -> _).flatMap { r =>
-			log.debug(s"Got results from topology $id").as(r)
+			log.debug(s"Got results from append on topology $id").as(r)
 		}
 	}.map(_.toMap)
 }
 
 private[corama] object EvalResults extends IOLogging {
-	def apply(topologies: List[Topology[?, ?]])(using log: Log[IO]): IO[EvalResults] = {
-		log.debug(s"Creating a local result sink for ${topologies.map(_.id)}") *>
+	def apply(topologies: List[Topology[?, ?]])(using baseLog: Log[IO]): IO[EvalResults] = {
+		baseLog.debug(s"Creating a local result sink for ${topologies.map(_.id)}") *>
 		(topologies.traverse { topology =>
-			val startingEdgeUnion = EdgeId.union(topologies.map(t => EdgeId.startingEdge(t.id)))
-			EvalSink.local[topology.Result](topology.output.vid, topology.agg, startingEdgeUnion)
+			given log: Log[IO] = baseLog.addContext("topology" -> topology.id.value.toString())
+			EvalSink.local[topology.Result](topology.output.vid, topology.agg, EdgeId.startingEdge(topology.id))
 				.map(topology.id -> _)
 		}.map { topologyResults =>
 			new EvalResults(topologyResults.toMap)
@@ -113,7 +113,7 @@ private[corama] final class LocalEvalSink[R](
 		for {
 			_ <- value.traverse_(value => acc.updateAndGet(x => agg.combine(x, value)))
 			xorValue <- xorState.updateAndGet(x => x ^ edge.id)
-			_ <- log.debug(s"Received notification $edge|${value.fold("None")(_ => "Some")}, state => ${HexString(xorValue)}")
+			_ <- log.debug(s"Received notification $edge|${value.fold("None")(_ => "Some")}, state: from ${HexString(xorValue ^ edge.id)} => ${HexString(xorValue)}")
 			_ <- IO.whenA(xorValue === 0L) {
 				log.debug(s"eval complete") *>
 				acc.get.flatMap(x => done.complete(Success(x))).flatMap { wasFirst =>

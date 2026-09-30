@@ -42,10 +42,9 @@ object TestUtil extends IOLogging {
 	class RunSyncFn extends Expectations.Helpers {
 		private val runNoCounter = new AtomicInteger(0)
 
-		def apply(io: Log[IO] ?=> IO[Expectations])(using baseLog: Log[IO]): Expectations = {
+		def apply(io: Log[IO] ?=> IO[Expectations])(using log: Log[IO]): Expectations = {
 			import cats.effect.unsafe.implicits.global
 			val runNo = runNoCounter.incrementAndGet()
-			given log: Log[IO] = baseLog.addContext("run" -> runNo.toString())
 
 			val fullTask =
 				log.info(s"-- starting test case $runNo") *> io

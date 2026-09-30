@@ -3,6 +3,7 @@ package corama.interpreter
 import corama.*
 import org.scalacheck.Gen
 import corama.Flow
+import cats.data.NonEmptyList
 
 object Evaluation {
 	type LS = List[String]
@@ -114,34 +115,37 @@ object Evaluation {
 					3 -> map(s),
 					1 -> filter(s),
 					1 -> explode(s),
-					// 5 -> partition(s),
+					5 -> partition(s),
 				).flatMap(extend(_, n - 1))
 			}
 		}
 
-		// TODO: reset min to 0
-		Gen.choose(3, MAX_FLOW_STEPS).flatMap { n =>
+		Gen.choose(0, MAX_FLOW_STEPS).flatMap { n =>
 			val root = State(Nil, Flow.of(input))
 			extend(root, n).map(_.flow)
 		}
 	}
 	
-	case class TopologyCtx(topologies: Topologies, depot: Depot[LS], topology: StreamTopology[LS, LS]) {
-	}
+	case class TopologyCtx(root: Topologies, depot: Depot[LS], topologies: NonEmptyList[StreamTopology[LS, LS]])
 
 	def genTopology: Gen[TopologyCtx] = {
 		aggOp.flatMap { agg =>
 			// Hack: varid-0 is always the input, due to evaluation order
 			val inputVar = new Var[LS](VarId(0, "input"), implicitly, implicitly)
 
-			genFlow(inputVar).flatMap { flow =>
+			for {
+				numFlows <- Gen.choose(1, 4)
+				flows <- Gen.listOfN(numFlows, genFlow(inputVar))
+			} yield {
 				val t = Topologies()
 				val depot = t.depot[LS]("inputs")
-				val top = t.stream(depot, agg) { input =>
-					assert(input == inputVar)
-					flow
+				val topologies = NonEmptyList.fromListUnsafe(flows).map { flow =>
+					t.stream(depot, agg) { input =>
+						assert(input == inputVar)
+						flow
+					}
 				}
-				TopologyCtx(t, depot, top)
+				TopologyCtx(t, depot, topologies)
 			}
 		}
 	}
