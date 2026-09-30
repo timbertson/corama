@@ -30,11 +30,11 @@ object Evaluation {
 
 		// Operate on a random defined var
 		def extend(fn: Var[LS] => F): Gen[State] = {
-			genVar.map { source =>
+			genVar.map { sourceOpt =>
 				val newVar = new PendingVar
 				val newFlow = flow.flatMap { flowVar =>
 					newVar.set(flowVar)
-					val input = source.getOrElse(newVar).get
+					val input = sourceOpt.getOrElse(newVar).get
 					fn(input)
 				}
 				State(newVar :: vars, newFlow)

@@ -56,7 +56,6 @@ private[corama] object Node {
 				case DynamicOp.Explode(out) => Dependencies(Nil, Some(out))
 				case DynamicOp.Filter(cond) => Dependencies(List(cond), None)
 			}
-			
 			opDeps.copy(inputs = ins ++ opDeps.inputs)
 		}
 	}
