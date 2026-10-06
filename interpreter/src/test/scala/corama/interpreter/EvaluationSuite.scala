@@ -12,8 +12,8 @@ object EvaluationSuite extends CoramaSuite {
 
 	loggedTest("executing a value on a topology") { implicit log =>
 		forall.withConfig(checkConfig
-			.withPerPropertyParallelism(1)
-			.withInitialSeed(org.scalacheck.rng.Seed.fromBase64("InbV10NadZ2Ad1lHST7nRvDRMRXiA9q7ZMM9KKS4VaL=").toOption)
+			// .withPerPropertyParallelism(1)
+			// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("InbV10NadZ2Ad1lHST7nRvDRMRXiA9q7ZMM9KKS4VaL=").toOption)
 		)(genTopology) { ctx =>
 			val body = Interpreter.createCluster(ctx.root, clusterInstances, numPartitions = 4).use { interpreter =>
 				for {

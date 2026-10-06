@@ -16,7 +16,7 @@ sealed trait Flow[A, -Ctx] {
 
 	def void: Flow[Unit, Ctx] = as(Var.unit)
 
-	def agg(agg: corama.Agg[A])(implicit tag: Tag[A]): Flow[A, Ctx & Batch] = Flow.Combine(tag, this, agg)
+	// def agg(agg: corama.Agg[A])(implicit tag: Tag[A]): Flow[A, Ctx & Batch] = Flow.Combine(tag, this, agg)
 }
 
 object Flow {
