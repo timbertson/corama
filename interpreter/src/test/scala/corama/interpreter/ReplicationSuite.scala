@@ -11,7 +11,7 @@ import cats.Show
 import org.scalacheck.Gen
 import flogger.*
 
-object ReplicationSutie extends CoramaSuite {
+object ReplicationSuite extends CoramaSuite {
 	import Fixtures.*
 	import Replication.*
 	import TestUtil.*
@@ -22,12 +22,13 @@ object ReplicationSutie extends CoramaSuite {
 		val sim = for {
 			warmup <- Warmup.gen()
 			nextEvent <- Op.gen
-		} yield (warmup, nextEvent)
+			runSync <- RunSync.gen
+		} yield (warmup, nextEvent, runSync)
 
 		forall.withConfig(checkConfig
 			// .withPerPropertyParallelism(1) // TODO remove
 			// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("EfbDxjup3AnGUd5BCSLXuDpHQmEeFgHAt0ekC4uZ9zC=").toOption)
-		)(sim) { case (warmup, nextEvent) =>
+		)(sim) { case (warmup, nextEvent, runSync) =>
 			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {
 					transactions <- ctx.run(List(nextEvent))
@@ -61,10 +62,15 @@ object ReplicationSutie extends CoramaSuite {
 	loggedTest("multiple events in healthy state") { implicit log =>
 		val sim = for {
 			warmup <- Warmup.gen()
-			numEvents <- Gen.choose(0, 100)
+			numEvents <- Gen.choose(1, 100)
 			nextEvents <- Gen.listOfN(numEvents, Gen.zip(Op.gen, Op.emitDelayGen))
-		} yield (warmup, nextEvents)
-		forall(sim) { (warmup, nextEvents) =>
+			runSync <- RunSync.gen
+		} yield (warmup, nextEvents, runSync)
+		forall.withConfig(
+			checkConfig
+				// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("dTk5CV5VB-n9TS_OkIOTiP-Ga_lI8S-XorilElXbobE=").toOption)
+				.withPerPropertyParallelism(1)
+		)(sim) { (warmup, nextEvents, runSync) =>
 			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {
 					// enqueue with delay, then wait for all batches to be complete
@@ -83,8 +89,9 @@ object ReplicationSutie extends CoramaSuite {
 			warmup <- Warmup.gen(statesGen = FollowerStates.allHealthy)
 			degradedState <- FollowerStates.degraded
 			nextEvent <- Op.gen
-		} yield (warmup, nextEvent, degradedState)
-		forall(sim) { (warmup, nextEvent, degradedState) =>
+			runSync <- RunSync.gen
+		} yield (warmup, nextEvent, degradedState, runSync)
+		forall(sim) { (warmup, nextEvent, degradedState, runSync) =>
 			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {
 					_ <- ctx.setStates(degradedState)

@@ -168,16 +168,18 @@ object Replication extends IOLogging {
 		def runWarmup(warmup: Warmup): IO[Unit] = {
 			import scala.math.Ordering.Implicits._
 			for {
+				_ <- log.info(s"Sending ${warmup.acknowledgedOps.size} acknowledged ops")
 				_ <- run(warmup.acknowledgedOps, delay = warmup.emitDelay)
+				_ <- log.info(s"Enqueuing ${warmup.inFlightOps.size} in-flight ops")
 				enqueues <- enqueueAll(warmup.inFlightOps, delay = Duration.Zero)
-				_ <- log.info(s"Enqueued into batches: ${enqueues.map(_._2.txId).distinct}")
+				_ <- log.info(s"-- Enqueued into batches: ${enqueues.map(_._2.txId).distinct}")
 
 				// wait for batches that have definitely been sent, either because
 				// they're full, or they're prior to the latest batch
 				lastTx = enqueues.lastOption.map(_._2.txId)
 				_ <- enqueues.traverse { case (op, batch) =>
 					IO.whenA(lastTx.exists(_ > batch.txId) || batch.writes.size >= leaderConfig.maxBatchSize) {
-						log.info(s"Awaiting acknowledgement for closed batch: ${batch.txId}") *>
+						log.info(s"-- Awaiting acknowledgement for closed batch: ${batch.txId}") *>
 						batch.acknowledged.get
 					}
 				}
@@ -213,7 +215,7 @@ object Replication extends IOLogging {
 		def awaitAll(batches: List[(Op, OpenBatch)]): IO[List[TxId]] = {
 			batches.traverse { case (op, batch) =>
 				for {
-					_ <- log.info(s"Awaiting batch ack: ${batch.txId}")
+					_ <- log.info(s"-- Awaiting batch ack: ${batch.txId}")
 					_ <- batch.acknowledged.get
 					ts <- IO.monotonic
 					_ <- record(Event.OpCompleted(ts, op, batch.txId))
@@ -225,7 +227,6 @@ object Replication extends IOLogging {
 	object ReplicationCtx {
 		def run(warmup: Warmup)(body: ReplicationCtx => IO[Expectations])(using log: Log[IO]): IO[Expectations] = {
 			val makeResource = for {
-				_ <- log.info(s"Running warmup: $warmup")
 				states <- Ref[IO].of(warmup.followers)
 				audit <- Audit[IO, Event]
 				leaderResouce = TaskLeader.resource(taskId, leaderId, leaderConfig, followerImpls(states, audit))
@@ -233,12 +234,12 @@ object Replication extends IOLogging {
 
 			makeResource.flatMap(_.use { ctx =>
 				for {
-					_ <- log.info("Running warmup")
+					_ <- log.info("-- Running warmup")
 					_ <- ctx.runWarmup(warmup)
-					_ <- log.info("Warmup complete; running test")
+					_ <- log.info("-- Warmup complete; running test")
 					_ <- ctx.audit.reset
 					result <- body(ctx)
-					_ <- log.info("Test body complete")
+					_ <- log.info("-- Test body complete")
 				} yield result
 			})
 		}
