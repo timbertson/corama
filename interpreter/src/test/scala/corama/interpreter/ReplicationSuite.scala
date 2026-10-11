@@ -69,7 +69,7 @@ object ReplicationSuite extends CoramaSuite {
 		forall.withConfig(
 			checkConfig
 				// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("dTk5CV5VB-n9TS_OkIOTiP-Ga_lI8S-XorilElXbobE=").toOption)
-				.withPerPropertyParallelism(1)
+				// .withPerPropertyParallelism(1)
 		)(sim) { (warmup, nextEvents, runSync) =>
 			runSync(ReplicationCtx.run(warmup) { ctx =>
 				for {

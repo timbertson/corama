@@ -168,9 +168,7 @@ object Replication extends IOLogging {
 		def runWarmup(warmup: Warmup): IO[Unit] = {
 			import scala.math.Ordering.Implicits._
 			for {
-				_ <- log.info(s"Sending ${warmup.acknowledgedOps.size} acknowledged ops")
 				_ <- run(warmup.acknowledgedOps, delay = warmup.emitDelay)
-				_ <- log.info(s"Enqueuing ${warmup.inFlightOps.size} in-flight ops")
 				enqueues <- enqueueAll(warmup.inFlightOps, delay = Duration.Zero)
 				_ <- log.info(s"-- Enqueued into batches: ${enqueues.map(_._2.txId).distinct}")
 

@@ -17,12 +17,11 @@ import cats.effect.Ref
 import scala.collection.immutable.Queue
 import cats.effect.unsafe.IORuntimeConfig
 import org.scalacheck.Gen
+import weaver.scalacheck.CheckConfig
 
-abstract class CoramaSuite extends SimpleIOSuite with Checkers //with RunSync
-
-// trait RunSync {
-// 	import TestUtil.*
-// }
+abstract class CoramaSuite extends SimpleIOSuite with Checkers {
+	override def checkConfig: CheckConfig = super.checkConfig.withMinimumSuccessful(500)
+}
 
 object TestUtil extends IOLogging {
 	def expectSeq(expectations: Seq[Expectations]): Expectations = {

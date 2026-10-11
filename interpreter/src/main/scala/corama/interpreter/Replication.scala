@@ -12,10 +12,12 @@ import cats.effect.Async
 import flogger.Log
 import flogger.IOLogging
 import cats.Eq
+import corama.error.Util.err
 
 case class TxId(value: Long)
 object TxId {
 	implicit val ord: Ordering[TxId] = Ordering.by(_.value)
+	implicit val eq: Eq[TxId] = Eq.by(_.value)
 }
 
 // There are `n` tasks in an `n` node setup.
@@ -121,12 +123,15 @@ class ReplicationStalled(val txId: TxId)
 // /** Commands into the single batcher fiber. One fiber owns the current batch, so
 // 	*  there are no races between appends joining a batch and the batch being
 // 	*  sealed — the Kafka-producer accumulator model. */
-sealed trait BatchCommand {
-	val accepted: Deferred[IO, OpenBatch]
-}
+sealed trait BatchCommand
 private object BatchCommand {
-	case class AppendCmd(depot: DepotId, appends: Vector[DepotAppend], accepted: Deferred[IO, OpenBatch]) extends BatchCommand
-	case class UpdateCmd(pstate: PStateId, updates: Vector[PStateUpdate], accepted: Deferred[IO, OpenBatch]) extends BatchCommand
+	sealed trait Op extends BatchCommand {
+		val accepted: Deferred[IO, OpenBatch]
+	}
+	case class Append(depot: DepotId, appends: Vector[DepotAppend], accepted: Deferred[IO, OpenBatch]) extends Op
+	case class Update(pstate: PStateId, updates: Vector[PStateUpdate], accepted: Deferred[IO, OpenBatch]) extends Op
+
+	case class Flush(batch: OpenBatch) extends BatchCommand
 }
 
 /** The leader for one task. Appends and pstate updates go into a single
@@ -143,26 +148,30 @@ final class TaskLeader private (
 )(using log: Log[IO]) extends IOLogging {
 	// TODO: we could reuse a single deferred per batch instead of per op, but that might increase contention
 	def append(depot: DepotId, appends: Vector[DepotAppend]): IO[OpenBatch] =
-		Deferred[IO, OpenBatch].flatMap { w => cmdQueue.offer(BatchCommand.AppendCmd(depot, appends, w)) *> w.get }
+		Deferred[IO, OpenBatch].flatMap { w => cmdQueue.offer(BatchCommand.Append(depot, appends, w)) *> w.get }
 
 	def update(pstate: PStateId, updates: Vector[PStateUpdate]): IO[OpenBatch] =
-		Deferred[IO, OpenBatch].flatMap { w => cmdQueue.offer(BatchCommand.UpdateCmd(pstate, updates, w)) *> w.get }
+		Deferred[IO, OpenBatch].flatMap { w => cmdQueue.offer(BatchCommand.Update(pstate, updates, w)) *> w.get }
 
 	def replicationLoop: IO[Nothing] = {
 		def newBatchLoop: IO[Nothing] = {
-			log.debug("Awaiting next command...") *>
-			cmdQueue.take.flatMap { cmd =>
-				// only allocate once we have the first command in the batch
-				// (batch.openedAt should reflect the time of first append)
-				allocator.createBatch.flatMap { batch =>
-					extendBatchLoop(batch, cmd)
+			cmdQueue.take.flatMap {
+				case cmd: BatchCommand.Op => {
+					// only allocate once we have the first command in the batch
+					// (batch.openedAt should reflect the time of first append)
+					allocator.createBatch.flatMap { batch =>
+						extendBatchLoop(batch, cmd)
+					}
 				}
+
+				// nothing to flush; ignore
+				case _: BatchCommand.Flush => newBatchLoop
 			}
 		}
 		
 		def flushAndContinue(batch: OpenBatch) = flush(batch) >> newBatchLoop
 
-		def extendBatchLoop(prevBatch: OpenBatch, cmd: BatchCommand): IO[Nothing] = {
+		def extendBatchLoop(prevBatch: OpenBatch, cmd: BatchCommand.Op): IO[Nothing] = {
 			// Add a command to a batch and either flush immediately or keep accumulating
 			val newBatch = prevBatch.update(cmd)
 			cmd.accepted.complete(newBatch) *> (
@@ -183,10 +192,28 @@ final class TaskLeader private (
 				} else {
 					IO.race(
 						cmdQueue.take,
-						IO.sleep(config.maxBatchDelay - elapsed)
+
+						// Note: if the timeout cancels a `take`, the taken item can be lost.
+						// (https://github.com/typelevel/cats-effect/issues/4571)
+						// We avoid this by explicitly pushing a flush command after timeout, so the `take` is never canceled.
+						// Note: the batch may be published prematurely in this case, if the offer succeeds but it appears on the
+						// queue after another item.
+						IO.sleep(config.maxBatchDelay - elapsed) *> cmdQueue.offer(BatchCommand.Flush(batch)) *> IO.never
+
 					).flatMap {
-						case Left(cmd) => extendBatchLoop(batch, cmd)
-						case Right(timeout) => flushAndContinue(batch)
+						case Left(BatchCommand.Flush(batchToFlush)) => {
+							if (batch `eq` batchToFlush) {
+								// strict reference equality, if we've extended the batch we don't want to have
+								// to compare full contents to see it differs.
+								flushAndContinue(batch)
+							} else {
+								// Flush command for some other tx; ignore and resume
+								// TODO: does this ever happen?
+								waitingBatchLoop(batch)
+							}
+						}
+						case Left(cmd: BatchCommand.Op) => extendBatchLoop(batch, cmd)
+						case Right(_) => IO.raiseError(err("Impossible; race returned Right(...)"))
 					}
 				}
 			}
@@ -275,13 +302,13 @@ case class BatchWrites(
 	pstateUpdates: Map[PStateId, Vector[PStateUpdate]],
 	size: Int,
 ) {
-	def update(cmd: BatchCommand): BatchWrites = cmd match {
-		case BatchCommand.AppendCmd(depot, appends, w) => copy(
+	def update(cmd: BatchCommand.Op): BatchWrites = cmd match {
+		case BatchCommand.Append(depot, appends, w) => copy(
 			depotAppends = depotAppends.updatedWith(depot)(v => Some(v.getOrElse(Vector.empty) ++ appends)),
 			size = size + appends.size
 		)
 
-		case BatchCommand.UpdateCmd(pstate, updates, w) => copy(
+		case BatchCommand.Update(pstate, updates, w) => copy(
 			pstateUpdates = pstateUpdates.updatedWith(pstate)(v => Some(v.getOrElse(Vector.empty) ++ updates)),
 			size = size + updates.size
 		)
@@ -299,7 +326,7 @@ case class OpenBatch(
 	writes: BatchWrites,
 ) {
 
-	def update(cmd: BatchCommand): OpenBatch = copy(writes = writes.update(cmd))
+	def update(cmd: BatchCommand.Op): OpenBatch = copy(writes = writes.update(cmd))
 }
 
 class TransactionAllocator(nextId: Ref[IO, Long]):
