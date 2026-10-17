@@ -9,6 +9,8 @@ import corama.internal.*
 import corama.interpreter.Env
 import fs2.Stream
 import flogger.Log
+import corama.error.Util.err
+import scala.util.control.NoStackTrace
 
 // continue evaluation on another task
 trait TaskRouter {
@@ -35,6 +37,8 @@ trait Router extends TaskRouter with EvalRouter
 
 case class Epoch(value: Long)
 case class Leadership(instance: InstanceId, epoch: Epoch)
+class MetadataError(instance: InstanceId, message: String) extends RuntimeException(s"$instance: $message") with NoStackTrace
+
 class ClusterMetadata(
 	val leaders: Ref[IO, Map[TaskId, Leadership]],
 	val instances: Vector[InstanceId], // for now numTasks is pinned to numInstances for simplicity
@@ -46,7 +50,6 @@ class ClusterMetadata(
 	assert(numTasks >= 3)
 
 	def taskFor(partition: PartitionId): TaskId = TaskId(partition.id % numTasks)
-	def instanceFor(taskId: TaskId): InstanceId = instances(taskId.id)
 	def add(taskId: TaskId, diff: Int): TaskId = TaskId(wrapTaskIndex(taskId.id + diff))
 	
 	def allPartitions = (0 until numPartitions).map(PartitionId.apply)
@@ -54,10 +57,15 @@ class ClusterMetadata(
 	def partitionsIn(task: TaskId): List[PartitionId] = {
 		allPartitions.filter(p => taskFor(p) === task).toList
 	}
+
+	def leaderFor(task: TaskId) = leaders.get.flatMap(_.get(task) match {
+		case None => IO.raiseError(err(s"No such task: $task"))
+		case Some(leader) => IO.pure(leader)
+	})
 	
 	// replicas are statically assigned so that e.g. taskId(2) is replicated on instance id 2, 3, and 4 (wrapping around)
 	def replicasFor(task: TaskId) = taskDiffs.map { diff =>
-		instanceFor(add(task, diff))
+		instances(add(task, diff).id)
 	}
 
 	// TODO replicasFor, tasksFor and partitionsFor could probably all be one calculation / structure

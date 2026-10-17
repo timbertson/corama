@@ -64,11 +64,6 @@ private[corama] object Node {
 		val deps = Dependencies(List(in), Some(out))
 	}
 
-	/** `flag` is where the predicate's result is bound before Rama's `keepTrue` reads
-	  * it. Unused by `interp` backend.
-		*/
-	// case class Filter(pos: SourcePos, fn: Any => Boolean, in: VarId, flag: VarId) extends NodeOp
-
 	case class Partition(in: VarId) extends NodeOp {
 		val deps = Dependencies(List(in), None)
 	}

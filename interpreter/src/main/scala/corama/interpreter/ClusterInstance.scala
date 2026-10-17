@@ -46,16 +46,21 @@ class ClusterInstance(
 		} yield ()
 	}
 
-	// TODO: only if we are currently leader for task
 	def get(task: TaskId, partition: PartitionId): IO[Partition] = {
 		if (metadata.taskFor(partition) === task) {
-			val newPartition = new Partition(receivers, metadata, topologies, router, log.addContext("partition" -> partition.id.toString))
-			partitions.modify { map =>
-				map.get(partition) match {
-					case None => {
-						(map.updated(partition, newPartition), newPartition)
+			metadata.leaderFor(task).flatMap { leader =>
+				if (leader.instance === instance) {
+					partitions.modify { map =>
+						map.get(partition) match {
+							case None => {
+								val newPartition = new Partition(receivers, metadata, topologies, router, log.addContext("partition" -> partition.id.toString))
+								(map.updated(partition, newPartition), newPartition)
+							}
+							case Some(p) => (map, p)
+						}
 					}
-					case Some(p) => (map, p)
+				} else {
+					IO.raiseError(new MetadataError(instance, s"leadership for task $task is currently $leader"))
 				}
 			}
 		} else {
@@ -63,7 +68,8 @@ class ClusterInstance(
 		}
 	}
 	
-	// TODO: respond /guard against changes in leadership
+	// TODO: respond /guard against changes in leadership.
+	// shutdown unused partitions, and start newly assigned ones
 	def run = {
 		metadata.leaders.get.flatMap { leaders =>
 			leaders.toList.mapFilter { case (task, leadership) =>

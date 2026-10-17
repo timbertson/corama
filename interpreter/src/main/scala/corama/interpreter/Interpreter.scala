@@ -13,6 +13,7 @@ import flogger.*
 import cats.effect.Resource
 import cats.effect.kernel.Deferred
 
+// An in-memory cluster, useful for testing
 class Interpreter(
 	val topologies: Topologies,
 	metadata: ClusterMetadata,
