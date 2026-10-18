@@ -1,6 +1,6 @@
 # corama
 
-This project is an experiment, aiming to improve some specific areas of [rama].
+This project is an experiment, aiming to improve some specific areas of [rama][].
 
 # Rama is great technology.
 
