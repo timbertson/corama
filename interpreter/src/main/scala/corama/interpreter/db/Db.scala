@@ -2,7 +2,7 @@ package corama.interpreter.db
 
 import cats.effect.*
 import cats.*
-import corama.{Decoder, Encoder}
+import corama.Codec
 import corama.Bytes
 import corama.error.Util.*
 import scala.util.Try
@@ -42,7 +42,7 @@ object DbValue {
 	private val SET_ENTRY_MAGIC = 1.byteValue()
 	private [corama] val MAGIC_LEN = 1
 	
-	def encodeItemKey[K](k: K)(implicit encoder: Encoder[K]): Bytes = {
+	def encodeItemKey[K](k: K)(implicit encoder: Codec[K]): Bytes = {
 		Array(ITEM_MAGIC) ++ encoder.encode(k)
 	}
 
@@ -50,10 +50,10 @@ object DbValue {
 		Array(SET_ENTRY_MAGIC) ++ encoder.encode(k)
 	}
 
-	def encodeSetEntry[K, V](k: K, v: V)(implicit KE: SetKey[K], VE: Encoder[V]): (Bytes, Option[Bytes]) = {
+	def encodeSetEntry[K, V](k: K, v: V)(implicit KE: SetKey[K], VE: Codec[V]): (Bytes, Option[Bytes]) = {
 		val keyOnly = encodeSetKey(k)
 		val keyLen = keyOnly.length - 1 // 1 magic byte isn't included in length
-		(keyOnly ++ VE.encode(v), Some(Encoder.forInt.encode(keyLen)))
+		(keyOnly ++ VE.encode(v), Some(Codec.forInt.encode(keyLen)))
 	}
 
 	def decode[T](kv: (Bytes, Bytes), decodePair: DecodePair[T]): IO[T] = {
@@ -63,7 +63,7 @@ object DbValue {
 
 			// setEntries are encoded with the values concatenated onto the key, for uniqueness.
 			// In order to decode unambiguously, the value is the key's serialized length as an int
-			case Some(`SET_ENTRY_MAGIC`) => Decoder.forInt.decode(v).map(keyLen => k.tail.splitAt(keyLen))
+			case Some(`SET_ENTRY_MAGIC`) => Codec.forInt.decode(v).map(keyLen => k.tail.splitAt(keyLen))
 
 			case _ => Failure(err(s"Couldn't decode DB value with magic byte ${k.headOption}"))
 		}
