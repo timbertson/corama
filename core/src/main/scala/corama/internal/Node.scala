@@ -5,6 +5,7 @@ import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
 import java.util.concurrent.atomic.AtomicInteger
 import cats.kernel.Eq
+import izumi.reflect.macrortti.LightTypeTag
 
 // ---------------------------------------------------------------------------
 // base AST
@@ -87,9 +88,8 @@ private[corama] object Node {
 		case class Add(v: VarId) extends PStateOp
 		case class Remove(v: VarId) extends PStateOp
 		
-		// intermediate for Select/Get are only used in rama backend
-		case class Select(intermediate: VarId, out: VarId, options: SelectOptions[?]) extends PStateOp
-		case class Get(intermediate: VarId, out: VarId) extends PStateOp
+		case class Select(out: VarId, options: SelectOptions[?]) extends PStateOp
+		case class Get(out: VarId) extends PStateOp
 
 		case class Put(v: VarId) extends PStateOp
 	}
@@ -101,8 +101,8 @@ private[corama] object Node {
 				case PStateOp.Remove(v) => Dependencies(List(v), None)
 				case PStateOp.Put(v) => Dependencies(List(v), None)
 
-				case PStateOp.Select(_, v, _) => Dependencies(Nil, Some(v))
-				case PStateOp.Get(_, v) => Dependencies(Nil, Some(v))
+				case PStateOp.Select(v, _) => Dependencies(Nil, Some(v))
+				case PStateOp.Get(v) => Dependencies(Nil, Some(v))
 			}
 			opDeps.copy(inputs = opDeps.inputs ++ path.ins)
 		}
@@ -127,18 +127,18 @@ private[corama] object Node {
 			case Flow.Pure(v) => (Nil, v)
 
 			case e: Flow.MapN[A] =>
-				val out = t.define[A](e.tag, e.pos, "map")
+				val out = t.define[A](e.tag, e.codec, e.pos, "map")
 				val f = e.f
 				(List(n(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Map(out.vid)))), out)
 
 			case e: Flow.ExplodeOp[A] =>
-				val out = t.define[A](e.tag, e.pos, "exploded")
+				val out = t.define[A](e.tag, e.codec, e.pos, "exploded")
 				val f = e.f
 				(List(n(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Explode(out.vid)))), out)
 
 			case e: Flow.FilterOp[i] =>
 				val f = e.f
-				val condVar = t.define[Boolean](Tag[Boolean], Var.internal, "cond")
+				val condVar = t.define[Boolean](Tag[Boolean], Codec[Boolean], Var.internal, "cond")
 				(List(n(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Filter(condVar.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case p: Flow.Partition[i] =>
@@ -150,7 +150,7 @@ private[corama] object Node {
 				(n1 ++ n2, v2)
 
 			case i: Flow.If[a, ccond, c1, c2] =>
-				val out = t.define[a](i.tag, Var.internal, "ifOut")
+				val out = t.define[a](i.tag, i.codec, Var.internal, "ifOut")
 				val (condBlock, vCond) = compile(t, n, i.cond)
 				val (ifBlock, vIf) = compile(t, n, i.ifBlock)
 				val (elseBlock, vElse) = compile(t, n, i.elseBlock)
@@ -165,31 +165,35 @@ private[corama] object Node {
 
 			case a: Flow.Combine[a, ctx] =>
 				val (block, innerVar) = compile(t, n, a.block)
-				val out = t.define[A](a.tag, Var.internal, "agg")
+				val out = t.define[A](a.tag, a.codec, Var.internal, "agg")
 				(List(n(Node.Combine(block, a.agg, innerVar.vid, out.vid))), out)
 
 			case g: Flow.Get[a] =>
-				val intermediate = t.define[Any](implicitly[Tag[Any]], Var.internal, "getIntermediate")
-				val out = t.define[a](g.lens.tag, Var.internal, "get")
-				(List(n(Node.PStateNode(g.lens.pstate.id, CompiledPath.from(g.lens.path), PStateOp.Get(intermediate.vid, out.vid)))), out.asInstanceOf[Var[A]])
+				val out = t.define[a](g.lens.schema.tag, g.lens.schema.codec, Var.internal, "get")
+				val path = CompiledPath.from(g.lens.path, g.lens.schema.tag.tag, g.lens.schema.codec)
+				(List(n(Node.PStateNode(g.lens.pstate.id, path, PStateOp.Get(out.vid)))), out.asInstanceOf[Var[A]])
 
 			case Flow.Put(lens, value) =>
-				(List(n(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Put(value.vid)))), Var.unit.asInstanceOf[Var[A]])
+				val path = CompiledPath.from(lens.path, lens.schema.tag.tag, lens.schema.codec)
+				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Put(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Add(lens, value) =>
-				(List(n(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Add(value.vid)))), Var.unit.asInstanceOf[Var[A]])
+				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec)
+				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Add(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Remove(lens, value) =>
-				(List(n(Node.PStateNode(lens.pstate.id, CompiledPath.from(lens.path), PStateOp.Remove(value.vid)))), Var.unit.asInstanceOf[Var[A]])
+				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec)
+				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Remove(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case u: Flow.Update[v] =>
 				val f = u.f
-				(List(n(Node.PStateUpdate(u.pos, u.lens.pstate.id, CompiledPath.from(u.lens.path), u.ins.map(_.vid), f))), Var.unit.asInstanceOf[Var[A]])
+				val path = CompiledPath.from(u.lens.path, u.lens.schema.tag.tag, u.lens.schema.codec)
+				(List(n(Node.PStateUpdate(u.pos, u.lens.pstate.id, path, u.ins.map(_.vid), f))), Var.unit.asInstanceOf[Var[A]])
 
 			case s: Flow.Select[v] =>
-				val intermediate = t.define[Any](implicitly[Tag[Any]], Var.internal, "select")
-				val out = t.define[Set[v]](s.lens.schema.setTag, Var.internal, "select")
-				(List(n(Node.PStateNode(s.lens.pstate.id, CompiledPath.from(s.lens.path), PStateOp.Select(intermediate.vid, out.vid, s.options)))), out.asInstanceOf[Var[A]])
+				val out = t.define[List[v]](s.lens.schema.listTag, Codec.forList(s.lens.schema.v.codec), Var.internal, "select")
+				val path = CompiledPath.from(s.lens.path, s.lens.schema.itemTag.tag, Codec.notImplemented)
+				(List(n(Node.PStateNode(s.lens.pstate.id, path, PStateOp.Select(out.vid, s.options)))), out.asInstanceOf[Var[A]])
 
 			case Flow.LocalAppend(depot, value) =>
 				(List(n(Node.LocalAppend(depot.id, value.vid))), Var.unit.asInstanceOf[Var[A]])

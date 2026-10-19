@@ -261,7 +261,7 @@ class Partition(
 								op match {
 									case PStateOp.Add(v) => (Some(currentSet.incl(env(v))), env)
 									case PStateOp.Remove(v) => (Some(currentSet.excl(env(v))), env)
-									case PStateOp.Select(_intermediate, out, options) => {
+									case PStateOp.Select(out, options) => {
 										// TODO: implement limit
 										val ord: Ordering[Any] = options.ord.asInstanceOf[Ordering[Any]]
 										val fullList = currentSet.toList.sorted(using ord)
@@ -280,7 +280,7 @@ class Partition(
 										(current, env.updated(out, result))
 									}
 
-									case PStateOp.Get(_intermediate, out: VarId) => (current, env.updated(out, current))
+									case PStateOp.Get(out: VarId) => (current, env.updated(out, current))
 									case PStateOp.Put(v: VarId) => (Some(env(v)), env)
 									// case PStateOp.Delete(v: VarId) => (None, env)
 								}

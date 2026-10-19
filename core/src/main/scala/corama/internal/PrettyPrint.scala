@@ -58,8 +58,8 @@ object PrettyPrint {
 					n.op match {
 						case _: Add => (None, Nil)
 						case _: Remove =>(None, Nil)
-						case Select(intermediate, out, options) => (Some(out), Nil)
-						case Get(intermediate, out) => (Some(out), Nil)
+						case Select(out, options) => (Some(out), Nil)
+						case Get(out) => (Some(out), Nil)
 						case _: Put => (None, Nil)
 					}
 				}

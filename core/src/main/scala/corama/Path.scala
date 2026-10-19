@@ -3,6 +3,7 @@ package corama
 import cats.data.NonEmptyList
 import cats.syntax.all.*
 import izumi.reflect.Tag
+import izumi.reflect.macrortti.LightTypeTag
 
 // TODO: how can we encode path components? They can be arbitrary
 // binary, and we need to distinguish e.g. [ab, cd] from [a, bc, d]
@@ -32,18 +33,21 @@ object CompiledPath {
 	case class Variable(id: VarId) extends Component
 	
 	// strip down to minimum information needed for serialization,
-	// in particular keeping only the varId for vars
-	def from(path: Path): CompiledPath = {
+	// in particular keeping only the varId for vars.
+	// The tag and codec reflect the type which gets persisted:
+	// - select: T, not List[T]
+	// - get / update / put: T, not Option[T]
+	def from(path: Path, terminalTag: LightTypeTag, codec: AnyCodec): CompiledPath = {
 		CompiledPath(path.raw.map { part =>
 			part.value match {
 				case lit: Var.Literal[?] => Literal(lit.value)
 				case v: Var[?] => Variable(v.vid)
 			}
-		})
+		}, terminalTag, codec)
 	}
 }
 
-private [corama] case class CompiledPath(path: NonEmptyList[CompiledPath.Component]) {
+private [corama] case class CompiledPath(path: NonEmptyList[CompiledPath.Component], terminalTag: LightTypeTag, codec: AnyCodec) {
 	import CompiledPath._
 	def ins: List[VarId] = path.toList.mapFilter {
 		case Literal(inner) => None

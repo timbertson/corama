@@ -22,9 +22,37 @@ import corama.Schema.SetSchema
 import corama.Subindex.NonIndexed
 import corama.Subindex.Indexed
 import com.rpl.rama.SubindexOptions
+import corama.rama.CodecRegistry.tagAny
+import Tagged.untagAny
+import izumi.reflect.Tag
+import izumi.reflect.macrortti.LightTypeTag
+
+/*
+Note on serialization in the rama backend:
+
+Rama's serialization is based on concrete, erased types - it's not possible to define a serializer for List[A] given a serializer for A. You can only define
+a serializer for all lists.
+
+Idiomatic rama usage gets around this in two ways:
+ - use untyped objects (arrays / maps containing primitives which are each already supported)
+ - use concrete classes for each serializable object (ListOfUsers, etc)
+
+This backend relies on the `Codec` typeclass, allowing unobtrusive and generic definitions of codecs.
+In order to interoperate with rama, the generated topologies wrap EVERY stored value (in a pstate, depot, etc) as a `Tagged` value.
+
+Wrapping everything obviously has overheads on serialization, time and memory usage. Ultimately I'd like to integrate more efficiently with rama.
+One way this could work is by allowing users to provide explicit codecs or IDs in the DSL everywhere a serializable object is provided,
+instead of rama's requirement to have the class itself inherit from RamaSerializable. This would be more efficient,
+but the API would be cumbersome (useful as a compile target, but not for humans).
+
+TODO: functions and their closures are serializable through some kind of magic. It might be useful to preemtively attempt to serialize all functions,
+to flush out unserializable types with a more useful error message.
+*/
 
 class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
 	import RamaBackend._
+	private val codecRegistry = new CodecRegistry()
+
 	def install(topologies: corama.Topologies): Unit = {
 		// TODO: would you ever need multiple stream topologies?
 		val streamTopology = ramaTopologies.stream("main")
@@ -48,6 +76,9 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 
 		topologies.topologies.foreach { t =>
 			val id = t.builder.source
+			t.builder.vars.all.foreach { v =>
+				codecRegistry.register(v.tag, v.codec)
+			}
 			val compiled = compileNodes(t.compiled._1)
 
 			t.builder.source.namespace match {
@@ -62,21 +93,160 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 							.`macro`(compiled)
 					} else {
 						streamTopology.source(
-							compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.agg))
+							compileIdentity(id), StreamSourceOptions.ackReturnAgg(compileCombiner(t.agg, t.tagR.tag))
 						).out(compileVar(t.input))
 							.`macro`(compiled)
 							.ackReturn(compileVar(t.compiled._2))
 					}
 
 				case IdentityNamespace.Query =>
-					ramaTopologies.query(compileIdentity(id), compileVar(t.input.vid)).out(compileVar(t.queryOutputVar.vid))
+					codecRegistry.register(t.tagR, t.codec)
+					val queryOutputVar = unsafeInternalVar(t.compiled._2.vid, "out", tag = t.tagR.tag)
+					ramaTopologies.query(compileIdentity(id), compileVar(t.input.vid)).out(compileVar(queryOutputVar))
 						.`macro`(compiled)
 						.originPartition()
-						.agg(rama.Agg.combiner(compileCombiner(t.agg), compileVar(t.compiled._2.vid))).out(compileVar(t.queryOutputVar.vid))
+						.agg(rama.Agg.combiner(compileCombiner(t.agg, t.tagR.tag), compileVar(t.compiled._2.vid))).out(compileVar(queryOutputVar))
 
 				case IdentityNamespace.PState => ()
 			}
 		}
+	}
+
+	private def compileNodes(nodes: List[Node]): Block.Impl =
+		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
+
+	private def compileNode(node: Node): Block.Impl = node.op match {
+		case Node.Dynamic(pos, ins, fn, op) => {
+			// TODO: error reporting using the `pos`
+			val inVars = ins.map(compileVar)
+			def compileOp(op: DynamicOp): Block.Impl = op match {
+				case DynamicOp.Map(out) => {
+					val each = inVars match {
+						case Nil => Block.each(() => out.tagAny(fn(Nil)))
+						case List(a) => Block.each(a => out.tagAny(fn(List(untagAny(a)))), a)
+						case List(a, b) => Block.each((a,b) => out.tagAny(fn(List(untagAny(a), untagAny(b)))), a, b)
+						case other => throw new NotImplementedError(s"map[${other.length}]")
+					}
+					each.out(compileVar(out))
+				}
+
+			/** Fan-out as a Rama operation: emit once per element of the computed sequence.
+				*
+				* Note this uses `RamaOperation` + `OutputCollector` rather than `Ops.EXPLODE`
+				* over a returned collection. This saves converting to a java list.
+				*/
+				case DynamicOp.Explode(out) => {
+					val block = inVars match {
+						case List(a) => Block.each(new RamaOperation1[Tagged[Any]] {
+							override def invoke(a: Tagged[Any], collector: OutputCollector) = {
+								fn(List(a.untag)).asInstanceOf[Seq[Any]].foreach(x => collector.emit(out.tagAny(x)))
+							}
+						}, a)
+						case other => throw new NotImplementedError(s"Explode[${other.length}]")
+					}
+					block.out(compileVar(out))
+				}
+
+				case DynamicOp.Filter(condVar) =>
+					// map to a raw bool, then apply keepTrue
+					val rawVar = unsafeInternalVar(condVar, "raw")
+					compileOp(op = DynamicOp.Map(condVar)).`macro`(
+						unwrapPrimitiveInto(condVar, rawVar)
+					).keepTrue(compileVar(rawVar))
+			}
+			compileOp(op)
+		}
+
+		case Node.If(cond, ifBlock, elseBlock, _) => {
+			val rawVar = unsafeInternalVar(cond, "raw")
+			unwrapPrimitiveInto(cond, rawVar).`macro`(Block.ifTrue(
+				compileVar(rawVar),
+				Block.create().`macro`(compileNodes(ifBlock)),
+				Block.create().`macro`(compileNodes(elseBlock)),
+			))
+		}
+
+		case Node.Partition(in) => {
+			val rawVar = unsafeInternalVar(in, "raw")
+			unwrapPrimitiveInto(in, rawVar).hashPartition(compileVar(rawVar))
+		}
+
+		case Node.Assign(in, out) =>
+			if (in === Var.unit.vid) {
+				// TODO: is there any need to use Tagged here?
+				Block.each(() => Tagged(())).out(compileVar(out))
+			} else {
+				Block.each(identity, compileVar(in)).out(compileVar(out))
+			}
+
+		case Node.Combine(block, agg, collectFrom, out) =>
+			Block.create()
+				.`macro`(compileNodes(block))
+				.`macro`(Block.agg(Agg.combiner(compileCombiner(agg, out.tag), compileVar(collectFrom))).out(compileVar(out)))
+
+		case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
+			val ramaPath = compilePath(path)
+			// Rama models read-modify-write as a `term` on the path: the function
+			// receives the current value (null when absent) and returns the new one.
+			def wrapResult(newVal: Option[Any]) = newVal.map(Tagged.explicit(_, path.terminalTag)).orNull
+
+			val mutation = ins match {
+				case Nil => ramaPath.term(current => wrapResult(fn(Option(current).map(untagAny), Nil)))
+				case List(a) => ramaPath.term((current, a) => wrapResult(fn(Option(current).map(untagAny), List(a))), compileVar(a))
+				case List(a, b) => ramaPath.term((current, a, b) => wrapResult(fn(Option(current).map(untagAny), List(a, b))), compileVar(a), compileVar(b))
+				case other => throw new NotImplementedError(s"PStateUpdate[${other.length}]")
+			}
+			Block.localTransform(compileIdentity(ps), mutation)
+
+		case Node.PStateNode(psId, path, op) => {
+			// The path tag reflects the intermediate / item type, whereas the returned Var is often a wrapper type (like List[T] or Option[T]).
+			// Var types are automatically registered, ensure the raw item types are registered too.
+			codecRegistry.registerRaw(path.terminalTag, path.codec)
+
+			val ramaPath = compilePath(path)
+			val ps = compileIdentity(psId)
+			// Rama models read-modify-write as a `term` on the path: the function
+			// receives the current value (null when absent) and returns the new one.
+			op match {
+				// TODO: seems like `nullToSet` would be required when navigating into nonexistent sets.
+				// This doesn't work for subindexes sets (it overwrites the value to be a regular HashSet),
+				// TBD whether it's actually needed for sets.
+				case PStateOp.Add(v: VarId) =>
+					Block.localTransform(ps, ramaPath /*.nullToSet() */ .voidSetElem().termVal(compileVar(v)))
+
+				case PStateOp.Remove(v: VarId) =>
+					Block.localTransform(ps, ramaPath /*.nullToSet() */ .setElem(compileVar(v)).termVoid())
+
+				case PStateOp.Select(out: VarId, opts) =>
+					val intermediate = unsafeInternalVar(out, "intermediate")
+					val setPath = ramaPath // .nullToSet()
+					val fullPath = opts match {
+						case SelectOptions(Some(after), Some(limit), _) => setPath.sortedSetRangeFrom(compileVar(after), limit)
+						case SelectOptions(None, Some(limit), _) => setPath.sortedSetRangeFromStart(limit)
+						case SelectOptions(Some(after), None, _) => setPath.sortedSetRangeFrom(compileVar(after))
+						case SelectOptions(None, None, _) => setPath
+					}
+					Block.localSelect(ps, fullPath)
+						.out(compileVar(intermediate))
+						// move the tagging from each element to the list itself
+						.each((jlist: java.util.Collection[Any]) => out.tagAny(jlist.asScala.toList.map(untagAny)), compileVar(intermediate))
+						.out(compileVar(out))
+
+				case PStateOp.Get(out: VarId) => {
+					val intermediate = unsafeInternalVar(out, "intermediate", tag = path.terminalTag)
+					Block.localSelect(ps, ramaPath)
+						.out(compileVar(intermediate))
+						.each(v => intermediate.tagAny(Option(v).map(untagAny)), compileVar(intermediate))
+						.out(compileVar(out))
+				}
+
+				case PStateOp.Put(v: VarId) => Block.localTransform(ps, ramaPath.termVal(compileVar(v)))
+				// case PStateOp.Delete(v: VarId) => Block.localTransform(ps, ramaPath).termVoid()
+			}
+		}
+
+		case Node.LocalAppend(dep, value) =>
+			Block.depotPartitionAppend(compileIdentity(dep), compileVar(value))
 	}
 }
 
@@ -142,134 +312,12 @@ object RamaBackend {
 	// 	}
 
 
-	private def compileNode(node: Node): Block.Impl = node.op match {
-		case Node.Dynamic(pos, ins, fn, op) => {
-			// TODO: error reporting using the `pos`
-			val inVars = ins.map(compileVar)
-			def compileOp(op: DynamicOp): Block.Impl = op match {
-				case DynamicOp.Map(out) => {
-					val each = inVars match {
-						case Nil => Block.each(() => fn(Nil))
-						case List(a) => Block.each(a => fn(List(a)), a)
-						case List(a, b) => Block.each((a,b) => fn(List(a,b)), a, b)
-						case other => throw new NotImplementedError(s"map[${other.length}]")
-					}
-					each.out(compileVar(out))
-				}
-
-			/** Fan-out as a Rama operation: emit once per element of the computed sequence.
-				*
-				* Note this uses `RamaOperation` + `OutputCollector` rather than `Ops.EXPLODE`
-				* over a returned collection. This saves converting to a java list.
-				*/
-				case DynamicOp.Explode(out) => {
-					val block = inVars match {
-						case List(a) => Block.each(new RamaOperation1[Any] {
-							override def invoke(a: Any, collector: OutputCollector) = {
-								fn(List(a)).asInstanceOf[Seq[Any]].foreach(x => collector.emit(x))
-							}
-						}, a)
-						case other => throw new NotImplementedError(s"Explode[${other.length}]")
-					}
-					block.out(compileVar(out))
-				}
-
-				case DynamicOp.Filter(condVar) =>
-					// compile to a Map, then apply keepTrue
-					compileOp(op = DynamicOp.Map(condVar)).`macro`(Block.keepTrue(compileVar(condVar)))
-			}
-			compileOp(op)
-		}
-
-		case Node.If(cond, ifBlock, elseBlock, _) => {
-			Block.ifTrue(
-				compileVar(cond),
-				Block.create().`macro`(compileNodes(ifBlock)),
-				Block.create().`macro`(compileNodes(elseBlock)),
-			)
-		}
-
-		case Node.Partition(in) => Block.hashPartition(compileVar(in))
-
-		case Node.Assign(in, out) =>
-			println(s"Assigning ${in} -> ${out}")
-			if (in === Var.unit.vid) {
-				Block.each(() => ()).out(compileVar(out))
-			} else {
-				Block.each(identity, compileVar(in)).out(compileVar(out))
-			}
-
-		case Node.Combine(block, agg, collectFrom, out) =>
-			Block.create()
-				.`macro`(compileNodes(block))
-				.`macro`(Block.agg(Agg.combiner(compileCombiner(agg), compileVar(collectFrom))).out(compileVar(out)))
-
-		case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
-			val ramaPath = compilePath(path)
-			// Rama models read-modify-write as a `term` on the path: the function
-			// receives the current value (null when absent) and returns the new one.
-			val mutation = ins match {
-				case Nil => ramaPath.term(current => fn(Option(current), Nil).orNull)
-				case List(a) => ramaPath.term((current, a) => fn(Option(current), List(a)).orNull, compileVar(a))
-				case List(a, b) => ramaPath.term((current, a, b) => fn(Option(current), List(a, b)).orNull, compileVar(a), compileVar(b))
-				case other => throw new NotImplementedError(s"PStateUpdate[${other.length}]")
-			}
-			Block.localTransform(compileIdentity(ps), mutation)
-
-		case Node.PStateNode(psId, path, op) => {
-			println(s"compiling rama path ${path} for op ${op} on ${psId}")
-			val ramaPath = compilePath(path)
-			val ps = compileIdentity(psId)
-			// Rama models read-modify-write as a `term` on the path: the function
-			// receives the current value (null when absent) and returns the new one.
-			op match {
-				// TODO: seems like `nullToSet` would be required when navigating into nonexistent sets.
-				// This doesn't work for subindexes sets (it overwrites the value to be a regular HashSet),
-				// TBD whether it's actually needed for sets.
-				case PStateOp.Add(v: VarId) =>
-					Block.localTransform(ps, ramaPath /*.nullToSet() */ .voidSetElem().termVal(compileVar(v)))
-
-				case PStateOp.Remove(v: VarId) =>
-					Block.localTransform(ps, ramaPath /*.nullToSet() */ .setElem(compileVar(v)).termVoid())
-
-				case PStateOp.Select(intermediate: VarId, out: VarId, opts) =>
-					val setPath = ramaPath // .nullToSet()
-					val fullPath = opts match {
-						case SelectOptions(Some(after), Some(limit), _) => setPath.sortedSetRangeFrom(compileVar(after), limit)
-						case SelectOptions(None, Some(limit), _) => setPath.sortedSetRangeFromStart(limit)
-						case SelectOptions(Some(after), None, _) => setPath.sortedSetRangeFrom(compileVar(after))
-						case SelectOptions(None, None, _) => setPath
-					}
-					Block.localSelect(ps, fullPath)
-						.out(compileVar(intermediate))
-						.each((jlist: java.util.Collection[Any]) => jlist.asScala.toList, compileVar(intermediate))
-						.out(compileVar(out))
-
-				case PStateOp.Get(intermediate: VarId, out: VarId) => {
-					Block.localSelect(ps, ramaPath)
-						.out(compileVar(intermediate))
-						.each(Option.apply, compileVar(intermediate))
-						.out(compileVar(out))
-				}
-
-				case PStateOp.Put(v: VarId) => Block.localTransform(ps, ramaPath.termVal(compileVar(v)))
-				// case PStateOp.Delete(v: VarId) => Block.localTransform(ps, ramaPath).termVoid()
-			}
-		}
-
-		case Node.LocalAppend(dep, value) =>
-			Block.depotPartitionAppend(compileIdentity(dep), compileVar(value))
-	}
-
-	private def compileNodes(nodes: List[Node]): Block.Impl =
-		nodes.foldLeft(Block.create())((acc, n) => acc.`macro`(compileNode(n)))
-
-	private def compileCombiner[O](agg: corama.Agg[O]): RamaCombinerAgg[O] = {
+	private def compileCombiner[O](agg: corama.Agg[O], tag: LightTypeTag): RamaCombinerAgg[Tagged[O]] = {
 		val zero = agg.zero
 		val combineFn = agg.combine
-		new RamaCombinerAgg[O] {
-			override def zeroVal(): O = zero
-			override def combine(current: O, value: O): O = combineFn(current, value)
+		new RamaCombinerAgg[Tagged[O]] {
+			override def zeroVal(): Tagged[O] = Tagged.explicit(zero, tag)
+			override def combine(current: Tagged[O], value: Tagged[O]): Tagged[O] = Tagged.explicit(combineFn(current.untag, value.untag), tag)
 		}
 	}
 	
@@ -291,7 +339,7 @@ object RamaBackend {
 		}
 
 		schema match {
-			case ClassSchema(tag) => Left(tag.closestClass)
+			case _: ClassSchema[?] => Left(classOf[Tagged[?]])
 
 			case FixedKeySchema(shape) => {
 				val pairs = shape.toList.flatMap {
@@ -308,9 +356,24 @@ object RamaBackend {
 				}))
 			}
 
-			case setSchema @ SetSchema(v, index, setTag, ord) => {
-				Right(applyIndexing(setSchema, rama.PState.setSchema(v.tag.closestClass)))
+			case s: SetSchema[?] => {
+				Right(applyIndexing(s, rama.PState.setSchema(s.v.tag.closestClass)))
 			}
 		}
+	}
+
+	private val untagAccessor: RamaFunction1[Tagged[Any], Any] = _.untag
+
+	// used to get e.g. boolean from a Tagged[Boolean], for low level rama APIs which use a specific primitive type
+	private def unwrapPrimitiveInto[A](source: VarId, dest: VarId): Block.Impl = {
+		Block.each(untagAccessor, compileVar(source)).out(compileVar(dest))
+	}
+	
+	// This is not a valid var in general, as the ID is not unique and the tag is not accurate.
+	// It must only be used for:
+	//  - local consumption (i.e. not cross-partition)
+	//  - internal (i.e. not exposed as a var that user code can reference)
+	private def unsafeInternalVar(base: VarId, suffix: String, tag: LightTypeTag = implicitly[Tag[Any]].tag) = {
+		VarId(id = base.id, hint = s"${base.hint}|${suffix}", tag = tag)
 	}
 }

@@ -50,7 +50,11 @@ trait Codec[A] {
 	def decode(bytes: Bytes): Try[A]
 }
 
+type AnyCodec = Codec[?]
+
 object Codec {
+	def apply[A](implicit codec: Codec[A]) = codec
+
 	// this one's explicit, otherwise we may pick up unintended instances
 	def json[T](implicit cd: circe.Decoder[T], ce: circe.Encoder[T]): Codec[T] = new Codec[T] {
 		import io.circe.syntax.*
@@ -93,6 +97,19 @@ object Codec {
 	implicit val forUnit: Codec[Unit] = new Codec {
 		def decode(bytes: Bytes): Try[Unit] = Success(())
 		def encode(a: Unit): Bytes = Array.empty[Byte]
+	}
+
+	implicit val forBool: Codec[Boolean] = new Codec {
+		def decode(bytes: Bytes): Try[Boolean] = bytes match {
+			case Array(c) => c match {
+				case 0 => Success(false)
+				case 1 => Success(true)
+				case other => Failure(err(s"Invalid boolean byte: ${other.toShort}"))
+			}
+			case other => Failure(err("Bytes has incorrect length"))
+		}
+
+		def encode(b: Boolean): Array[Byte] = Array[Byte](if b then 1 else 0)
 	}
 
 	implicit val forInt: Codec[Int] = new Codec {
@@ -153,6 +170,11 @@ object Codec {
 	implicit def forProtobufMessage[M <: GeneratedMessage](implicit C: GeneratedMessageCompanion[M]): Codec[M] = new Codec {
 		def decode(bytes: Bytes): Try[M] = Try(C.parseFrom(bytes))
 		def encode(a: M): Bytes = a.toByteArray
+	}
+	
+	def notImplemented[A] = new Codec[A] {
+		def encode(a: A): Bytes = Array.emptyByteArray
+		def decode(bytes: Bytes): Try[A] = Failure(new NotImplementedError("Codec.notImplemented"))
 	}
 
 	private def viaByteBuffer(fn: ByteBuffer => Unit, sizeHint: Int = 64): Bytes = {

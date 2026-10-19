@@ -23,14 +23,14 @@ object Flow {
 	private[corama] case class Pure[A](v: Var[A]) extends Flow[A, Any]
 
 	private[corama] case class Bind[A, B, C1, C2](pos: SourcePos, fa: Flow[A, C1], k: Var[A] => Flow[B, C2]) extends Flow[B, C1 & C2]
-	private[corama] case class MapN[O](tag: Tag[O], pos: SourcePos, ins: List[Var[Any]], f: List[Any] => O) extends Flow[O, Any]
+	private[corama] case class MapN[O](tag: Tag[O], codec: Codec[O], pos: SourcePos, ins: List[Var[Any]], f: List[Any] => O) extends Flow[O, Any]
 
-	private[corama] case class ExplodeOp[O](tag: Tag[O], pos: SourcePos, ins: List[Var[Any]], f: List[Any] => Seq[O]) extends Flow[O, Any]
+	private[corama] case class ExplodeOp[O](tag: Tag[O], codec: Codec[O], pos: SourcePos, ins: List[Var[Any]], f: List[Any] => Seq[O]) extends Flow[O, Any]
 	private[corama] case class FilterOp[I](pos: SourcePos, ins: List[Var[Any]], f: List[Any] => Boolean) extends Flow[Unit, Any]
 	private[corama] case class Partition[I](in: Var[I]) extends Flow[Unit, Any]
 
-	private[corama] case class If[A, C0, C1, C2](tag: Tag[A], cond: Flow[Boolean, C0], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C0 & C1 & C2]
-	private[corama] case class Combine[A, Ctx](tag: Tag[A], block: Flow[A, Ctx], agg: corama.Agg[A]) extends Flow[A, Ctx & Batch]
+	private[corama] case class If[A, C0, C1, C2](tag: Tag[A], codec: Codec[A], cond: Flow[Boolean, C0], ifBlock: Flow[A, C1], elseBlock: Flow[A, C2]) extends Flow[A, C0 & C1 & C2]
+	private[corama] case class Combine[A, Ctx](tag: Tag[A], codec: Codec[A], block: Flow[A, Ctx], agg: corama.Agg[A]) extends Flow[A, Ctx & Batch]
 
 	// PState. Reads are available anywhere — a query topology reads PStates, that is
 	// what it is for. Writes require `Etl`: "a PState can only be updated by the ETL
@@ -47,12 +47,12 @@ object Flow {
 
 	def of[A](v: Var[A]): Flow[A, Any] = Pure(v)
 
-	def pure[A](value: A)(implicit pos: SourcePos, tag: Tag[A]): Flow[A, Any] = {
+	def pure[A](value: A)(implicit pos: SourcePos, codec: Codec[A], tag: Tag[A]): Flow[A, Any] = {
 		// TODO this can probably be optimised
-		Flow.MapN(tag, pos, Nil, _ => value)
+		Flow.MapN(tag, codec, pos, Nil, _ => value)
 	}
 
-	def foreach[O](f: () => O)(implicit pos: SourcePos, tag: Tag[O]): Flow[O, Any] = MapN(tag, pos, Nil, _ => f())
+	def foreach[O](f: () => O)(implicit tag: Tag[O], codec: Codec[O], pos: SourcePos): Flow[O, Any] = MapN(tag, codec, pos, Nil, _ => f())
 
 	/** Move downstream execution to the partition owning `v`.
 	  */

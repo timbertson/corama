@@ -23,18 +23,18 @@ sealed trait IndexableSchema extends Schema {
 // memory
 object Schema {
 	// static shape
-	case class ClassSchema[A] private[corama](tag: Tag[A]) extends LeafSchema[A]
+	case class ClassSchema[A] private[corama](codec: Codec[A], tag: Tag[A], optionTag: Tag[Option[A]]) extends LeafSchema[A]
 	case class FixedKeySchema private[corama](shape: Map[String, Schema]) extends Schema
 
 	// sub-indexable shapes
 	case class MapSchema[A] private[corama](k: ClassSchema[A], v: Schema, index: Subindex) extends IndexableSchema
-	case class SetSchema[A] private[corama](v: ClassSchema[A], index: Subindex, setTag: Tag[Set[A]], ord: Ordering[A]) extends IndexableSchema with LeafSchema[A]
+	case class SetSchema[A] private[corama](v: ClassSchema[A], index: Subindex, itemTag: Tag[A], codec: Codec[A], listTag: Tag[List[A]], ord: Ordering[A]) extends IndexableSchema with LeafSchema[A]
 	
-	def apply[T](implicit tag: Tag[T]) = ClassSchema(tag)
+	def apply[T](implicit codec: Codec[T], tag: Tag[T], optTag: Tag[Option[T]]) = ClassSchema(codec, tag, optTag)
 	val string = apply[String]
 	def fixed(pairs: (String, Schema)*) = FixedKeySchema(pairs.toMap)
 
-	def mapOf[K](v: Schema, subindex: Subindex)(implicit kTag: Tag[K]) = MapSchema(ClassSchema(kTag), v, subindex)
-	def set[A](subindex: Subindex)(implicit atag: Tag[A], setTag: Tag[Set[A]], ord: Ordering[A]) =
-		SetSchema[A](apply[A](using atag), subindex, setTag, ord)
+	def mapOf[K](v: Schema, subindex: Subindex)(implicit kCodec: Codec[K], kTag: Tag[K], kTagOpt: Tag[Option[K]]) = MapSchema(ClassSchema(kCodec, kTag, kTagOpt), v, subindex)
+	def set[A](subindex: Subindex)(implicit atag: Tag[A], codec: Codec[A], listTag: Tag[List[A]], ord: Ordering[A]) =
+		SetSchema[A](apply[A], subindex, atag, codec, listTag, ord)
 }
