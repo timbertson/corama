@@ -1,23 +1,22 @@
 package corama
 
-import com.rpl.rama.RamaSerializable
 import cats.Monoid
 
-// Serializable wrapper type for Either[String, T]
-case class Result[T](value: Either[String, T]) extends RamaSerializable
+// Utilities for Either[String, T]
+type Result[T] = Either[String, T]
 object Result {
-	type Void = Result[Unit]
-	def empty[T : Monoid]: Result[T] = Result(Right(Monoid[T].empty))
+	type Void = Either[String,Unit]
+
+	def empty[T : Monoid]: Either[String,T] = Right(Monoid[T].empty)
 	
-	def failure[T](s: String): Result[T] = Result[T](Left(s))
+	def failure[T](s: String): Either[String,T] = Left(s)
 
-	def success[T](v: T): Result[T] = Result(Right(v))
+	def success[T](v: T): Either[String,T] = Right(v)
 
-	def unit: Result[Unit] = success[Unit](())
+	def unit: Either[String,Unit] = Right(())
 
-	def agg[T](implicit M: Monoid[T]): Agg[Result[T]] =
-		Agg(Result(Right(M.empty)), { (a,b) =>
-			Result(a.value.flatMap(a => b.value.map(M.combine(a, _))))
+	def agg[T](implicit M: Monoid[T]): Agg[Either[String,T]] =
+		Agg(Right(M.empty), { (a,b) =>
+			a.flatMap(a => b.map(M.combine(a, _)))
 		})
 }
-

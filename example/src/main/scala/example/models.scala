@@ -5,12 +5,21 @@ import com.rpl.rama._
 import com.rpl.rama.ops.RamaFunction2
 import com.rpl.rama.ops.RamaFunction1
 import java.lang.{Long => JLong}
+	import io.circe.generic.auto._
+import corama.Codec
 
 type JLong = java.lang.Long
 
 case class Ticket(id: JLong, requester: String, description: String) extends RamaSerializable
+object Ticket {
+	implicit val codec: Codec[Ticket] = Codec.json
+}
 
 case class FullTicket(upstream: Ticket, assignee: Option[JLong], assigneeName: Option[String]) extends RamaSerializable
+object FullTicket {
+	implicit val codec: Codec[FullTicket] = Codec.json
+}
+
 object UpdateTicketAssigneeName extends RamaFunction2[FullTicket, String, FullTicket]{
 	override def invoke(t: FullTicket, n: String): FullTicket =
 		t.copy(assigneeName = Option(n))
@@ -19,19 +28,33 @@ object UpdateTicketAssigneeName extends RamaFunction2[FullTicket, String, FullTi
 case class TicketAssignment(ticketId: JLong, assigneeId: JLong) extends RamaSerializable
 
 case class PropagateTicketAssignment(ticketId: JLong, assignee: JLong, prevAssignee: Option[JLong]) extends RamaSerializable
+object PropagateTicketAssignment {
+	implicit val codec: Codec[PropagateTicketAssignment] = Codec.json
+}
+
 class PropagateTicketAssignmentKey extends RamaFunction1[PropagateTicketAssignment, JLong] {
 	override def invoke(assignment: PropagateTicketAssignment): JLong = assignment.ticketId
 }
 
 case class User(id: JLong, email: String, name: String) extends RamaSerializable
+object User {
+	implicit val codec: Codec[User] = Codec.json
+}
 
 case class UserNameChange(userId: JLong, name: String) extends RamaSerializable
+object UserNameChange {
+	implicit val codec: Codec[UserNameChange] = Codec.json
+}
 
 case class UserTicketsRequest(userId: JLong, cursor: Option[JLong] = None) extends RamaSerializable
-case class UserTicketsResponse(tickets: List[Ticket], nextCursor: Option[JLong]) extends RamaSerializable
+object UserTicketsRequest {
+	implicit val codec: Codec[UserTicketsRequest] = Codec.json
+}
 
+case class UserTicketsResponse(tickets: List[Ticket], nextCursor: Option[JLong]) extends RamaSerializable
 object UserTicketsResponse {
 	val empty = UserTicketsResponse(Nil, None)
+	implicit val codec: Codec[UserTicketsResponse] = Codec.json
 }
 
 class TicketIdExtractor extends RamaFunction1[Ticket, JLong] {
@@ -50,6 +73,9 @@ case class NoSuchTicket(id: JLong) extends RamaSerializable
 
 class AssignmentPartitioner extends RamaFunction1[TicketAssignment, JLong] {
 	override def invoke(assignment: TicketAssignment): JLong = assignment.assigneeId
+}
+object TicketAssignment {
+	implicit val codec: Codec[TicketAssignment] = Codec.json
 }
 
 class UserNameChangePartitioner extends RamaFunction1[UserNameChange, JLong] {
