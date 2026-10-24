@@ -54,9 +54,7 @@ object CodecRegistry {
 	implicit val tagEq: Eq[LightTypeTag] = Eq.fromUniversalEquals
 	private val anyTag = implicitly[Tag[Any]].tag
 	
-	extension (v: VarId) {
-		def tagAny(value: Any): Tagged[Any] = new Tagged(value, anyTag)
-	}
+	def tagAny(value: Any): Tagged[Any] = new Tagged(value, anyTag)
 }
 
 class CodecRegistry() {
@@ -81,20 +79,6 @@ class CodecRegistry() {
 			}
 		}
 	}
-	
-	// def register[A](s: Tagged[A])(using c: Codec[A]) = {
-	// 	val id = CodecRegistry.id(s.tag)
-	// 	idMap.get(id) match {
-	// 		case Some(entry) => if (entry.tag =!= s.tag) {
-	// 			throw new Error(s"CodecRegistry type collision - both ${entry.tag} and ${s.tag} have the same hash")
-	// 		}
-	// 		case None => {
-	// 			val entry = Entry(id, s.tag, c)
-	// 			idMap.update(id, entry)
-	// 			typeMap.update(s.tag, entry)
-	// 		}
-	// 	}
-	// }
 
 	def forTag(tag: LightTypeTag): Entry[?] = typeMap.getOrElse(tag, throw new RuntimeException(s"Unregistered type tag: $tag"))
 

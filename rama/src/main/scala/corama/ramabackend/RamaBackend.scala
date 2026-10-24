@@ -122,9 +122,9 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 			def compileOp(op: DynamicOp): Block.Impl = op match {
 				case DynamicOp.Map(out) => {
 					val each = inVars match {
-						case Nil => Block.each(() => out.tagAny(fn(Nil)))
-						case List(a) => Block.each(a => out.tagAny(fn(List(untagAny(a)))), a)
-						case List(a, b) => Block.each((a,b) => out.tagAny(fn(List(untagAny(a), untagAny(b)))), a, b)
+						case Nil => Block.each(() => tagAny(fn(Nil)))
+						case List(a) => Block.each(a => tagAny(fn(List(untagAny(a)))), a)
+						case List(a, b) => Block.each((a,b) => tagAny(fn(List(untagAny(a), untagAny(b)))), a, b)
 						case other => throw new NotImplementedError(s"map[${other.length}]")
 					}
 					each.out(compileVar(out))
@@ -139,7 +139,7 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 					val block = inVars match {
 						case List(a) => Block.each(new RamaOperation1[Tagged[Any]] {
 							override def invoke(a: Tagged[Any], collector: OutputCollector) = {
-								fn(List(a.untag)).asInstanceOf[Seq[Any]].foreach(x => collector.emit(out.tagAny(x)))
+								fn(List(a.untag)).asInstanceOf[Seq[Any]].foreach(x => collector.emit(tagAny(x)))
 							}
 						}, a)
 						case other => throw new NotImplementedError(s"Explode[${other.length}]")
@@ -188,7 +188,10 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 			val ramaPath = compilePath(path)
 			// Rama models read-modify-write as a `term` on the path: the function
 			// receives the current value (null when absent) and returns the new one.
-			def wrapResult(newVal: Option[Any]) = newVal.map(Tagged.explicit(_, path.terminalTag)).orNull
+			// The lambdas below are java-serialized by rama, so they must only capture
+			// serializable values - not `path` (which holds a non-serializable Codec).
+			val termTag = path.terminalTag
+			def wrapResult(newVal: Option[Any]) = newVal.map(Tagged.explicit(_, termTag)).orNull
 
 			val mutation = ins match {
 				case Nil => ramaPath.term(current => wrapResult(fn(Option(current).map(untagAny), Nil)))
@@ -229,14 +232,14 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 					Block.localSelect(ps, fullPath)
 						.out(compileVar(intermediate))
 						// move the tagging from each element to the list itself
-						.each((jlist: java.util.Collection[Any]) => out.tagAny(jlist.asScala.toList.map(untagAny)), compileVar(intermediate))
+						.each((jlist: java.util.Collection[Any]) => tagAny(jlist.asScala.toList.map(untagAny)), compileVar(intermediate))
 						.out(compileVar(out))
 
 				case PStateOp.Get(out: VarId) => {
 					val intermediate = unsafeInternalVar(out, "intermediate", tag = path.terminalTag)
 					Block.localSelect(ps, ramaPath)
 						.out(compileVar(intermediate))
-						.each(v => intermediate.tagAny(Option(v).map(untagAny)), compileVar(intermediate))
+						.each(v => tagAny(Option(v).map(untagAny)), compileVar(intermediate))
 						.out(compileVar(out))
 				}
 
