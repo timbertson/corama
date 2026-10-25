@@ -1,6 +1,7 @@
 package corama
 
 import izumi.reflect.Tag
+import cats.Order
 
 sealed trait Subindex
 object Subindex {
@@ -28,13 +29,13 @@ object Schema {
 
 	// sub-indexable shapes
 	case class MapSchema[A] private[corama](k: ClassSchema[A], v: Schema, index: Subindex) extends IndexableSchema
-	case class SetSchema[A] private[corama](v: ClassSchema[A], index: Subindex, itemTag: Tag[A], codec: Codec[A], listTag: Tag[List[A]], ord: Ordering[A]) extends IndexableSchema with LeafSchema[A]
+	case class SetSchema[A] private[corama](v: ClassSchema[A], index: Subindex, itemTag: Tag[A], codec: Codec[A], listTag: Tag[List[A]], ord: Order[A]) extends IndexableSchema with LeafSchema[A]
 	
 	def apply[T](implicit codec: Codec[T], tag: Tag[T], optTag: Tag[Option[T]]) = ClassSchema(codec, tag, optTag)
 	val string = apply[String]
 	def fixed(pairs: (String, Schema)*) = FixedKeySchema(pairs.toMap)
 
 	def mapOf[K](v: Schema, subindex: Subindex)(implicit kCodec: Codec[K], kTag: Tag[K], kTagOpt: Tag[Option[K]]) = MapSchema(ClassSchema(kCodec, kTag, kTagOpt), v, subindex)
-	def set[A](subindex: Subindex)(implicit atag: Tag[A], codec: Codec[A], listTag: Tag[List[A]], ord: Ordering[A]) =
+	def set[A](subindex: Subindex)(implicit atag: Tag[A], codec: Codec[A], listTag: Tag[List[A]], ord: Order[A]) =
 		SetSchema[A](apply[A], subindex, atag, codec, listTag, ord)
 }

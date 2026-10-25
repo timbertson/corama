@@ -22,10 +22,11 @@ import corama.Schema.SetSchema
 import corama.Subindex.NonIndexed
 import corama.Subindex.Indexed
 import com.rpl.rama.SubindexOptions
-import corama.rama.CodecRegistry.tagAny
 import Tagged.untagAny
 import izumi.reflect.Tag
 import izumi.reflect.macrortti.LightTypeTag
+import com.rpl.rama.cluster.ClusterManagerBase
+import java.{util => ju}
 
 /*
 Note on serialization in the rama backend:
@@ -38,7 +39,7 @@ Idiomatic rama usage gets around this in two ways:
  - use concrete classes for each serializable object (ListOfUsers, etc)
 
 This backend relies on the `Codec` typeclass, allowing unobtrusive and generic definitions of codecs.
-In order to interoperate with rama, the generated topologies wrap EVERY stored value (in a pstate, depot, etc) as a `Tagged` value.
+In order to interoperate with rama, the generated topologies wrap EVERY stored value (in a pstate, depot, var, etc) as a `Tagged` value.
 
 Wrapping everything obviously has overheads on serialization, time and memory usage. Ultimately I'd like to integrate more efficiently with rama.
 One way this could work is by allowing users to provide explicit codecs or IDs in the DSL everywhere a serializable object is provided,
@@ -49,11 +50,9 @@ TODO: functions and their closures are serializable through some kind of magic. 
 to flush out unserializable types with a more useful error message.
 */
 
-class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies) {
+class RamaBackend(codecRegistry: CodecRegistry) {
 	import RamaBackend._
-	private val codecRegistry = new CodecRegistry()
-
-	def install(topologies: corama.Topologies): Unit = {
+	def install(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies, topologies: corama.Topologies): Unit = {
 		// TODO: would you ever need multiple stream topologies?
 		val streamTopology = ramaTopologies.stream("main")
 
@@ -121,10 +120,12 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 			val inVars = ins.map(compileVar)
 			def compileOp(op: DynamicOp): Block.Impl = op match {
 				case DynamicOp.Map(out) => {
+					// out.tag can't be used within closure, extract the raw ID
+					val outTag = CodecRegistry.id(out.tag)
 					val each = inVars match {
-						case Nil => Block.each(() => tagAny(fn(Nil)))
-						case List(a) => Block.each(a => tagAny(fn(List(untagAny(a)))), a)
-						case List(a, b) => Block.each((a,b) => tagAny(fn(List(untagAny(a), untagAny(b)))), a, b)
+						case Nil => Block.each(() => Tagged.explicit(fn(Nil), outTag))
+						case List(a) => Block.each(a => Tagged.explicit(fn(List(untagAny(a))), outTag), a)
+						case List(a, b) => Block.each((a,b) => Tagged.explicit(fn(List(untagAny(a), untagAny(b))), outTag), a, b)
 						case other => throw new NotImplementedError(s"map[${other.length}]")
 					}
 					each.out(compileVar(out))
@@ -136,10 +137,12 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 				* over a returned collection. This saves converting to a java list.
 				*/
 				case DynamicOp.Explode(out) => {
+					// outTag can't be used within closure
+					val outId = CodecRegistry.id(out.tag)
 					val block = inVars match {
 						case List(a) => Block.each(new RamaOperation1[Tagged[Any]] {
 							override def invoke(a: Tagged[Any], collector: OutputCollector) = {
-								fn(List(a.untag)).asInstanceOf[Seq[Any]].foreach(x => collector.emit(tagAny(x)))
+								fn(List(a.untag)).asInstanceOf[Seq[Any]].foreach(x => collector.emit(Tagged.explicit(x, outId)))
 							}
 						}, a)
 						case other => throw new NotImplementedError(s"Explode[${other.length}]")
@@ -190,13 +193,13 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 			// receives the current value (null when absent) and returns the new one.
 			// The lambdas below are java-serialized by rama, so they must only capture
 			// serializable values - not `path` (which holds a non-serializable Codec).
-			val termTag = path.terminalTag
+			val termTag = CodecRegistry.id(path.terminalTag)
 			def wrapResult(newVal: Option[Any]) = newVal.map(Tagged.explicit(_, termTag)).orNull
 
 			val mutation = ins match {
 				case Nil => ramaPath.term(current => wrapResult(fn(Option(current).map(untagAny), Nil)))
-				case List(a) => ramaPath.term((current, a) => wrapResult(fn(Option(current).map(untagAny), List(a))), compileVar(a))
-				case List(a, b) => ramaPath.term((current, a, b) => wrapResult(fn(Option(current).map(untagAny), List(a, b))), compileVar(a), compileVar(b))
+				case List(a) => ramaPath.term((current, a) => wrapResult(fn(Option(current).map(untagAny), List(untagAny(a)))), compileVar(a))
+				case List(a, b) => ramaPath.term((current, a, b) => wrapResult(fn(Option(current).map(untagAny), List(untagAny(a), untagAny(b)))), compileVar(a), compileVar(b))
 				case other => throw new NotImplementedError(s"PStateUpdate[${other.length}]")
 			}
 			Block.localTransform(compileIdentity(ps), mutation)
@@ -229,17 +232,20 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 						case SelectOptions(Some(after), None, _) => setPath.sortedSetRangeFrom(compileVar(after))
 						case SelectOptions(None, None, _) => setPath
 					}
+					val tagId = CodecRegistry.id(out.tag)
 					Block.localSelect(ps, fullPath)
 						.out(compileVar(intermediate))
-						// move the tagging from each element to the list itself
-						.each((jlist: java.util.Collection[Any]) => tagAny(jlist.asScala.toList.map(untagAny)), compileVar(intermediate))
+						.each((jlist: java.util.Collection[Any]) => {
+							Tagged.explicit(jlist.asScala.toList.map(untagAny), tagId)
+						}, compileVar(intermediate))
 						.out(compileVar(out))
 
 				case PStateOp.Get(out: VarId) => {
 					val intermediate = unsafeInternalVar(out, "intermediate", tag = path.terminalTag)
+					val tagId = CodecRegistry.id(path.terminalTag)
 					Block.localSelect(ps, ramaPath)
 						.out(compileVar(intermediate))
-						.each(v => tagAny(Option(v).map(untagAny)), compileVar(intermediate))
+						.each(v => Tagged.explicit(Option(v).map(untagAny), tagId), compileVar(intermediate))
 						.out(compileVar(out))
 				}
 
@@ -251,11 +257,84 @@ class RamaBackend(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies
 		case Node.LocalAppend(dep, value) =>
 			Block.depotPartitionAppend(compileIdentity(dep), compileVar(value))
 	}
+
+	private def compileSchema(schema: Schema): Either[Class[?], rama.PState.Schema] = {
+		println(s"Compiling schema ${schema}")
+		def applyIndexing(source: IndexableSchema, result: rama.PState.Schema): rama.PState.Schema = {
+			println(s"Applying indexing: ${source.index} to schema: $result")
+			source.index match {
+				case NonIndexed => result
+				case Indexed(sizeTracking) => {
+					var opts = SubindexOptions.create()
+					if (sizeTracking == false) {
+						opts = opts.withoutSizeTracking()
+					}
+					println(s"Subindexed: $opts")
+					result.subindexed(opts)
+				}
+			}
+		}
+
+		schema match {
+			case _: ClassSchema[?] => Left(classOf[Tagged[?]])
+
+			case FixedKeySchema(shape) => {
+				val pairs = shape.toList.flatMap {
+					case (key, schema) => List(key, compileSchema(schema).merge)
+				}
+				Right(rama.PState.fixedKeysSchema(pairs*))
+			}
+
+			case mapSchema @ MapSchema(k, v, index) => {
+				// keys are arbitrary types - they must be stored as Tagged (see RamaCodec)
+				val keyClass = classOf[Tagged[?]]
+				Right(applyIndexing(mapSchema, compileSchema(v) match {
+					case Left(x) => rama.PState.mapSchema(keyClass, x)
+					case Right(x) => rama.PState.mapSchema(keyClass, x)
+				}))
+			}
+
+			case s: SetSchema[?] => {
+				// set elements are arbitrary types - stored as Tagged.
+				// rama orders sorted structures by serialized bytes (not Comparable), so
+				// the element codec's encoding must be order-preserving for range queries
+				Right(applyIndexing(s, rama.PState.setSchema(classOf[Tagged[?]])))
+			}
+		}
+	}
 }
 
 object RamaBackend {
-	def apply(setup: RamaModule.Setup, topologies: RamaModule.Topologies) = new RamaBackend(setup, topologies)
+	def apply(codecRegistry: CodecRegistry) = new RamaBackend(codecRegistry)
 
+	class Cluster(inner: rama.cluster.ClusterManagerBase, module: Class[?]) {
+		val moduleName = module.getName
+
+		def close(): Unit = inner.close()
+
+		def append[A](depot: Depot[A], values: A*)(using Tag[A]): Unit = {
+			// TODO async?
+			val ramaDepot = inner.clusterDepot(moduleName, compileIdentity(depot.id))
+			values.foreach { v => ramaDepot.append(Tagged[A](v)) }
+			()
+		}
+
+		def get[K, V](kv: PStateKV[K, V], k: K)(using Tag[K]): Option[V] = {
+			val ramaPstate = inner.clusterPState(moduleName, compileIdentity(kv.id))
+			val raw = ramaPstate.selectOne[Tagged[V]](Path.key(Tagged(k)))
+			Option(raw).map(v => untagAny(v).asInstanceOf[V])
+		}
+		
+		def query[S, R](q: QueryTopology[S, R], input: S)(using Tag[S]): R = {
+			val ramaQuery = inner.clusterQuery[Tagged[R]](moduleName, compileIdentity(q.topology.builder.source))
+			untagAny(ramaQuery.invoke(Tagged(input))).asInstanceOf[R]
+		}
+	}
+
+	object Cluster {
+		def apply(inner: rama.cluster.ClusterManagerBase, module: Class[?]) = new Cluster(inner, module)
+	}
+	
 	// generate a rama varname for the given identity
 	private def compileIdentity(id: Identity) = {
 		id.namespace match {
@@ -267,6 +346,7 @@ object RamaBackend {
 
 	// generate a rama var name
 	private[corama] def compileVar(vid: VarId): String = {
+		println(s"compileVar(${vid.id}_${vid.hint}[${vid.tag}]")
 		require(vid != Var.unit.vid, "Var.unit has no Rama representation: it stands for the absence of a value")
 		// TODO assert hint doesn't have any special characters
 		s"*${vid.hint}_${vid.id}"
@@ -316,55 +396,15 @@ object RamaBackend {
 
 
 	private def compileCombiner[O](agg: corama.Agg[O], tag: LightTypeTag): RamaCombinerAgg[Tagged[O]] = {
+		val tagId = CodecRegistry.id(tag)
 		val zero = agg.zero
 		val combineFn = agg.combine
 		new RamaCombinerAgg[Tagged[O]] {
 			override def zeroVal(): Tagged[O] = Tagged.explicit(zero, tag)
-			override def combine(current: Tagged[O], value: Tagged[O]): Tagged[O] = Tagged.explicit(combineFn(current.untag, value.untag), tag)
+			override def combine(current: Tagged[O], value: Tagged[O]): Tagged[O] = Tagged.explicit(combineFn(current.untag, value.untag), tagId)
 		}
 	}
 	
-	private def compileSchema(schema: Schema): Either[Class[?], rama.PState.Schema] = {
-		println(s"Compiling schema ${schema}")
-		def applyIndexing(source: IndexableSchema, result: rama.PState.Schema): rama.PState.Schema = {
-			println(s"Applying indexing: ${source.index} to schema: $result")
-			source.index match {
-				case NonIndexed => result
-				case Indexed(sizeTracking) => {
-					var opts = SubindexOptions.create()
-					if (sizeTracking == false) {
-						opts = opts.withoutSizeTracking()
-					}
-					println(s"Subindexed: $opts")
-					result.subindexed(opts)
-				}
-			}
-		}
-
-		schema match {
-			case _: ClassSchema[?] => Left(classOf[Tagged[?]])
-
-			case FixedKeySchema(shape) => {
-				val pairs = shape.toList.flatMap {
-					case (key, schema) => List(key, compileSchema(schema).merge)
-				}
-				Right(rama.PState.fixedKeysSchema(pairs*))
-			}
-
-			case mapSchema @ MapSchema(k, v, index) => {
-				val keyClass = k.tag.closestClass
-				Right(applyIndexing(mapSchema, compileSchema(v) match {
-					case Left(x) => rama.PState.mapSchema(keyClass, x)
-					case Right(x) => rama.PState.mapSchema(keyClass, x)
-				}))
-			}
-
-			case s: SetSchema[?] => {
-				Right(applyIndexing(s, rama.PState.setSchema(s.v.tag.closestClass)))
-			}
-		}
-	}
-
 	private val untagAccessor: RamaFunction1[Tagged[Any], Any] = _.untag
 
 	// used to get e.g. boolean from a Tagged[Boolean], for low level rama APIs which use a specific primitive type

@@ -7,20 +7,14 @@ import com.rpl.rama.RamaModule
 import com.rpl.rama
 import scala.annotation.unused
 import corama.rama.RamaBackend
-import corama.rama.ListCodec
 import scala.jdk.CollectionConverters._
-import corama.rama.OptionCodec
+import corama.rama.RamaCodecSingleton
+import corama.rama.RamaCodec
+import corama.rama.CodecRegistry
+import izumi.reflect.Tag
 
-class RamaExample extends RamaModule {
-	// import RamaModule._
-	import RamaExample._
-
+class RamaExample(backend: RamaBackend) extends RamaModule {
 	val topologies: Topologies = Topologies()
-
-	// val fullTickets: PState[Long, FullTicket] = topologies.pstate("fullTickets")
-	// val users: PState[Long, String] = topologies.pstate("users")
-
-	// val ticketAssignment: Depot[TicketAssignment] = topologies.depot("ticketAssignment")
 
 	// inputs from another system (e.g. support, via kafka)
 	val upstreamTicket = topologies.depot[Ticket]("upstreamTicket", rama.Depot.hashBy(classOf[TicketIdExtractor]))
@@ -34,12 +28,12 @@ class RamaExample extends RamaModule {
 	val mergedUserChange = topologies.depot[User]("mergedUserChange", rama.Depot.hashBy(classOf[UserPartitionKey]))
 	val propagateTicketAssignment = topologies.depot[PropagateTicketAssignment]("propagateTicketAssignment", rama.Depot.hashBy(classOf[PropagateTicketAssignmentKey]))
 
-	val users = topologies.pstateKV[JLong, User]("user")
+	val users = topologies.pstateKV[Long, User]("user")
 
 	// tickets is a set of IDs, subindexed so it can be arbitrarily large
-	val userTickets = topologies.pstateKVSet[JLong, JLong]("userTickets", Subindex.indexed)
+	val userTickets = topologies.pstateKVSet[Long, Long]("userTickets", Subindex.indexed)
 
-	val fullTickets = topologies.pstateKV[JLong, FullTicket]("fullTicket")
+	val fullTickets = topologies.pstateKV[Long, FullTicket]("fullTicket")
 
 	// upstream ticket changes update the fullTicket view
 	val _ = topologies.stream_(upstreamTicket) { ticket =>
@@ -168,7 +162,7 @@ class RamaExample extends RamaModule {
 		UserTicketsResponse(a.tickets ++ b.tickets, a.nextCursor.orElse(b.nextCursor))
 	})
 
-	val _ = topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
+	val getUserTickets = topologies.query[UserTicketsRequest, UserTicketsResponse]("userTickets", ticketAgg) { query =>
 		val userTicketsPageSize = 10
 		for {
 			userId <- query.map(_.userId)
@@ -185,7 +179,7 @@ class RamaExample extends RamaModule {
 			
 			// fanout each ticket ID
 			// TODO: is this serial? Can I make it parallel per hashPartition?
-			ticketId <- ticketIds.explode[JLong]
+			ticketId <- ticketIds.explode[Long]
 			_ <- Flow.hashPartition(ticketId)
 
 			// lookup ticket; filter out None (TODO: log / alert on none?)
@@ -200,49 +194,39 @@ class RamaExample extends RamaModule {
 	}
 
 	override def define(setup: RamaModule.Setup, ramaTopologies: RamaModule.Topologies): Unit = {
-		RamaBackend(setup, ramaTopologies).install(topologies)
+		backend.install(setup, ramaTopologies, topologies)
 	}
 }
 
 object RamaExample {
-	implicit val eqLong: Eq[JLong] = Eq.fromUniversalEquals
-
 	def main(@unused argv: Array[String]): Unit = {
 
-		def appendTo(depot: rama.Depot, obj: Object*) = {
-			obj.foreach { obj =>
-				val appendResult = depot.append(obj)
-				println(s"$appendResult <- from appending $obj")
-			}
-		}
+		val registry = new CodecRegistry()
+		RamaCodec.setGlobal(registry)
+		val backend = RamaBackend(registry)
+		val example = new RamaExample(backend)
+		val serializers: java.util.List[Class[?]] = List(classOf[RamaCodecSingleton]).asJava
 
-		val serializers: java.util.List[Class[?]] = List(
-			classOf[ListCodec],
-			classOf[OptionCodec],
-		).asJava
+		val ramaCluster = rama.test.InProcessCluster.create(serializers)
+		val ctl = RamaBackend.Cluster(ramaCluster, classOf[RamaExample])
 		// TODO autoclose?
-		val cluster = rama.test.InProcessCluster.create(serializers)
 		try {
 			println("Launching module...")
-			cluster.launchModule(new RamaExample(), new rama.test.LaunchConfig(8, 8).numWorkers(8));
+			ramaCluster.launchModule(example, new rama.test.LaunchConfig(8, 8).numWorkers(8));
 			println("Module launched...")
 
-			val moduleName = classOf[RamaExample].getName()
-
-			val upstreamTicketDepot = cluster.clusterDepot(moduleName, "*upstreamTicket")
-			appendTo(upstreamTicketDepot,
+			ctl.append(example.upstreamTicket,
 				Ticket(1, requester = "Troubles McGee", description = "My printer is on fire!"),
 				Ticket(2, requester = "Troubles McGee", description = "I don't have water"),
 				Ticket(3, requester = "Passerby", description = "There seems to be a fire"),
 			)
 
-			appendTo(cluster.clusterDepot(moduleName, "*userRegistration"),
+			ctl.append(example.userRegistration,
 				User(111, name = "Agent Smith", email="smiffy@agents.r.us"),
 				User(222, name = "Sooty", email="soots@puppet.com"),
 			)
 
-			val assignmentsDepot = cluster.clusterDepot(moduleName, "*ticketAssignment")
-			appendTo(assignmentsDepot,
+			ctl.append(example.ticketAssignment,
 				TicketAssignment(1, 111),
 				TicketAssignment(9, 111),
 				TicketAssignment(3, 999),
@@ -253,27 +237,24 @@ object RamaExample {
 			)
 
 			(4L to 30L).foreach { id =>
-				upstreamTicketDepot.append(Ticket(id, requester = "Troubles McGee", description = s"Spam #$id"))
+				ctl.append(example.upstreamTicket, Ticket(id, requester = "Troubles McGee", description = s"Spam #$id"))
 				// sorry 111, you get all the goods
-				appendTo(assignmentsDepot, TicketAssignment(id, 111))
+				ctl.append(example.ticketAssignment, TicketAssignment(id, 111))
 			}
 
-			appendTo(cluster.clusterDepot(moduleName, "*userNameChange"),
-				UserNameChange(111, name = "Ex-Agent Smith"),
-			)
+			ctl.append(example.userNameChange, UserNameChange(111, name = "Ex-Agent Smith"))
 			
-			println("Ticket 1: " + cluster.clusterPState(moduleName, "$$fullTicket").selectOne[Ticket](rama.Path.key(long2Long(1L))))
-			println("Ticket 2: " + cluster.clusterPState(moduleName, "$$fullTicket").selectOne[Ticket](rama.Path.key(long2Long(2L))))
-			println("Ticket 3: " + cluster.clusterPState(moduleName, "$$fullTicket").selectOne[Ticket](rama.Path.key(long2Long(3L))))
+			println("Ticket 1: " + ctl.get(example.fullTickets, 1L))
+			println("Ticket 2: " + ctl.get(example.fullTickets, 2L))
+			println("Ticket 3: " + ctl.get(example.fullTickets, 3L))
 
-			println("User 111: " + cluster.clusterPState(moduleName, "$$user").selectOne[User](rama.Path.key(long2Long(111L))))
-			println("User 222: " + cluster.clusterPState(moduleName, "$$user").selectOne[User](rama.Path.key(long2Long(222L))))
+			println("User 111: " + ctl.get(example.users, 111L))
+			println("User 222: " + ctl.get(example.users, 222L))
 
-			val userTicketsQuery = cluster.clusterQuery[UserTicketsResponse](moduleName, "userTickets")
-			println("User tickets[222]: " + userTicketsQuery.invoke(UserTicketsRequest(222L)))
+			println("User tickets[222]: " + ctl.query(example.getUserTickets, UserTicketsRequest(222L)))
 
-			def recurseListTickets(pageNum: Int, cursor: Option[JLong]): Unit = {
-				val result = userTicketsQuery.invoke(UserTicketsRequest(111L, cursor)).asInstanceOf[UserTicketsResponse]
+			def recurseListTickets(pageNum: Int, cursor: Option[Long]): Unit = {
+				val result = ctl.query(example.getUserTickets, UserTicketsRequest(111L, cursor))
 				println(s"User tickets[111] (page $pageNum): ${result}")
 				result.nextCursor.foreach { cursor =>
 					val nextPage = pageNum + 1
@@ -284,7 +265,7 @@ object RamaExample {
 			recurseListTickets(1, None)
 			println("DONE")
 		} finally {
-			cluster.close()
+			ctl.close()
 			println("CLOSED")
 		}
 		println("shutting down...")

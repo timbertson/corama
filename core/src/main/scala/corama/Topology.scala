@@ -9,6 +9,7 @@ import scala.annotation.unused
 import scala.util.Try
 import cats.Eq
 import corama.error.Util.err
+import cats.Order
 
 final case class TopologyId(value: Int) extends AnyVal
 object TopologyId {
@@ -81,7 +82,7 @@ final class Topologies {
 	def pstateKV[K: Tag : Codec, V: Tag : Codec](name: String): PStateKV[K, V] =
 		registerPstate(PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name))), _.inner)
 
-	def pstateKVSet[K: Tag : Codec, V: Tag : Codec : Ordering](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
+	def pstateKVSet[K: Tag : Codec, V: Tag : Codec : Order](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
 		registerPstate(PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex), _.inner)
 
 	def pstate(name: String, schema: Schema): PState =

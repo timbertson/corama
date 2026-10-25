@@ -20,9 +20,9 @@ import corama.error.Util._
 type Bytes = Array[Byte]
 object Bytes {
 	// A wrapper type with proper equality / hashcode
-	class Value(val raw: Array[Byte]) {
+	class Value(val raw: Array[Byte]) extends Serializable {
 		override def equals(obj: Any): Boolean = obj match {
-			case arr: Array[Byte] => eqInstance.eqv(arr, raw)
+			case v: Value => eqInstance.eqv(v.raw, raw)
 			case _ => false
 		}
 		override def hashCode(): Int = Arrays.hashCode(raw)
@@ -121,11 +121,6 @@ object Codec {
 	implicit val forLong: Codec[Long] = new Codec {
 		def decode(bytes: Bytes): Try[Long] = Try(ByteBuffer.wrap(bytes).getLong())
 		def encode(a: Long): Bytes = viaByteBuffer { b => b.putLong(a); () }
-	}
-
-	implicit val forJavaLong: Codec[java.lang.Long] = new Codec {
-		def decode(bytes: Bytes): Try[java.lang.Long] = forLong.decode(bytes).map(long2Long)
-		def encode(a: java.lang.Long): Bytes = forLong.encode(a.toLong)
 	}
 
 	implicit val forBytes: Codec[Bytes] = new Codec {

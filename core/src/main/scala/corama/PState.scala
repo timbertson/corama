@@ -4,6 +4,7 @@ import cats.data.NonEmptyList
 import cats.syntax.all.*
 import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
+import cats.Order
 
 // A lens into some arbitrary path of a pstate, containing the given leaf schema
 sealed trait Lens[A]
@@ -44,7 +45,7 @@ case class PStateId(value: String)
 
 // Pstate with nested schemas. Not fully type safe, validity of paths is verified at runtime
 final case class PState(id: Identity, schema: Schema) {
-	println(s"created pstate ${id.name} with schema $schema")
+	// println(s"created pstate ${id.name} with schema $schema")
 	private def checkType(value: PathComponent[?], schema: Schema): Either[String, Unit] =
 		def requireValueOf(schemaTag: Tag[?]) = {
 			if (value.value.tag =:= schemaTag) {
@@ -130,12 +131,12 @@ final case class PStateKV[K: Tag : Codec, V: Tag : Codec](id: Identity) {
 	def key(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Ordering](id: Identity, subindex: Subindex) {
+final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Order](id: Identity, subindex: Subindex) {
 	private [corama] var inner: PState = PState(id, Schema.mapOf[K](Schema.set[V](subindex), Subindex.nonIndexed))
 	def key(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class SelectOptions[A](after: Option[Var[Option[A]]], maxItems: Option[Int], ord: Ordering[A])
+final case class SelectOptions[A](after: Option[Var[Option[A]]], maxItems: Option[Int], ord: Order[A])
 object SelectOptions {
-	def all[A](implicit ord: Ordering[A]): SelectOptions[A] = SelectOptions(None, None, ord)
+	def all[A](implicit ord: Order[A]): SelectOptions[A] = SelectOptions(None, None, ord)
 }
