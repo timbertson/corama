@@ -17,11 +17,23 @@ import flogger.Log
   * is invisible in the types. Here the same shape typechecks, and `Interp` runs it.
   */
 object Example extends IOApp {
+	import io.circe.generic.auto._
 	implicit val log: Log[IO] = Log.empty
 
 	case class Ticket(id: Long, requester: String, description: String)
+	object Ticket {
+		implicit val codec: Codec[Ticket] = Codec.json
+	}
+
 	case class FullTicket(ticket: Ticket, assignee: Option[Long])
+	object FullTicket {
+		implicit val codec: Codec[FullTicket] = Codec.json
+	}
+
 	case class Assignment(ticketId: Long, assigneeId: Long)
+	object Assignment {
+		implicit val codec: Codec[Assignment] = Codec.json
+	}
 
 	val topologies: Topologies = Topologies()
 

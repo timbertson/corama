@@ -67,7 +67,10 @@ lazy val interpreter = (project in file("interpreter")).settings(
   libraryDependencies ++= Seq(
     "org.rocksdb" % "rocksdbjni" % "9.3.1",
     "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
-  ),
+
+  ) ++ List("ratis-grpc", "ratis-server").map { component =>
+    "org.apache.ratis" % component % "3.3.1"
+  },
 ).dependsOn(core, pb)
 
 lazy val rama = (project in file("rama")).settings(
@@ -76,11 +79,16 @@ lazy val rama = (project in file("rama")).settings(
   libraryDependencies ++= Seq(
     "com.rpl" % "rama" % "1.9.0" /*% Provided*/,
   ),
+  
+  // grpc depends on *-android version, but rama requires *-jre
+  // (symptoms of mismatch: failure to load com.google.common.io.MoreFiles)
+  dependencyOverrides += "com.google.guava" % "guava" % "32.1.3-jre",
 ).dependsOn(core)
 
 lazy val example = (project in file("example")).settings(
   commonSettings,
   Compile / mainClass := Some("example.Example"),
+  dependencyOverrides += "com.google.guava" % "guava" % "32.1.3-jre",
 ).dependsOn(core, rama, interpreter)
 
 lazy val root = (project in file(".")).settings(

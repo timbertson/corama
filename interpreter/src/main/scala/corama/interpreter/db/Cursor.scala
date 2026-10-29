@@ -3,11 +3,11 @@ package corama.interpreter.db
 import cats.effect.*
 import cats.implicits.*
 import cats.*
-import corama.{Decoder, Encoder}
 import corama.Bytes
 import corama.error.Util.*
 import scala.util.Try
 import scala.util.Failure
+import corama.Codec
 
 // phantom type to ensure distinction between item and set keys, which
 // have different encoded prefixes
@@ -35,23 +35,25 @@ type ItemCursor[K] = Cursor[Record.Item, K]
 
 object Cursor {
 	import Bytes.eqInstance
+	private val baseCodec = Codec.forTuple[Bytes, Int]
 
-	implicit def encoder[R, K]: Encoder[Cursor[R, K]] = c =>
-		Encoder.forTuple[Bytes, Int].encode((c.value, c.prefixLength))
+	implicit def codec[R, K]: Codec[Cursor[R, K]] = new Codec {
+		def decode(bytes: Bytes): Try[Cursor[R, K]] =
+			baseCodec.decode(bytes).map { (value, len) => new Cursor(value, len) }
 
-	implicit def decoder[R, K]: Decoder[Cursor[R, K]] = b =>
-		Decoder.forTuple[Bytes, Int].decode(b).map { (value, len) => new Cursor(value, len) }
+		def encode(a: Cursor[R, K]): Bytes = baseCodec.encode((a.value, a.prefixLength))
+	}
 
 	implicit def eq[R, K]: Eq[Cursor[R, K]] = Eq.by(c => (c.value, c.prefixLength))
 
 	def allItems[K]: ItemCursor[K] = {
 		// unit is encoded as Array.empty
-		val raw = itemsWithPrefix[Unit](())(using Encoder.forUnit)
+		val raw = itemsWithPrefix[Unit](())(using Codec.forUnit)
 		new Cursor[Record.Item, K](raw.prefix, raw.prefixLength)
 	}
 	
 	// get a cursor representing the given key prefix
-	def itemsWithPrefix[K](key: K)(implicit E: Encoder[K]): ItemCursor[K] = {
+	def itemsWithPrefix[K](key: K)(implicit E: Codec[K]): ItemCursor[K] = {
 		val bytes = DbValue.encodeItemKey(key)
 		new Cursor[Record.Item, K](bytes, bytes.length)
 	}
@@ -66,9 +68,9 @@ object Cursor {
 // Set keys have additional constraints, because we need an unambiguous prefix that can't
 // also be the prefix of a different key. For strings we append a null byte (which never appears
 // in a utf8 string), and for numbers we rely on a fixed-length encoding.
-// TODO: explore 
-trait SetKey[K] extends Encoder[K] {
+trait SetKey[K] {
 	def decodePrefix(bytes: Bytes): Try[(K, Bytes)]
+	def encode(key: K): Bytes
 }
 
 object SetKey {
@@ -79,12 +81,12 @@ object SetKey {
 				Failure(err("null byte not found in encoded key"))
 			} else {
 				val (strBytes, rest) = bytes.splitAt(nullBytePos)
-				Decoder.forString.decode(strBytes).map(_ -> rest.tail)
+				Codec.forString.decode(strBytes).map(_ -> rest.tail)
 			}
 		}
-
+		
 		override def encode(k: String) = {
-			val bytes = Encoder.forString.encode(k)
+			val bytes = Codec.forString.encode(k)
 			if (bytes.contains(Bytes.NULL_BYTE)) {
 				// should be impossible for utf8 encoding
 				throw new RuntimeException(s"key encoder for ${k.getClass()} produced a null byte; this is disallowed for set keys")
@@ -96,9 +98,9 @@ object SetKey {
 	implicit val forInt: SetKey[Int] = new SetKey[Int] {
 		override def decodePrefix(bytes: Bytes): Try[(Int, Bytes)] = {
 			val (k, rest) = bytes.splitAt(4)
-			Decoder.forInt.decode(k).map(_ -> rest)
+			Codec.forInt.decode(k).map(_ -> rest)
 		}
 
-		override def encode(k: Int) = Encoder.forInt.encode(k)
+		override def encode(k: Int) = Codec.forInt.encode(k)
 	}
 }

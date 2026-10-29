@@ -9,6 +9,7 @@ import scala.annotation.unused
 import scala.util.Try
 import cats.Eq
 import corama.error.Util.err
+import cats.Order
 
 final case class TopologyId(value: Int) extends AnyVal
 object TopologyId {
@@ -28,13 +29,13 @@ final class TopologyBuilder[S] private[corama] (
 	val source: Identity,
 	private [corama] val tag: Tag[S],
 	pos: SourcePos
-) {
+)(implicit codec: Codec[S]) {
 
 	private[corama] val vars = new VarRegistry()
 
-	val input: Var[S] = vars.add[S](source.name, tag, pos) // mint a generated var name for elements in the source
+	val input: Var[S] = vars.add[S](source.name, tag, codec, pos) // mint a generated var name for elements in the source
 
-	def define[A](tag: Tag[A], pos: SourcePos, hint: String = "var"): Var[A] = vars.add[A](hint, tag, pos)
+	def define[A](tag: Tag[A], codec: Codec[A], pos: SourcePos, hint: String = "var"): Var[A] = vars.add[A](hint, tag, codec, pos)
 
 	override def toString: String = s"TopologyBuilder($source)"
 }
@@ -78,10 +79,10 @@ final class Topologies {
 		value
 	}
 
-	def pstateKV[K: Tag, V: Tag](name: String): PStateKV[K, V] =
+	def pstateKV[K: Tag : Codec, V: Tag : Codec](name: String): PStateKV[K, V] =
 		registerPstate(PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name))), _.inner)
 
-	def pstateKVSet[K: Tag, V: Tag : Ordering](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
+	def pstateKVSet[K: Tag : Codec, V: Tag : Codec : Order](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
 		registerPstate(PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex), _.inner)
 
 	def pstate(name: String, schema: Schema): PState =
@@ -94,8 +95,8 @@ final class Topologies {
 	  */
 	def query[S, R](name: String, agg: Agg[R])(
 		block: Var[S] => Flow[R, QueryContext],
-	)(implicit pos: SourcePos, tagS: Tag[S], tagR: Tag[R]): QueryTopology[S, R] = {
-		QueryTopology(declare[S, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, pos)(block))
+	)(implicit tagS: Tag[S], tagR: Tag[R], codecS: Codec[S], codecR: Codec[R], pos: SourcePos): QueryTopology[S, R] = {
+		QueryTopology(declare[S, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, tagR, pos)(block))
 	}
 
 	/** A stream topology: driven by an append, writes PStates, returns nothing.
@@ -104,22 +105,22 @@ final class Topologies {
 	  */
 	def stream_[A](depot: Depot[A])(
 		block: Var[A] => Flow[Unit, StreamContext[Nothing]]
-	)(implicit pos: SourcePos, tagA: Tag[A]): StreamTopology[A, Unit] = {
-		StreamTopology(declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tagA, pos)(block))
+	)(implicit tagA: Tag[A], codecS: Codec[A], pos: SourcePos): StreamTopology[A, Unit] = {
+		StreamTopology(declare[A, Unit, StreamContext[Nothing]](depot.id, Agg.unit, tagA, implicitly[Tag[Unit]], pos)(block))
 	}
 
 	// A stream topology returning `R` aggregated values
 	def stream[S, R](depot: Depot[S], agg: Agg[R])(
 		block: Var[S] => Flow[R, StreamContext[R]]
-	)(implicit pos: SourcePos, tagS: Tag[S]): StreamTopology[S, R] = {
-		StreamTopology(declare[S, R, StreamContext[R]](depot.id, agg, tagS, pos)(block))
+	)(implicit tagS: Tag[S], codecS: Codec[S], tagR: Tag[R], codecR: Codec[R], pos: SourcePos): StreamTopology[S, R] = {
+		StreamTopology(declare[S, R, StreamContext[R]](depot.id, agg, tagS, tagR, pos)(block))
 	}
 
-	private def declare[S, R, C](source: Identity, agg: Agg[R], tagS: Tag[S], pos: SourcePos)(
+	private def declare[S, R, C](source: Identity, agg: Agg[R], tagS: Tag[S], tagR: Tag[R], pos: SourcePos)(
 		block: Var[S] => Flow[R, C]
-	): Topology[S, R] = {
+	)(implicit codecS: Codec[S], codecR: Codec[R]): Topology[S, R] = {
 		val b = new TopologyBuilder[S](TopologyId(built.length), source, tagS, pos)
-		val t = Topology[S, R](b, block(b.input), agg)
+		val t = Topology[S, R](b, block(b.input), agg, tagR, codecR)
 		built = t :: built
 		t
 	}
@@ -136,15 +137,15 @@ object Topologies {
 final case class Topology[S, R](
 	builder: TopologyBuilder[S],
 	flow: Flow[R, Nothing],
-	agg: Agg[R]) {
+	agg: Agg[R],
+	tagR: Tag[R],
+	codec: Codec[R]
+) {
 	type Result = R
 
 	def input: Var[S] = builder.input
 	
 	def id = builder.id
-
-	// only used in rama backend
-	val queryOutputVar: Var[R] = builder.vars.add("queryOutput", null /* TODO */, implicitly[SourcePos])
 
 	val compiled = Node.compile(builder, new NodeBuilder(), flow)
 	

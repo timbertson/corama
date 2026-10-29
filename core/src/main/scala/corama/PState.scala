@@ -4,14 +4,14 @@ import cats.data.NonEmptyList
 import cats.syntax.all.*
 import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
+import cats.Order
 
 // A lens into some arbitrary path of a pstate, containing the given leaf schema
 sealed trait Lens[A]
 
 case class ValueLens[A](pstate: PState, path: Path, schema: Schema.ClassSchema[A]) extends Lens[A] {
-	private [corama] def tag: Tag[A] = schema.tag
 	def get: Flow[Option[A], Any] = Flow.Get(this)
-	def getOrElse(dfl: A): Flow[A, Any] = Flow.Get(this).flatMap(v => v.map(_.getOrElse(dfl))(using implicitly, tag))
+	def getOrElse(dfl: A)(implicit codec: Codec[A]): Flow[A, Any] = Flow.Get(this).flatMap(v => v.map(_.getOrElse(dfl))(using implicitly, schema.tag))
 	def put(value: Var[A]): Flow[Unit, Etl] = Flow.Put(this, value)
 	def delete(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, this, Nil, (_, _) => None)
 	def update(f: Option[A] => Option[A])(implicit pos: SourcePos): Flow[Unit, Etl] = ???
@@ -45,7 +45,7 @@ case class PStateId(value: String)
 
 // Pstate with nested schemas. Not fully type safe, validity of paths is verified at runtime
 final case class PState(id: Identity, schema: Schema) {
-	println(s"created pstate ${id.name} with schema $schema")
+	// println(s"created pstate ${id.name} with schema $schema")
 	private def checkType(value: PathComponent[?], schema: Schema): Either[String, Unit] =
 		def requireValueOf(schemaTag: Tag[?]) = {
 			if (value.value.tag =:= schemaTag) {
@@ -55,7 +55,7 @@ final case class PState(id: Identity, schema: Schema) {
 			}
 		}
 		schema match {
-			case Schema.ClassSchema(tag) => requireValueOf(tag)
+			case cls: Schema.ClassSchema[?] => requireValueOf(cls.tag)
 			case _: Schema.FixedKeySchema => requireValueOf(Schema.string.tag)
 			case map: Schema.MapSchema[?] => requireValueOf(map.k.tag)
 			case set: Schema.SetSchema[?] => Left(s"Path component ${value} attempted to enter a set schema")
@@ -126,17 +126,17 @@ final case class PState(id: Identity, schema: Schema) {
 }
 
 // A convenience API with additional type safety for simple K/V PStates
-final case class PStateKV[K: Tag, V: Tag](id: Identity) {
+final case class PStateKV[K: Tag : Codec, V: Tag : Codec](id: Identity) {
 	private [corama] var inner: PState = PState(id, Schema.mapOf[K](Schema[V], Subindex.nonIndexed))
 	def key(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class PStateKVSet[K: Tag, V: Tag : Ordering](id: Identity, subindex: Subindex) {
+final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Order](id: Identity, subindex: Subindex) {
 	private [corama] var inner: PState = PState(id, Schema.mapOf[K](Schema.set[V](subindex), Subindex.nonIndexed))
 	def key(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class SelectOptions[A](after: Option[Var[Option[A]]], maxItems: Option[Int], ord: Ordering[A])
+final case class SelectOptions[A](after: Option[Var[Option[A]]], maxItems: Option[Int], ord: Order[A])
 object SelectOptions {
-	def all[A](implicit ord: Ordering[A]): SelectOptions[A] = SelectOptions(None, None, ord)
+	def all[A](implicit ord: Order[A]): SelectOptions[A] = SelectOptions(None, None, ord)
 }

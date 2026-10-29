@@ -4,21 +4,26 @@ import cats.Applicative
 import cats.Eq
 import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
+import izumi.reflect.macrortti.LightTypeTag
 
 // Allocates var ids within one topology.
 private[corama] class VarRegistry {
 	private var defined = 0
+	private var list: List[Var[Any]] = Nil
 
-	def add[A](hint: String, tag: Tag[A], pos: SourcePos): Var[A] = {
-		val v = new Var[A](new VarId(defined, hint), tag, pos)
+	def add[A](hint: String, tag: Tag[A], codec: Codec[A], pos: SourcePos): Var[A] = {
+		val v = new Var[A](new VarId(defined, hint, tag.tag), tag, codec, pos)
+		list = v.asAny :: list
 		defined += 1
 		v
 	}
 
 	def count: Int = defined
+	
+	private [corama] def all = list
 }
 
-private[corama] final class VarId(private[corama] val id: Int, private[corama] val hint: String) {
+private[corama] final class VarId(private[corama] val id: Int, private[corama] val hint: String, private[corama] val tag: LightTypeTag) {
 	override def equals(other: Any): Boolean = other match {
 		case that: VarId => that.id == id
 		case _           => false
@@ -61,20 +66,20 @@ object IntoVar extends DefaultIntoVar {
 	}
 }
 
-final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag[A], pos: SourcePos) extends MaybeVar[A] {
+final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag[A], val codec: Codec[A], pos: SourcePos) extends MaybeVar[A] {
 	private [corama] def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
 
-	def map[B](f: A => B)(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = Flow.MapN(tag, pos, List(this.asAny), {
+	def map[B](f: A => B)(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.MapN(tag, codec, pos, List(this.asAny), {
 		case List(v) => f(v.asInstanceOf[A])
 		case other => impossible(s"map with ${other.length}")
 	})
 
-	def mapWith[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos, tag: Tag[C]): Flow[C, Any] = Flow.MapN(tag, pos, List(this.asAny, b.asAny), {
+	def mapWith[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos, tag: Tag[C], codec: Codec[C]): Flow[C, Any] = Flow.MapN(tag, codec, pos, List(this.asAny, b.asAny), {
 		case List(a, b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
 		case other => impossible(s"mapWith[2] with ${other.length}")
 	})
 
-	def mapWith[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos, tag: Tag[D]): Flow[D, Any] = Flow.MapN(tag, pos, List(this.asAny, b.asAny, c.asAny), {
+	def mapWith[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos, tag: Tag[D], codec: Codec[D]): Flow[D, Any] = Flow.MapN(tag, codec, pos, List(this.asAny, b.asAny, c.asAny), {
 		case List(a, b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
 		case other => impossible(s"mapWith[3] with ${other.length}")
 	})
@@ -92,7 +97,7 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 		}).as(this)
 
 	// TODO this could probably be optimised
-	def mapFilter[B](f: A => Option[B])(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = for {
+	def mapFilter[B: Tag : Codec](f: A => Option[B])(implicit pos: SourcePos): Flow[B, Any] = for {
 		opt <- this.map(f)
 		_ <- opt.filter(_.isDefined)
 		result <- opt.map(_.get)
@@ -100,12 +105,12 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 
 	def foreach(f: A => Unit)(implicit pos: SourcePos) = map[Unit](f)
 
-	def into[F[_]](using f: Applicative[F])(implicit pos: SourcePos, tag: Tag[F[A]]): Flow[F[A], Any] = this.map(f.pure)
+	def into[F[_]](using f: Applicative[F])(implicit pos: SourcePos, tag: Tag[F[A]], codec: Codec[F[A]]): Flow[F[A], Any] = this.map(f.pure)
 
 	/** Fan out: emit one value per element, running everything downstream per element. */
-	def explode[B](implicit pos: SourcePos, tag: Tag[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
+	def explode[B](implicit pos: SourcePos, tag: Tag[B], codec: Codec[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
 
-	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B]): Flow[B, Any] = Flow.ExplodeOp(tag, pos, List(this.asAny), {
+	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.ExplodeOp(tag, codec, pos, List(this.asAny), {
 		case List(a) => f(a.asInstanceOf[A])
 		case other => impossible(s"explode with ${other.length}")
 	})
@@ -126,14 +131,15 @@ object Var {
 	case class Literal[A](value: A, tag: Tag[A]) extends MaybeVar[A]
 
 	// Virtual vars have a unique id < 0 and are never given a Rama name
-	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit"), implicitly[Tag[Unit]], implicitly[SourcePos])
+	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit", implicitly[Tag[Unit]].tag), implicitly[Tag[Unit]], implicitly[Codec[Unit]], implicitly[SourcePos])
 
 	private [corama] val internal = SourcePos("internal", 1)
 
-	extension [A](v: Var[Option[A]]) {
-		def fold[B, C](ifNone: Flow[B, C])(ifSome: Var[A] => Flow[B, C])(implicit taga: Tag[A], tagb: Tag[B]): Flow[B, C] = {
+	extension [A: Codec](v: Var[Option[A]]) {
+		def fold[B, C](ifNone: Flow[B, C])(ifSome: Var[A] => Flow[B, C])(implicit taga: Tag[A], tagb: Tag[B], codecb: Codec[B]): Flow[B, C] = {
 			Flow.If[B, Any, C, C](
 				tagb,
+				codecb,
 				v.map(_.isEmpty),
 				ifNone,
 				v.map(_.get).flatMap(ifSome)
