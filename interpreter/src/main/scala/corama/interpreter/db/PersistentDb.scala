@@ -9,6 +9,7 @@ import corama._
 import cats.*
 import scala.util.Try
 import org.rocksdb
+import java.io.File
 
 // object PersistentDb extends IOLogging {
 // 	type Base = RocksDb
@@ -47,7 +48,27 @@ import org.rocksdb
 
 final class RocksDb private (val client: rocksdb.RocksDB) {
 	import org.rocksdb.*
-	def get(key: Bytes): IO[Option[Bytes]] = IO.delay(Option(client.get(key)))
+
+	def getSync(key: Bytes): Option[Bytes] = Option(client.get(key))
+
+	/** Atomic batched write, fsynced — one WAL fsync spans the whole batch. */
+	def writeSync(updates: Seq[(Bytes, Option[Bytes])]): Unit = {
+		val writeOptions = new rocksdb.WriteOptions()
+		val batch = new rocksdb.WriteBatch()
+		try {
+			updates.foreach { case (key, value) =>
+				value.fold(batch.delete(key))(batch.put(key, _))
+			}
+			client.write(writeOptions, batch)
+		} finally {
+			batch.close()
+			writeOptions.close()
+		}
+	}
+
+	def closeSync(): Unit = client.close()
+
+	def get(key: Bytes): IO[Option[Bytes]] = IO.delay(getSync(key))
 	
 	def iteratorR = Resource.fromAutoCloseable(IO.delay(client.newIterator()))
 	
@@ -75,15 +96,24 @@ final class RocksDb private (val client: rocksdb.RocksDB) {
 		value.fold(client.delete(key))(value => client.put(key, value))
 	}
 	
-	def close: IO[Unit] = IO.delay(client.close())
+	def close: IO[Unit] = IO.delay(closeSync())
 }
 
 object RocksDb {
-	private[db] def apply(path: String): Resource[IO, RocksDb] = {
+	private[corama] def apply(path: String): Resource[IO, RocksDb] = {
 		optionsR.flatMap { options =>
 			options.setCreateIfMissing(true)
 			Resource.make(applyF(path, options))(_.close)
 		}
+	}
+
+	// resource management is the responsibility of the caller
+	def openSyncUnsafe(path: File): RocksDb = {
+		org.rocksdb.RocksDB.loadLibrary()
+		val options = new rocksdb.Options()
+		options.setCreateIfMissing(true)
+		try new RocksDb(rocksdb.RocksDB.open(options, path.getAbsolutePath()))
+		finally options.close()
 	}
 
 	private def applyF(

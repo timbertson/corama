@@ -67,7 +67,10 @@ lazy val interpreter = (project in file("interpreter")).settings(
   libraryDependencies ++= Seq(
     "org.rocksdb" % "rocksdbjni" % "9.3.1",
     "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
-  ),
+
+  ) ++ List("ratis-grpc", "ratis-server").map { component =>
+    "org.apache.ratis" % component % "3.3.1"
+  },
 ).dependsOn(core, pb)
 
 lazy val rama = (project in file("rama")).settings(
