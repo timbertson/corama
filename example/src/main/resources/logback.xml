@@ -1,0 +1,19 @@
+<configuration>
+	<appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+		<encoder class="ch.qos.logback.classic.encoder.PatternLayoutEncoder">
+			<pattern>%highlight(%-5level)|%cyan(%logger{1}) %msg %yellow(%mdc) %n</pattern>
+		</encoder>
+	</appender>
+
+	<root level="INFO">
+		<appender-ref ref="CONSOLE"/>
+	</root>
+
+	<logger name="corama" level="DEBUG" />
+	<logger name="org.apache.ratis" level="WARN" />
+	<logger name="org.apache.ratis" level="WARN" />
+	
+	<!-- this one gives a full stacktrace warning for AlreadyExistsException,
+	which we catch and ignore -->
+	<logger name="org.apache.ratis.grpc.server.GrpcAdminProtocolService" level="ERROR" />
+</configuration>

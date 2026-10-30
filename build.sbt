@@ -66,9 +66,10 @@ lazy val interpreter = (project in file("interpreter")).settings(
   commonSettings,
   libraryDependencies ++= Seq(
     "org.rocksdb" % "rocksdbjni" % "9.3.1",
+    "com.lihaoyi" %% "os-lib" % "0.11.4",
     "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
 
-  ) ++ List("ratis-grpc", "ratis-server").map { component =>
+  ) ++ List("ratis-grpc", "ratis-server", "ratis-metrics-default").map { component =>
     "org.apache.ratis" % component % "3.3.1"
   },
 ).dependsOn(core, pb)
@@ -77,7 +78,8 @@ lazy val rama = (project in file("rama")).settings(
   name := "corama-rama",
   commonSettings,
   libraryDependencies ++= Seq(
-    "com.rpl" % "rama" % "1.9.0" /*% Provided*/,
+    // exclude log4j's slf4j provider so slf4j routes to logback (rama brings both)
+    "com.rpl" % "rama" % "1.9.0" /*% Provided*/ exclude ("org.apache.logging.log4j", "log4j-slf4j2-impl"),
   ),
   
   // grpc depends on *-android version, but rama requires *-jre

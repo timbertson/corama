@@ -12,6 +12,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 import scala.util.{Failure, Success, Try}
+import corama.interpreter.TaskId
 
 /** Wire codecs for the replog payload (`ReplicationUpdate`), built on the existing
 	* `Codec` combinators (tuples / lists / length-prefixed primitives).
@@ -71,7 +72,7 @@ object Keyspace {
 	* Apply is idempotent by key, so replaying uncommitted entries after a
 	* crash is fine.
 	*/
-class StateMachine extends BaseStateMachine {
+class StateMachine(task: TaskId) extends BaseStateMachine {
 	private val storage = new SimpleStateMachineStorage()
 	private var db: Option[RocksDb] = None
 
@@ -80,7 +81,7 @@ class StateMachine extends BaseStateMachine {
 	override def initialize(server: RaftServer, group: RaftGroupId, raftStorage: RaftStorage): Unit = {
 		super.initialize(server, group, raftStorage)
 		storage.init(raftStorage)
-		val dir = new File(raftStorage.getStorageDir().getStateMachineDir(), "db")
+		val dir = new File(raftStorage.getStorageDir().getStateMachineDir(), s"db-${task.id}")
 		db = Some(RocksDb.openSyncUnsafe(dir))
 	}
 
