@@ -21,6 +21,7 @@ object Util {
 	def neverReached: IO[Nothing] =
 		IO.raiseError(new IllegalStateException("neverReached: this should be impossible"))
 
+	def joinNothings(tasks: List[IO[Nothing]]) = tasks.parSequence_ *> neverReached
 
 	def withContext[F[_], T](desc: => String, value: F[T])(implicit E: ApplicativeError[F, Throwable]): F[T] = {
 		E.handleErrorWith(value) { e =>
