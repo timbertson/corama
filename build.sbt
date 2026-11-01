@@ -68,7 +68,7 @@ lazy val interpreter = (project in file("interpreter")).settings(
     "org.rocksdb" % "rocksdbjni" % "9.3.1",
     "com.lihaoyi" %% "os-lib" % "0.11.4",
     "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
-
+    "io.grpc" % "grpc-netty-shaded" % scalapb.compiler.Version.grpcJavaVersion,
   ) ++ List("ratis-grpc", "ratis-server", "ratis-metrics-default").map { component =>
     "org.apache.ratis" % component % "3.3.1"
   },

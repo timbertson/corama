@@ -32,10 +32,10 @@ object ReplogCodecs {
 		via[PStateUpdate, (Bytes, Option[Bytes])](Codec.forTuple[Bytes, Option[Bytes]])(p => (p.key, p.value)) { case (key, value) => PStateUpdate(key, value) }
 
 	implicit val pstateUpdates: Codec[PStateUpdates] =
-		via[PStateUpdates, (PStateId, List[PStateUpdate])](Codec.forTuple[PStateId, List[PStateUpdate]])(p => (p.id, p.updates.toList)) { case (id, updates) => PStateUpdates(id, updates.toVector) }
+		via[PStateUpdates, (PStateId, List[PStateUpdate])](Codec.forTuple[PStateId, List[PStateUpdate]])(p => (p.id, p.updates.toList)) { case (id, updates) => PStateUpdates(id, updates.toArray) }
 
 	implicit val depotAppends: Codec[DepotAppends] =
-		via[DepotAppends, (DepotId, List[Bytes])](Codec.forTuple[DepotId, List[Bytes]])(d => (d.id, d.updates.map(_.value).toList)) { case (id, values) => DepotAppends(id, values.map(DepotAppend.apply).toVector) }
+		via[DepotAppends, (DepotId, List[Bytes])](Codec.forTuple[DepotId, List[Bytes]])(d => (d.id, d.updates.map(_.value).toList)) { case (id, values) => DepotAppends(id, values.map(DepotAppend.apply).toArray) }
 
 	implicit val replicationUpdate: Codec[ReplicationUpdate] =
 		via[ReplicationUpdate, ((TxId, List[DepotAppends]), List[PStateUpdates])](Codec.forTuple[(TxId, List[DepotAppends]), List[PStateUpdates]])(r => ((r.id, r.depotAppends), r.pstateUpdates)) {
@@ -102,6 +102,7 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 				case Success(update) => update
 				case Failure(e) => throw new RuntimeException(s"Failed to decode ReplicationUpdate at log index ${entry.getIndex}", e)
 			}
+			// TODO: why is this a future if we're writing sync?
 			rocks.writeSync(StateMachine.applyWrites(update, entry.getIndex))
 			updateLastAppliedTermIndex(entry.getTerm, entry.getIndex)
 			CompletableFuture.completedFuture(ack(update.id))

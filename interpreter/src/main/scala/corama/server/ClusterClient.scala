@@ -1,5 +1,6 @@
 package corama.server
 
+import corama.interpreter.IOMap
 import cats.syntax.all.*
 import cats.effect.IO
 import cats.effect.kernel.Resource
@@ -14,11 +15,9 @@ import flogger.Log
 
 case class GroupClient(raft: RaftClient, group: RaftGroup)
 
-class ClusterClient(instances: Map[TaskId, GroupClient]) {
+class ClusterClient(clients: IOMap[TaskId, GroupClient]) {
 	def invoke(taskId: TaskId)(block: GroupClient => IO[RaftClientReply]): IO[RaftClientReply] = {
-		IO.fromEither(instances.get(taskId).toRight(
-			new RuntimeException(s"No such task: ${taskId}")
-		)).flatMap(block).flatMap { reply =>
+		clients.use(taskId)(block).flatMap { reply =>
 			IO.fromEither(Option(reply.getException()).toLeft(reply))
 		}
 	}
@@ -30,7 +29,7 @@ object ClusterClient extends IOLogging {
 		config.tasks.parTraverse { task =>
 			groupClient(config, task).map(task -> _)
 		}.map { clients =>
-			new ClusterClient(clients.toList.toMap)
+			new ClusterClient(IOMap(clients))
 		}
 	}
 

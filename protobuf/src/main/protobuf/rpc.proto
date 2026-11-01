@@ -1,6 +1,14 @@
 syntax = "proto3";
 package streamdsl;
 
+service Corama {
+	rpc Append(Request) returns (Response);
+	rpc Query(Request) returns (Response);
+	
+	// internal
+	rpc Continue(ContinueRequest) returns (Empty);
+}
+
 message Empty {}
 
 // message ValueBinding {
@@ -61,5 +69,42 @@ message Either {
 	oneof value {
 		bytes left = 1;
 		bytes right = 2;
+	}
+}
+
+// -- internal API
+
+message ContinueRequest {
+	int32 taskId = 1;
+	int32 topologyId = 2;
+	int32 afterNode = 3;
+	int64 edgeId = 4;
+	EvalOrigin origin = 5;
+	PartitionBatch envs = 6;
+}
+
+message PartitionBatch {
+	map<int32, EnvBatch> partitions = 1;
+}
+
+message EnvBatch {
+	// key is VarId
+	map<int32, bytes> values = 1;
+}
+
+message EvalOrigin {
+	string instanceId = 1;
+	int64 evalId = 2;
+}
+
+message Request {
+	string id = 1; // destination (depot name / query name)
+	bytes value = 2;
+}
+
+message Response {
+	oneof value {
+		bytes success = 1;
+		bytes failure = 2;
 	}
 }

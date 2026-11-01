@@ -19,82 +19,10 @@ import org.apache.ratis.protocol.Message
 import org.apache.ratis.protocol.exceptions.NotLeaderException
 
 import java.nio.ByteBuffer
-import scala.collection.immutable.TreeMap
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-
-/** Collects the effects of speculative execution as a raft-log payload,
- * rather than mutating state.
-	*/
-final class WriteCollector(txId: TxId, task: TaskId) {
-	private val depotAppends = Ref.unsafe[IO, List[DepotAppends]](Nil)
-	private val pstateUpdates = Ref.unsafe[IO, List[PStateUpdates]](Nil)
-
-	def depotAppend(id: DepotId, values: Vector[DepotAppend]): IO[Unit] = {
-		depotAppends.update(DepotAppends(id, values) :: _)
-	}
-
-	def pstateUpdate(id: PStateId, updates: Vector[PStateUpdate]): IO[Unit] = {
-		pstateUpdates.update(PStateUpdates(id, updates) :: _)
-	}
-
-	def update: IO[ReplicationUpdate] = {
-		(depotAppends.get, pstateUpdates.get).mapN { (depots, pstates) =>
-			ReplicationUpdate(txId, depots.reverse, pstates.reverse)
-		}
-	}
-}
-
-/** Read view for one task: the applied state (persisted)
-	* plus the speculative results of submitted-but-unacknowledged writes.
-	*
-	* Ensures all writes are immediately visible to local topologies,
-	* without waiting for a commit between each write.
-	*
-	* Keyed by *submission sequence*, not log index: the log index only becomes
-	* known when the proposal commits, but later executions must see earlier
-	* updates immediately. The seq→index mapping is monotonic because the
-	* executor is the group's only proposer.
-	*/
-final class SpeculativeView(task: TaskId)(using Log[IO]) {
-	private case class Entry(update: ReplicationUpdate, index: Option[LogIndex])
-	private val pending = Ref.unsafe[IO, TreeMap[Long, Entry]](TreeMap.empty)
-
-	def append(seq: Long, update: ReplicationUpdate): IO[Unit] = {
-		pending.update(_.updated(seq, Entry(update, None)))
-	}
-
-	// remove an item that was not accepted
-	def discard(seq: Long): IO[Unit] = {
-		pending.update(_.removed(seq))
-	}
-
-	// Mark a sequence as committed and now associated with a ratis log index.
-	// Note that committed items are still present in their speculative form,
-	// until markCommitted (when the log index has been applied locally
-	// on this node).
-	def markCommitted(seq: Long, index: LogIndex): IO[Unit] = {
-		pending.update { entries =>
-			entries.updatedWith(seq)(_.map(e => e.copy(index = Some(index))))
-		}
-	}
-
-	// remove entries at or below watermark, as they have been applied
-	// to the local persistent store.
-	def markApplied(watermark: LogIndex): IO[Unit] = {
-		pending.update(entries => entries.dropWhile((_, entry) => entry.index.exists(_.value <= watermark.value)))
-	}
-
-	// build a view on top of the applied state.
-	// TODO: materialize on change instead of recomputing?
-	def observe[A](applied: IO[A])(overlay: (A, ReplicationUpdate) => A): IO[A] = {
-		for {
-			base <- applied
-			entries <- pending.get
-		} yield entries.values.foldLeft(base)((acc, entry) => overlay(acc, entry.update))
-	}
-}
+import corama.interpreter.SpeculativeState
 
 private[server] case class RatisCommand[A](op: RatisOp[A], reply: Deferred[IO, Try[A]])
 private[server] sealed trait RatisOp[A]
@@ -130,13 +58,14 @@ private[server] object RatisCommand {
 final class RatisTask private[server] (
 	val task: TaskId,
 	replog: RepLog,
-	view: SpeculativeView,
+	speculative: SpeculativeState,
 	topologies: Topologies,
 	metadata: ClusterMetadata,
 	commands: Queue[IO, RatisCommand[?]],
 	submissions: Queue[IO, RatisTask.Submission],
 	permits: Semaphore[IO],
 	// partitions evaluated on this instance for this task
+	pstateView: PStateView,
 	partitionFor: PartitionId => IO[Partition],
 )(using log: Log[IO]) extends IOLogging {
 	import RatisCommand.*
@@ -178,6 +107,8 @@ final class RatisTask private[server] (
 			case Append(depot, value, level) =>
 				// all appends are RatisCommand[AckReturns]
 				val reply = cmd.asInstanceOf[RatisCommand[AckReturns]].reply
+				// TODO: return early if the client isn't actually waiting for returns
+
 				// TODO: allocate the TxId here, inside the serialized fiber so tx ids
 				// and log indices stay consistent while leadership holds.
 				// A bare counter is not enough — key on (instanceId, txId) or take
@@ -185,14 +116,14 @@ final class RatisTask private[server] (
 				// and uncommitted old-leader txs collide.
 				// A retry of a committed action must dedup by TxId at execution time.
 				val txId = ??? : TxId
-				val collector = WriteCollector(txId, task)
 				val eval = for {
+					evalState <- EvalState(pstateView, speculative)
 					results <- EvalResults(subscribers(depot))
 					// speculative execution: run the depot-driven topologies for this
-					// record, capturing all writes into the collector instead of state
-					_ <- executeTopologies(depot, value, collector, results)
+					// record, capturing all writes into evalState
+					_ <- executeTopologies(depot, value, evalState, results)
 					raw <- results.await
-					update <- collector.update
+					update = evalState.toUpdate(txId)
 				} yield (raw, update)
 
 				eval.attempt.flatMap {
@@ -208,7 +139,7 @@ final class RatisTask private[server] (
 							seq <- nextSeq.updateAndGet(_ + 1)
 							proposal <- replog.submit(update)
 							submission = RatisTask.Submission(seq, proposal, AckReturns(raw, topologies), reply)
-							_ <- view.append(seq, update)
+							_ <- speculative.append(seq, update)
 							_ <- submissions.offer(submission)
 						} yield ()
 				}
@@ -223,13 +154,13 @@ final class RatisTask private[server] (
 			result <- submission.proposal.committed.attempt
 			_ <- result match {
 				case Right(index) =>
-					view.markCommitted(submission.seq, index) *>
+					speculative.markCommitted(submission.seq, index) *>
 						// committed, release the ack
 						// note: apply happens after ack, but that's OK because we already speculatively executed it.
 						// On failover it's in the log, so it'll be available there too
 						submission.reply.complete(Success(submission.raw)).void
 				case Left(e) =>
-					view.discard(submission.seq) *>
+					speculative.discard(submission.seq) *>
 						submission.reply.complete(Failure(e)).void
 			}
 			_ <- permits.release
@@ -238,7 +169,7 @@ final class RatisTask private[server] (
 
 	// The task's background fibers
 	private[server] def background: IO[Nothing] = {
-		val drainLoop = replog.appliedOffsets.evalMap(view.markApplied).compile.drain *> Util.neverReached
+		val drainLoop = replog.appliedOffsets.evalMap(speculative.markApplied).compile.drain *> Util.neverReached
 		Util.joinNothings(List(
 			executorLoop,
 			awaitLoop,
@@ -255,10 +186,10 @@ final class RatisTask private[server] (
 	private def executeTopologies(
 		depot: DepotId,
 		value: Bytes,
-		collector: WriteCollector,
+		state: EvalState,
 		results: EvalResults,
 	): IO[Unit] = ???
-	// TODO: hook up interpreter with write collector, running against the speculative view.
+	// TODO: hook up interpreter with eval state
 }
 
 object RatisTask {
@@ -273,7 +204,7 @@ object RatisTask {
 	def resource(
 		task: TaskId,
 		replog: RepLog,
-		view: SpeculativeView,
+		view: SpeculativeState,
 		topologies: Topologies,
 		metadata: ClusterMetadata,
 		partitionFor: PartitionId => IO[Partition],
@@ -283,7 +214,19 @@ object RatisTask {
 			commands <- Resource.eval(Queue.unbounded[IO, RatisCommand[?]])
 			submissions <- Resource.eval(Queue.unbounded[IO, Submission])
 			permits <- Resource.eval(Semaphore[IO](maxInFlight.toLong))
-			ratisTask = RatisTask(task, replog, view, topologies, metadata, commands, submissions, permits, partitionFor)
+			rocksDbState = identity[PStateView](???)
+			ratisTask = RatisTask(
+				task,
+				replog,
+				view,
+				topologies,
+				metadata,
+				commands,
+				submissions,
+				permits,
+				rocksDbState,
+				partitionFor
+			)
 		} yield (ratisTask, ratisTask.background))
 	}
 }
@@ -350,7 +293,7 @@ object RatisInterpreter {
 			RatisTask.resource(
 				taskId,
 				RatisRepLog(groupClient.raft),
-				SpeculativeView(taskId),
+				SpeculativeState(),
 				topologies,
 				metadata,
 				partitionFor,

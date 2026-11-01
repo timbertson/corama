@@ -46,6 +46,11 @@ object Bytes {
 	implicit val orderingInstance: Ordering[Bytes] = Order.catsKernelOrderingForOrder[Bytes](orderInstance)
 }
 
+// TODO: use ByteString
+// TODO: Add embedding field, describing how values are embedded in a stream:
+// - fixed length
+// - len prefixed
+// - null-terminated
 trait Codec[A] {
 	def encode(a: A): Bytes
 	def decode(bytes: Bytes): Try[A]

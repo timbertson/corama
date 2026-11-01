@@ -28,10 +28,10 @@ object TaskId {
 }
 
 case class PStateUpdate(key: Bytes, value: Option[Bytes])
-case class PStateUpdates(id: PStateId, updates: Vector[PStateUpdate])
+case class PStateUpdates(id: PStateId, updates: Array[PStateUpdate])
 
 case class DepotAppend(value: Bytes)
-case class DepotAppends(id: DepotId, updates: Vector[DepotAppend])
+case class DepotAppends(id: DepotId, updates: Array[DepotAppend])
 
 case class ReplicationUpdate(
 	id: TxId,
@@ -298,18 +298,18 @@ object TaskLeader extends IOLogging {
 }
 
 case class BatchWrites(
-	depotAppends: Map[DepotId, Vector[DepotAppend]],
-	pstateUpdates: Map[PStateId, Vector[PStateUpdate]],
+	depotAppends: Map[DepotId, Array[DepotAppend]],
+	pstateUpdates: Map[PStateId, Array[PStateUpdate]],
 	size: Int,
 ) {
 	def update(cmd: BatchCommand.Op): BatchWrites = cmd match {
 		case BatchCommand.Append(depot, appends, w) => copy(
-			depotAppends = depotAppends.updatedWith(depot)(v => Some(v.getOrElse(Vector.empty) ++ appends)),
+			depotAppends = depotAppends.updatedWith(depot)(v => Some(v.getOrElse(Array.empty[DepotAppend]) ++ appends)),
 			size = size + appends.size
 		)
 
 		case BatchCommand.Update(pstate, updates, w) => copy(
-			pstateUpdates = pstateUpdates.updatedWith(pstate)(v => Some(v.getOrElse(Vector.empty) ++ updates)),
+			pstateUpdates = pstateUpdates.updatedWith(pstate)(v => Some(v.getOrElse(Array.empty[PStateUpdate]) ++ updates)),
 			size = size + updates.size
 		)
 	}
