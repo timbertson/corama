@@ -23,7 +23,12 @@ private[corama] class VarRegistry {
 	private [corama] def all = list
 }
 
-private[corama] final class VarId(private[corama] val id: Int, private[corama] val hint: String, private[corama] val tag: LightTypeTag) {
+private[corama] final class VarId(
+	private[corama] val id: Int,
+	private[corama] val hint: String,
+	private[corama] val tag: LightTypeTag,
+	private[corama] val codec: AnyCodec = ???,
+) {
 	override def equals(other: Any): Boolean = other match {
 		case that: VarId => that.id == id
 		case _           => false

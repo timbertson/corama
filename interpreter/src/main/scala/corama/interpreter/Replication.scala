@@ -27,8 +27,7 @@ object TaskId {
 	implicit val eq: Eq[TaskId] = Eq.fromUniversalEquals
 }
 
-case class PStateUpdate(key: Bytes, value: Option[Bytes])
-case class PStateUpdates(id: PStateId, updates: Array[PStateUpdate])
+case class PStateUpdate(key: PStateKey, value: Option[Bytes])
 
 case class DepotAppend(value: Bytes)
 case class DepotAppends(id: DepotId, updates: Array[DepotAppend])
@@ -36,7 +35,7 @@ case class DepotAppends(id: DepotId, updates: Array[DepotAppend])
 case class ReplicationUpdate(
 	id: TxId,
 	depotAppends: List[DepotAppends],
-	pstateUpdates: List[PStateUpdates],
+	pstateUpdates: Array[PStateUpdate],
 )
 
 case class ReplicationAck(
@@ -227,7 +226,7 @@ final class TaskLeader private (
 		val update = ReplicationUpdate(
 			b.txId,
 			writes.depotAppends.toList.map { case (id, v) => DepotAppends(id, v) },
-			writes.pstateUpdates.toList.map { case (id, v) => PStateUpdates(id, v) },
+			writes.pstateUpdates.map { (k,v) => PStateUpdate(k,v) }.toArray,
 		)
 		for {
 			_ <- log.debug(s"Flushing batch ${b.txId} of size ${b.writes.size}")
@@ -299,7 +298,7 @@ object TaskLeader extends IOLogging {
 
 case class BatchWrites(
 	depotAppends: Map[DepotId, Array[DepotAppend]],
-	pstateUpdates: Map[PStateId, Array[PStateUpdate]],
+	pstateUpdates: Map[PStateKey, Option[Bytes]],
 	size: Int,
 ) {
 	def update(cmd: BatchCommand.Op): BatchWrites = cmd match {
@@ -308,10 +307,11 @@ case class BatchWrites(
 			size = size + appends.size
 		)
 
-		case BatchCommand.Update(pstate, updates, w) => copy(
-			pstateUpdates = pstateUpdates.updatedWith(pstate)(v => Some(v.getOrElse(Array.empty[PStateUpdate]) ++ updates)),
-			size = size + updates.size
-		)
+		case BatchCommand.Update(pstate, updates, w) => ???
+			// copy(
+			// pstateUpdates = pstateUpdates.updatedWith(pstate)(v => Some(v.getOrElse(Array.empty[PStateUpdate]) ++ updates)),
+			// size = size + updates.size
+		// )
 	}
 }
 

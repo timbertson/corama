@@ -10,8 +10,11 @@ import org.tpolecat.sourcepos.SourcePos
 
 import scala.util.*
 import flogger.*
+import izumi.reflect.Tag
 
 class Partition(
+	id: PartitionId,
+	state: SpeculativeState,
 	receivers: EvalReceivers,
 	metadata: ClusterMetadata,
 	topologies: Topologies,
@@ -23,36 +26,20 @@ class Partition(
 
 	private val idList = topologies.ids.toList
 
-	private val pstates: Map[String, PState] = {
-		idList.mapFilter { id =>
-			if (id.namespace == IdentityNamespace.PState) {
-				Some(id.name -> new PState())
-			} else {
-				None
-			}
-		}.toMap
-	}
-	
-	private val depots: Map[String, Depot] = idList.mapFilter { id =>
-		if (id.namespace == IdentityNamespace.Depot) {
-			Some(id.name -> new Depot())
-		} else {
-			None
-		}
-	}.toMap
-
 	// Run a topology over some values by installing its results into the global GRPC service until completion
 	private def runTopologyEval[R](
 		results: LocalEvalSink[R],
+		evalState: EvalState,
 		topology: Topology[?, R],
 		envs: List[Env],
 	): IO[R] = {
-		runTopologyEvalRaw(results, topology.id, EdgeId.startingEdge(topology.id), topology.compiled._1, envs)
+		runTopologyEvalRaw(results, evalState, topology.id, EdgeId.startingEdge(topology.id), topology.compiled._1, envs)
 	}
 
 	// As above, but also used in sub-aggregations to collect the results of a block
 	private def runTopologyEvalRaw[R](
 		results: LocalEvalSink[R],
+		evalState: EvalState,
 		topologyId: TopologyId,
 		start: EdgeId,
 		nodes: List[Node],
@@ -61,7 +48,7 @@ class Partition(
 		// install into GRPC listener so other partitions can send results
 		receivers.addRunning(results) { origin =>
 			// continue could throw (from user functions), so wrap it in IO.defer
-			this.continue(origin, topologyId, results, start, nodes, envs).attempt.flatMap {
+			this.continue(origin, topologyId, results, evalState, start, nodes, envs).attempt.flatMap {
 				// TODO: how to apply backpressure if clients are not waiting?
 				case Right(_) => IO.unit
 
@@ -74,67 +61,19 @@ class Partition(
 	}
 
 	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
-		val t = q.topology
-		val env: Env = Map(t.builder.input.vid -> value)
-		EvalSink.local(t.output.vid, t.agg, EdgeId.startingEdge(t.id)).flatMap { results =>
-			runTopologyEval(results, t, List(env))
-		}
-	}
-
-	// TODO: cancel running when this node no longer owns this partition
-	def run: IO[Nothing] = {
-		topologies.topologies.filter(_.builder.source.namespace == IdentityNamespace.Depot).parTraverse_ { topology =>
-			// TODO: parallel? / chunks?
-			this.depots(topology.builder.source.name).stream.foreach { record =>
-				val env = Map(topology.input.vid -> record.value)
-				for {
-					resultsOpt <- record.tracker.traverse(tracker => IO.fromTry(tracker.forTopology(topology)))
-					// TODO: skip all this when results are not tracked
-					results = resultsOpt.getOrElse(???)
-					_ <- runTopologyEval(results, topology, List(env))
-				} yield ()
-			}.compile.drain *> IO.raiseError(new RuntimeException("depot consume terminated"))
-		} *> IO.never
-	}
-	
-	// TODO: returning an IO of a lens is a nuisance
-	def access[V](pstate: corama.PState, path: NonEmptyList[Any]): Storage.Lens[V] =
-		Storage.Lens[V](this.pstate(pstate.id.name), path)
-
-	def getKeys[K, V](pstate: corama.PStateKV[K, V]): IO[Set[K]] = {
-		this.pstate(pstate.id.name).inner.get.map(_.keySet.map(_.asInstanceOf[K]))
-	}
-
-	def emit[A](depot: corama.Depot[A], value: A): IO[Unit] = {
-		this.depot(depot.id.name).inner.update(vec => vec.appended(Record(value, None)))
-	}
-
-	/** As `emit`, but with ack tracking */
-	def spawn[A](depot: corama.Depot[A], value: A, tracker: EvalResults): IO[Unit] = {
-		this.depot(depot.id.name).inner.update { vec =>
-			vec.appended(Record(value, Some(tracker)))
-		}
-	}
-
-	def readDepot[A](depot: corama.Depot[A]): IO[Vector[A]] = {
-		this.depot(depot.id.name).inner.get.map(vec => vec.map(_.value.asInstanceOf[A]))
-	}
-
-	private def pstate(name: String) = pstates.getOrElse(name, throw new RuntimeException(s"Unknown pstate: ${name}"))
-	private def depot(name: String) = depots.getOrElse(name, throw new RuntimeException(s"Unknown depot: ${name}"))
-
-	private def compilePath(path: CompiledPath, env: Env): NonEmptyList[Any] = {
-		import CompiledPath._
-		path.path.map {
-			case Literal(inner) => inner
-			case Variable(id) => env(id)
-		}
+		???
+		// val t = q.topology
+		// val env: Env = Map(t.builder.input.vid -> value)
+		// EvalSink.local(t.output.vid, t.agg, EdgeId.startingEdge(t.id)).flatMap { results =>
+		// 	runTopologyEval(results, t, List(env))
+		// }
 	}
 
 	private [corama] def continue[R](
 		origin: Origin,
 		topologyId: TopologyId,
 		evalSink: EvalSink[R],
+		evalState: EvalState,
 		edgeId: EdgeId,
 		nodes: List[Node],
 		envs: List[Env],
@@ -147,17 +86,19 @@ class Partition(
 			"edge" -> edgeId.hex,
 		)
 		val continue = continueLog.debug("Continuing computation") *>
-			this.continueInner(origin, topologyId, evalSink, edgeId, nodes, envs, continueLog)
+			this.continueInner(origin, topologyId, evalSink, evalState, edgeId, nodes, envs, continueLog)
 
 		IO.defer(continue)
 	}
 
 	/** Runs a list of nodes with the given envs. Results are returned to `results`.
+	 *  TODO: should this be IO?
 		*/
 	private def continueInner[R](
 		origin: Origin,
 		topologyId: TopologyId,
 		evalSink: EvalSink[R],
+		evalState: EvalState,
 		edgeId: EdgeId,
 		nodes: List[Node],
 		envs: List[Env],
@@ -165,7 +106,7 @@ class Partition(
 	): IO[Unit] = {
 		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
 			// supplies origin / topology / evalSink since those don't change
-			continueInner(origin, topologyId, evalSink, nextEdgeId, nodes, envs, log)
+			continueInner(origin, topologyId, evalSink, evalState, nextEdgeId, nodes, envs, log)
 
 		import Node.DynamicOp
 		import Node.PStateOp
@@ -173,7 +114,7 @@ class Partition(
 		nodes match {
 			case Nil =>
 				evalSink.completeList(edgeId, envs.map(_(evalSink.varId).asInstanceOf[R]))
-			
+
 			case node :: tail => {
 				log.debug(s"Executing node: ${node}") *>
 				(node.op match {
@@ -235,82 +176,77 @@ class Partition(
 					}
 
 					case Node.Combine(block, agg, collectFrom, out) => {
-						envs.parTraverse { env =>
-							// TODO: skip all the bookkeeping if there aren't any
-							// partition jumps in `block`?
-							// Note: reusing parent `edgeId` here, but there's no confusion because this is a new EvalId
-							EvalSink.local(out, agg, edgeId).flatMap { results =>
-								runTopologyEvalRaw(results, topologyId, edgeId, block, List(env)).map { result =>
-									env.updated(out, result)
-								}
-							}
-						}.flatMap { outputEnvs =>
-							continueTopology(tail, outputEnvs)
-						}
+						???
+						// envs.parTraverse { env =>
+						// 	// TODO: skip all the bookkeeping if there aren't any
+						// 	// partition jumps in `block`?
+						// 	// Note: reusing parent `edgeId` here, but there's no confusion because this is a new EvalId
+						// 	EvalSink.local(out, agg, edgeId).flatMap { results =>
+						// 		runTopologyEvalRaw(results, evalState, topologyId, edgeId, block, List(env)).map { result =>
+						// 			env.updated(out, result)
+						// 		}
+						// 	}
+						// }.flatMap { outputEnvs =>
+						// 	continueTopology(tail, outputEnvs)
+						// }
 					}
 					
 					case Node.PStateNode(ps, path, op) =>
-						val state = pstate(ps.name)
 						envs.traverse { env =>
-							val rawPath = compilePath(path, env)
-							def applyOp(current: Option[Any]): (Option[Any], Env) = {
-								def currentSet: Set[Any] = {
-									println(s"accessing current set @ $rawPath: ${current}")
-									current.fold(Set.empty[Any])(_.asInstanceOf[Set[Any]])
+							IO.pure(op match {
+								// adding / removing items of a set is just writing to the key of (key,value)
+								case PStateOp.Add(v) => {
+									evalState.put(PStateKey.forSetElem(id, ps, path, env, v), Some(Bytes.empty))
+									env
 								}
-								op match {
-									case PStateOp.Add(v) => (Some(currentSet.incl(env(v))), env)
-									case PStateOp.Remove(v) => (Some(currentSet.excl(env(v))), env)
-									case PStateOp.Select(out, options) => {
-										// TODO: implement limit
-										val ord: Ordering[Any] = options.ord.asInstanceOf[Ordering[Any]]
-										val fullList = currentSet.toList.sorted(using ord)
-										val result = options match {
-											case SelectOptions(afterVar, maxItems, _) =>
-												val afterList = afterVar.fold(fullList){ afterVar =>
-													val afterVal = env(afterVar.vid)
-													fullList.dropWhile(x => ord.lteq(x, afterVal))
-												}
-												val afterLimit = maxItems.fold(afterList) { max =>
-													afterList.take(max)
-												}
-												afterLimit
-										}
-										println(s"Select returned $result into var $out")
-										(current, env.updated(out, result))
-									}
 
-									case PStateOp.Get(out: VarId) => (current, env.updated(out, current))
-									case PStateOp.Put(v: VarId) => (Some(env(v)), env)
-									// case PStateOp.Delete(v: VarId) => (None, env)
+								case PStateOp.Remove(v) => {
+									evalState.put(PStateKey.forSetElem(id, ps, path, env, v), None)
+									env
 								}
-							}
-							state.modify(rawPath)(applyOp)
+
+								case PStateOp.Select(out, options) => {
+									val key = PStateKey(id, ps, path, env)
+
+									val after = options.after.flatMap { after =>
+										env(after.vid)
+											.asInstanceOf[Option[Any]]
+											.map(after.vid.codec.encode)
+									}
+									val rawOpts = SelectOptions.Raw(after, options.maxItems)
+									env.updated(out, evalState.select(key, rawOpts))
+								}
+
+								case PStateOp.Get(out: VarId) =>
+									env.updated(out, evalState.get(PStateKey(id, ps, path, env)).map(out.codec.decodeEx))
+
+								case PStateOp.Put(v: VarId) => {
+									evalState.put(PStateKey(id, ps, path, env), Some(v.codec.encode(env(v))))
+									env
+								}
+							})
 						}.flatMap { updatedEnvs =>
 							continueTopology(tail, updatedEnvs)
 						}
 
 					case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
 						val f = fn // TODO is this necessary?
-						val state = pstate(ps.name)
 						envs.traverse_ { env =>
-							val rawPath = compilePath(path, env)
-							def applyOp(current: Option[Any]): (Option[Any], Unit) = {
-								val args = ins.map(env(_))
-								(f(current, args), ())
-							}
-							state.modify(rawPath)(applyOp)
+							val key = PStateKey(id, ps, path, env)
+							val current = evalState.get(key).map(path.codec.decodeEx)
+							val args = ins.map(env(_))
+							val updated = f(current, args).map(path.codec.encode)
+							evalState.put(key, updated)
+							IO.unit
 						}.flatMap { _ =>
 							continueTopology(tail, envs)
 						}
 
 					case Node.LocalAppend(dep, value) =>
-						val state = depot(dep.name)
 						envs.traverse_ { env =>
 							val v = env(value)
-							// `None`: the new record starts its own event tree rather than extending
-							// the appender's. An assumption, not a verified fact — FLOW-NOTES.md.
-							state.inner.update(_.appended(Record(v, None)))
+							evalState.append(dep, value.codec.encode(v))
+							IO.unit
 						} *> continueTopology(tail, envs)
 				})
 			}

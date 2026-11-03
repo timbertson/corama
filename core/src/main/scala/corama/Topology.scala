@@ -25,15 +25,14 @@ enum TopologyKind {
 // or query input
 final class TopologyBuilder[S] private[corama] (
 	val id: TopologyId,
-	// source may be a Depot or Query, it won't be a PState
-	val source: Identity,
+	val source: PublicIdentity,
 	private [corama] val tag: Tag[S],
 	pos: SourcePos
 )(implicit codec: Codec[S]) {
 
 	private[corama] val vars = new VarRegistry()
 
-	val input: Var[S] = vars.add[S](source.name, tag, codec, pos) // mint a generated var name for elements in the source
+	val input: Var[S] = vars.add[S](source.value, tag, codec, pos) // mint a generated var name for elements in the source
 
 	def define[A](tag: Tag[A], codec: Codec[A], pos: SourcePos, hint: String = "var"): Var[A] = vars.add[A](hint, tag, codec, pos)
 
@@ -66,7 +65,7 @@ final class Topologies {
 		get(id).flatMap(_.continuationAfter(afterNode))
 	}
 
-	private def claim(identity: Identity): Identity = {
+	private def claim[A <: Identity](identity: A): A = {
 		if (ids.contains(identity)) {
 			throw new RuntimeException(s"Multiple definition of $identity")
 		}
@@ -80,23 +79,23 @@ final class Topologies {
 	}
 
 	def pstateKV[K: Tag : Codec, V: Tag : Codec](name: String): PStateKV[K, V] =
-		registerPstate(PStateKV[K, V](claim(Identity(IdentityNamespace.PState, name))), _.inner)
+		registerPstate(PStateKV[K, V](claim(PStateId(name))), _.inner)
 
 	def pstateKVSet[K: Tag : Codec, V: Tag : Codec : Order](name: String, subindex: Subindex = Subindex.default): PStateKVSet[K, V] =
-		registerPstate(PStateKVSet[K, V](claim(Identity(IdentityNamespace.PState, name)), subindex), _.inner)
+		registerPstate(PStateKVSet[K, V](claim(PStateId(name)), subindex), _.inner)
 
 	def pstate(name: String, schema: Schema): PState =
-		registerPstate(PState(claim(Identity(IdentityNamespace.PState, name)), schema), identity)
+		registerPstate(PState(claim(PStateId(name)), schema), identity)
 
 	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] =
-		Depot[A](claim(Identity(IdentityNamespace.Depot, name)))
+		Depot[A](claim(DepotId(name)))
 
 	/** Declare a query topology: invoked by a client, returns one aggregated value.
 	  */
 	def query[S, R](name: String, agg: Agg[R])(
 		block: Var[S] => Flow[R, QueryContext],
 	)(implicit tagS: Tag[S], tagR: Tag[R], codecS: Codec[S], codecR: Codec[R], pos: SourcePos): QueryTopology[S, R] = {
-		QueryTopology(declare[S, R, QueryContext](claim(Identity(IdentityNamespace.Query, name)), agg, tagS, tagR, pos)(block))
+		QueryTopology(declare[S, R, QueryContext](claim(QueryId(name)), agg, tagS, tagR, pos)(block))
 	}
 
 	/** A stream topology: driven by an append, writes PStates, returns nothing.
@@ -116,7 +115,7 @@ final class Topologies {
 		StreamTopology(declare[S, R, StreamContext[R]](depot.id, agg, tagS, tagR, pos)(block))
 	}
 
-	private def declare[S, R, C](source: Identity, agg: Agg[R], tagS: Tag[S], tagR: Tag[R], pos: SourcePos)(
+	private def declare[S, R, C](source: PublicIdentity, agg: Agg[R], tagS: Tag[S], tagR: Tag[R], pos: SourcePos)(
 		block: Var[S] => Flow[R, C]
 	)(implicit codecS: Codec[S], codecR: Codec[R]): Topology[S, R] = {
 		val b = new TopologyBuilder[S](TopologyId(built.length), source, tagS, pos)
@@ -238,13 +237,16 @@ final case class QueryTopology[S, R] private[corama](topology: Topology[S, R])
 final case class StreamTopology[S, R] private[corama](topology: Topology[S, R])
 
 
-sealed trait IdentityNamespace
-object IdentityNamespace {
-	case object PState extends IdentityNamespace
-	case object Depot extends IdentityNamespace
-	case object Query extends IdentityNamespace
-}
-
 // Shared trait for PState, Depot and Query which all
 // have publicly referenceable names
-private case class Identity(namespace: IdentityNamespace, name: String)
+
+sealed trait Identity {
+	val value: String
+}
+
+// IDs which can be referenced directly by clients
+sealed trait PublicIdentity extends Identity
+
+case class PStateId(value: String) extends Identity
+case class DepotId(value: String) extends PublicIdentity
+case class QueryId(value: String) extends PublicIdentity

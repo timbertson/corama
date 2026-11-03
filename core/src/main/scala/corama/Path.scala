@@ -53,5 +53,9 @@ private [corama] case class CompiledPath(path: NonEmptyList[CompiledPath.Compone
 		case Literal(inner) => None
 		case Variable(id) => Some(id)
 	}
+
+	def appendVar(v: VarId, terminalTag: LightTypeTag, codec: AnyCodec) = {
+		CompiledPath(path.append(Variable(v)), terminalTag, codec)
+	}
 }
 

@@ -26,7 +26,7 @@ object PrettyPrint {
 	}
 	
 	private def lines[S, R](topology: Topology[S, R]) = {
-		s"# ${topology.id.value} from ${topology.builder.source.name}: ${cls(topology.builder.tag)}" ::
+		s"# ${topology.id.value} from ${topology.builder.source.value}: ${cls(topology.builder.tag)}" ::
 			s"  : returns ${cls(topology.compiled._2.tag)}" ::
 			nodeLines(State(indent = 1), topology.compiled._1)
 	}

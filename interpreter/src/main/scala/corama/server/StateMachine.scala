@@ -1,7 +1,7 @@
 package corama.server
 
 import corama.{Bytes, Codec, DepotId, PStateId}
-import corama.interpreter.{DepotAppend, DepotAppends, PStateUpdate, PStateUpdates, ReplicationUpdate, TxId}
+import corama.interpreter.{DepotAppend, DepotAppends, PStateKey, PStateUpdate, ReplicationUpdate, TxId}
 import corama.interpreter.db.RocksDb
 import org.apache.ratis.protocol.{Message, RaftGroupId}
 import org.apache.ratis.server.RaftServer
@@ -27,25 +27,24 @@ object ReplogCodecs {
 	implicit val depotId: Codec[DepotId] = via[DepotId, String](Codec.forString)(_.value)(DepotId.apply)
 	implicit val pstateId: Codec[PStateId] = via[PStateId, String](Codec.forString)(_.value)(PStateId.apply)
 	implicit val depotAppend: Codec[DepotAppend] = via[DepotAppend, Bytes](Codec.forBytes)(_.value)(DepotAppend.apply)
+	implicit val pstateKey: Codec[PStateKey] =
+		via[PStateKey, Bytes](Codec.forBytes)(k => k.raw.raw) { bytes => PStateKey(Bytes.Value(bytes)) }
 
 	implicit val pstateUpdate: Codec[PStateUpdate] =
-		via[PStateUpdate, (Bytes, Option[Bytes])](Codec.forTuple[Bytes, Option[Bytes]])(p => (p.key, p.value)) { case (key, value) => PStateUpdate(key, value) }
-
-	implicit val pstateUpdates: Codec[PStateUpdates] =
-		via[PStateUpdates, (PStateId, List[PStateUpdate])](Codec.forTuple[PStateId, List[PStateUpdate]])(p => (p.id, p.updates.toList)) { case (id, updates) => PStateUpdates(id, updates.toArray) }
+		via[PStateUpdate, (PStateKey, Option[Bytes])](Codec.forTuple[PStateKey, Option[Bytes]])(p => (p.key, p.value)) { case (key, value) => PStateUpdate(key, value) }
 
 	implicit val depotAppends: Codec[DepotAppends] =
 		via[DepotAppends, (DepotId, List[Bytes])](Codec.forTuple[DepotId, List[Bytes]])(d => (d.id, d.updates.map(_.value).toList)) { case (id, values) => DepotAppends(id, values.map(DepotAppend.apply).toArray) }
 
 	implicit val replicationUpdate: Codec[ReplicationUpdate] =
-		via[ReplicationUpdate, ((TxId, List[DepotAppends]), List[PStateUpdates])](Codec.forTuple[(TxId, List[DepotAppends]), List[PStateUpdates]])(r => ((r.id, r.depotAppends), r.pstateUpdates)) {
+		via[ReplicationUpdate, ((TxId, List[DepotAppends]), Array[PStateUpdate])](Codec.forTuple[(TxId, List[DepotAppends]), Array[PStateUpdate]])(r => ((r.id, r.depotAppends), r.pstateUpdates)) {
 			case ((id, depotAppends), pstateUpdates) => ReplicationUpdate(id, depotAppends, pstateUpdates)
 		}
 }
 
 object Keyspace {
 	private val Depot = 'D'.toByte
-	private val PState = 'S'.toByte
+	private [corama] val PState = 'S'.toByte
 	private val Meta = 'M'.toByte
 
 	private def lenPrefixed(s: String): Bytes = {
@@ -62,8 +61,8 @@ object Keyspace {
 	def depotKey(id: DepotId, index: Long, sub: Int): Bytes =
 		Array(Depot) ++ lenPrefixed(id.value) ++ Codec.forLong.encode(index) ++ Codec.forInt.encode(sub)
 
-	def pstateKey(id: PStateId, key: Bytes): Bytes =
-		Array(PState) ++ lenPrefixed(id.value) ++ key
+	// def pstateKey(id: PStateId, key: Bytes): Bytes =
+	// 	Array(PState) ++ lenPrefixed(id.value) ++ key
 
 	val applyOffsetKey: Bytes = metaKey("apply_offset")
 }
@@ -121,11 +120,7 @@ object StateMachine {
 				Keyspace.depotKey(id, index, sub) -> Some(value)
 			}
 		}
-		val pstateWrites = update.pstateUpdates.flatMap { case PStateUpdates(id, updates) =>
-			updates.map { case PStateUpdate(key, value) =>
-				Keyspace.pstateKey(id, key) -> value
-			}
-		}
+		val pstateWrites = update.pstateUpdates.map(up => up.key.raw.raw -> up.value)
 		val meta = Keyspace.applyOffsetKey -> Some(Codec.forLong.encode(index))
 		(depotWrites ++ pstateWrites).toVector :+ meta
 	}

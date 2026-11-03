@@ -8,7 +8,6 @@ import corama.InstanceId
 import fs2.Stream
 import flogger.{Log, IOLogging}
 
-import scala.concurrent.duration.*
 
 // interfaces used to swap out real server backend for an in-memory one in tests
 

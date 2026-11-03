@@ -43,6 +43,7 @@ object Flow {
 	private[corama] case class Add[A](lens: SetLens[A], value: Var[A]) extends Flow[Unit, Etl]
 	private[corama] case class Remove[A](lens: SetLens[A], value: Var[A]) extends Flow[Unit, Etl]
 
+	// Note: appends performed as part of a topology only replicate at AppendAck, they don't receive topology responses
 	private[corama] case class LocalAppend[A](depot: Depot[A], key: Var[A]) extends Flow[Unit, Etl]
 
 	def of[A](v: Var[A]): Flow[A, Any] = Pure(v)

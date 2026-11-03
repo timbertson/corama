@@ -9,10 +9,8 @@ import corama.interpreter.*
 
 import scala.collection.immutable.TreeMap
 import scala.collection.mutable.ArrayBuffer
-
-trait PStateView {
-	def get(pstate: PStateId, key: Bytes.Value): Option[Bytes]
-}
+import corama.server.Keyspace
+import scala.annotation.unused
 
 /** State of speculative view - tracks replication updates that have
  * been submitted but not yet acknowledged.
@@ -24,7 +22,7 @@ trait PStateView {
  * updates immediately. The seq -> index mapping is monotonic only because
  * appends are only performed from the single proposer fiber.
  */
-final class SpeculativeState {
+final class SpeculativeState(base: PStateView) {
 	private case class Entry(update: ReplicationUpdate, index: Option[LogIndex])
 	private val pending = Ref.unsafe[IO, TreeMap[Long, Entry]](TreeMap.empty)
 
@@ -53,59 +51,12 @@ final class SpeculativeState {
 		pending.update(entries => entries.dropWhile((_, entry) => entry.index.exists(_.value <= watermark.value)))
 	}
 	
-	def snapshot(base: PStateView): IO[ViewSnapshot] = {
+	def snapshot: IO[ViewSnapshot] = {
 		pending.get.map { pending =>
-			val updates = pending.values.flatMap(_.update.pstateUpdates).groupBy(_.id).view.mapValues { v =>
-				v.flatMap(_.updates.map { entry => Bytes.Value(entry.key) -> entry.value }).toMap
+			val updates = pending.values.flatMap(_.update.pstateUpdates).map { v =>
+				v.key -> v.value
 			}.toMap
 			new ViewSnapshot(base, updates)
 		}
-	}
-}
-
-// an immutable snapshot of updates on an undrelying base
-final class ViewSnapshot(
-	base: PStateView,
-	pstateUpdates: Map[PStateId, Map[Bytes.Value, Option[Bytes]]]
-) extends PStateView {
-	def get(pstate: PStateId, key: Bytes.Value): Option[Bytes] = {
-		pstateUpdates.get(pstate).flatMap(_.get(key)).getOrElse {
-			base.get(pstate, key)
-		}
-	}
-}
-
-// A mutable snapshot collecting updates (and serving a view), used for a single eval batch
-// Unsafe (mutation), must not be accessed concurrently
-final class EvalState(base: PStateView) extends PStateView {
-	val depotAppends = new mutable.HashMap[DepotId, mutable.ArrayBuffer[Bytes]]()
-	val pstateUpdates = new mutable.HashMap[PStateId, mutable.Map[Bytes.Value, Option[Bytes]]]()
-	
-	def append(depot: DepotId, value: Bytes) = {
-		depotAppends.getOrElseUpdate(depot, new ArrayBuffer()).append(value)
-	}
-
-	def put(pstate: PStateId, key: Bytes.Value, value: Option[Bytes]) = {
-		pstateUpdates.getOrElseUpdate(pstate, new mutable.HashMap()).put(key, value)
-	}
-
-	def get(pstate: PStateId, key: Bytes.Value): Option[Bytes] = {
-		pstateUpdates.get(pstate).flatMap(_.get(key)).getOrElse {
-			base.get(pstate, key)
-		}
-	}
-	
-	def toUpdate(txId: TxId): ReplicationUpdate = ReplicationUpdate(
-		txId,
-		depotAppends = depotAppends.toList.map { (id, buf) => DepotAppends(id, buf.toArray.map(DepotAppend.apply)) },
-		pstateUpdates = pstateUpdates.toList.map { (id, writes) => PStateUpdates(id, writes.toArray.map { (k, v) =>
-			PStateUpdate(k.raw, v)
-		}) }
-	)
-}
-
-object EvalState {
-	def apply(base: PStateView, speculative: SpeculativeState) = {
-		speculative.snapshot(base).map(new EvalState(_))
 	}
 }

@@ -11,6 +11,8 @@ import corama.*
 import corama.AckLevel.AppendAck
 import corama.error.Util
 import corama.interpreter.*
+import corama.interpreter.SpeculativeState
+import corama.interpreter.db.RocksDb
 import flogger.IOLogging
 import flogger.Log
 import fs2.Stream
@@ -22,7 +24,7 @@ import java.nio.ByteBuffer
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-import corama.interpreter.SpeculativeState
+import scala.annotation.unused
 
 private[server] case class RatisCommand[A](op: RatisOp[A], reply: Deferred[IO, Try[A]])
 private[server] sealed trait RatisOp[A]
@@ -36,6 +38,17 @@ private[server] object RatisCommand {
 		q: QueryTopology[?, ?],
 		value: Any,
 	) extends RatisOp[Any]
+}
+
+// rocksDB storage view for a partition
+// Note that DBs are shared between all partitions in a task,
+// so this only performs reads
+class PersistentDbView(db: RocksDb) extends PStateView {
+	override def get(key: PStateKey): Option[Bytes] = {
+		db.getSync(key.raw.raw)
+	}
+
+	override def select(key: PStateKey, options: SelectOptions.Raw): Vector[Bytes] = ???
 }
 
 /** Executes actions for one task's raft group. Proposals can be submitted
@@ -52,6 +65,10 @@ private[server] object RatisCommand {
  * - update speculative view with committed LogIndex
  * - resolve the Ack
  *
+ * notifyLoop:
+ * - awaits notifications from evaluations
+ * - asynchronously informs the origin node of the evaluation's completion
+ *
  * drainLoop:
  * - trim speculative view to remove now-applied LogIndexes
  */
@@ -60,15 +77,17 @@ final class RatisTask private[server] (
 	replog: RepLog,
 	speculative: SpeculativeState,
 	topologies: Topologies,
-	metadata: ClusterMetadata,
+	@unused metadata: ClusterMetadata,
 	commands: Queue[IO, RatisCommand[?]],
 	submissions: Queue[IO, RatisTask.Submission],
+	notificationQueue: Queue[IO, (Origin, EvalNotification)],
 	permits: Semaphore[IO],
 	// partitions evaluated on this instance for this task
 	pstateView: PStateView,
-	partitionFor: PartitionId => IO[Partition],
+	@unused partitionFor: PartitionId => IO[Partition],
 )(using log: Log[IO]) extends IOLogging {
 	import RatisCommand.*
+	import RatisTask.*
 
 	private val nextSeq = Ref.unsafe[IO, Long](0L)
 
@@ -77,7 +96,7 @@ final class RatisTask private[server] (
 	def append[A, R](depot: corama.Depot[A], value: A, level: AckLevel[R]): IO[R] = {
 		// TODO: encode `value` via the depot's codec
 		val encoded: Bytes = ???
-		submitCommand(Append(DepotId(depot.id.name), encoded, level)).map { returns =>
+		submitCommand(Append(depot.id, encoded, level)).map { returns =>
 			level match {
 				case AckLevel.Ack => returns.asInstanceOf[R]
 				case AckLevel.NoAck | AckLevel.AppendAck => ().asInstanceOf[R] // R is always Unit for these ack levels
@@ -124,14 +143,15 @@ final class RatisTask private[server] (
 					_ <- executeTopologies(depot, value, evalState, results)
 					raw <- results.await
 					update = evalState.toUpdate(txId)
-				} yield (raw, update)
+					notifications = evalState.notifications
+				} yield (raw, update, notifications)
 
 				eval.attempt.flatMap {
 					// evaluation failed: the ack fails, the record never reaches the log.
 					// TODO: should this be allowed to retry? Definitely not forever...
 					case Left(e) => reply.complete(Failure(e)).void
 
-					case Right((raw, update)) =>
+					case Right((raw, update, notifications)) =>
 						// pipeline: block only when the in-flight bound is reached —
 						// the slot is released by the await loop when this proposal resolves
 						for {
@@ -141,6 +161,7 @@ final class RatisTask private[server] (
 							submission = RatisTask.Submission(seq, proposal, AckReturns(raw, topologies), reply)
 							_ <- speculative.append(seq, update)
 							_ <- submissions.offer(submission)
+							_ <- notifications.traverse_(notificationQueue.offer) // TODO batch
 						} yield ()
 				}
 
@@ -167,19 +188,36 @@ final class RatisTask private[server] (
 		} yield ()).foreverM
 	}
 
+	private def notifyOriginOrLog(origin: Origin, notification: EvalNotification): IO[Unit] = {
+		// notifications are downstream of evaluation. They are best-effort, we don't block
+		// future evaluations on attempting to reach an unavailable origin.
+		// Origins which are still waiting on an evaluation will timeout anyway
+		// TODO: special-case shortcut when origin instance is self?
+		??? // TODO
+	}
+
+	private def notifyLoop: IO[Nothing] = {
+		Stream.fromQueueUnterminated(notificationQueue)
+			.parEvalMapUnordered(MAX_INFLIGHT_ACKS) { (origin, notification) =>
+				notifyOriginOrLog(origin, notification)
+			}
+			.compile.drain *> Util.neverReached
+	}
+
 	// The task's background fibers
 	private[server] def background: IO[Nothing] = {
 		val drainLoop = replog.appliedOffsets.evalMap(speculative.markApplied).compile.drain *> Util.neverReached
 		Util.joinNothings(List(
 			executorLoop,
 			awaitLoop,
+			notifyLoop,
 			drainLoop
 		))
 	}
 
 	// matched by name to avoid depending on Identity's visibility across packages
 	private def subscribers(depot: DepotId): List[Topology[?, ?]] = {
-		topologies.topologies.filter(_.builder.source.name == depot.value)
+		topologies.topologies.filter(_.builder.source == depot)
 	}
 
 	// deprecated sketch wiring: run topologies with a capturing partition
@@ -193,6 +231,8 @@ final class RatisTask private[server] (
 }
 
 object RatisTask {
+	val MAX_INFLIGHT_ACKS = 50
+
 	private[server] case class Submission(
 		seq: Long,
 		proposal: Proposal,
@@ -211,8 +251,9 @@ object RatisTask {
 		maxInFlight: Int = 16,
 	)(using log: Log[IO]): ActiveResource[IO, RatisTask] = {
 		ActiveResource(for {
-			commands <- Resource.eval(Queue.unbounded[IO, RatisCommand[?]])
-			submissions <- Resource.eval(Queue.unbounded[IO, Submission])
+			commands <- Resource.eval(Queue.bounded[IO, RatisCommand[?]](10))
+			submissions <- Resource.eval(Queue.bounded[IO, Submission](10))
+			notifications <- Resource.eval(Queue.bounded[IO, (Origin, EvalNotification)](10))
 			permits <- Resource.eval(Semaphore[IO](maxInFlight.toLong))
 			rocksDbState = identity[PStateView](???)
 			ratisTask = RatisTask(
@@ -223,6 +264,7 @@ object RatisTask {
 				metadata,
 				commands,
 				submissions,
+				notifications,
 				permits,
 				rocksDbState,
 				partitionFor
@@ -293,7 +335,7 @@ object RatisInterpreter {
 			RatisTask.resource(
 				taskId,
 				RatisRepLog(groupClient.raft),
-				SpeculativeState(),
+				SpeculativeState(???),
 				topologies,
 				metadata,
 				partitionFor,

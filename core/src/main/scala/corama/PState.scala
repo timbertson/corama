@@ -41,17 +41,17 @@ case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) e
 // 	//
 // }
 
-case class PStateId(value: String)
 
 // Pstate with nested schemas. Not fully type safe, validity of paths is verified at runtime
-final case class PState(id: Identity, schema: Schema) {
+// TODO: Identity vs PStateId
+final case class PState(id: PStateId, schema: Schema) {
 	// println(s"created pstate ${id.name} with schema $schema")
 	private def checkType(value: PathComponent[?], schema: Schema): Either[String, Unit] =
 		def requireValueOf(schemaTag: Tag[?]) = {
 			if (value.value.tag =:= schemaTag) {
 				Right(())
 			} else {
-				Left(s"Incompatible path component (${value}) for schema (${schema}) on pstate ${id.name}")
+				Left(s"Incompatible path component (${value}) for schema (${schema}) on pstate ${id.value}")
 			}
 		}
 		schema match {
@@ -126,12 +126,12 @@ final case class PState(id: Identity, schema: Schema) {
 }
 
 // A convenience API with additional type safety for simple K/V PStates
-final case class PStateKV[K: Tag : Codec, V: Tag : Codec](id: Identity) {
+final case class PStateKV[K: Tag : Codec, V: Tag : Codec](id: PStateId) {
 	private [corama] var inner: PState = PState(id, Schema.mapOf[K](Schema[V], Subindex.nonIndexed))
 	def key(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
-final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Order](id: Identity, subindex: Subindex) {
+final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Order](id: PStateId, subindex: Subindex) {
 	private [corama] var inner: PState = PState(id, Schema.mapOf[K](Schema.set[V](subindex), Subindex.nonIndexed))
 	def key(k: Var[K]) = inner.setAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
@@ -139,4 +139,5 @@ final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Order](id: Identit
 final case class SelectOptions[A](after: Option[Var[Option[A]]], maxItems: Option[Int], ord: Order[A])
 object SelectOptions {
 	def all[A](implicit ord: Order[A]): SelectOptions[A] = SelectOptions(None, None, ord)
+	case class Raw(after: Option[Bytes], maxItems: Option[Int])
 }

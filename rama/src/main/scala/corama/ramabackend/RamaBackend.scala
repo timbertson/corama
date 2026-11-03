@@ -7,7 +7,6 @@ import com.rpl.rama.module.StreamSourceOptions
 import com.rpl.rama.ops.{RamaFunction1, RamaFunction2, RamaOperation1, OutputCollector}
 import com.rpl.rama.RamaModule.Setup
 import com.rpl.rama.RamaModule
-import corama.IdentityNamespace.Query
 import com.rpl.rama.ops.RamaFunction0
 import scala.jdk.CollectionConverters._
 
@@ -57,9 +56,9 @@ class RamaBackend(codecRegistry: CodecRegistry) {
 		val streamTopology = ramaTopologies.stream("main")
 
 		topologies.ids.foreach { id =>
-			id.namespace match {
+			id match {
 				// TODO schema + partitioning config
-				case corama.IdentityNamespace.Depot => setup.declareDepot(compileIdentity(id), rama.Depot.random())
+				case id: DepotId => setup.declareDepot(compileIdentity(id), rama.Depot.random())
 				// case corama.IdentityNamespace.PState => streamTopology.pstate(compileIdentity(id), classOf[Object])
 				case _ => ()
 			}
@@ -80,8 +79,8 @@ class RamaBackend(codecRegistry: CodecRegistry) {
 			}
 			val compiled = compileNodes(t.compiled._1)
 
-			t.builder.source.namespace match {
-				case IdentityNamespace.Depot =>
+			t.builder.source match {
+				case _: DepotId =>
 					// streams always return their final value, which is aggregated.
 					// aggregation is omitted for unit streams, for two reasons:
 					//  - it's pointless work to perform this aggregation
@@ -98,15 +97,13 @@ class RamaBackend(codecRegistry: CodecRegistry) {
 							.ackReturn(compileVar(t.compiled._2))
 					}
 
-				case IdentityNamespace.Query =>
+				case _: QueryId =>
 					codecRegistry.register(t.tagR, t.codec)
 					val queryOutputVar = unsafeInternalVar(t.compiled._2.vid, "out", tag = t.tagR.tag)
 					ramaTopologies.query(compileIdentity(id), compileVar(t.input.vid)).out(compileVar(queryOutputVar))
 						.`macro`(compiled)
 						.originPartition()
 						.agg(rama.Agg.combiner(compileCombiner(t.agg, t.tagR.tag), compileVar(t.compiled._2.vid))).out(compileVar(queryOutputVar))
-
-				case IdentityNamespace.PState => ()
 			}
 		}
 	}
@@ -337,10 +334,10 @@ object RamaBackend {
 	
 	// generate a rama varname for the given identity
 	private def compileIdentity(id: Identity) = {
-		id.namespace match {
-			case IdentityNamespace.PState => "$$" + id.name
-			case IdentityNamespace.Depot => "*" + id.name
-			case IdentityNamespace.Query => id.name
+		id match {
+			case PStateId(value) => "$$" + value
+			case DepotId(value) => "*" + value
+			case QueryId(value) => value
 		}
 	}
 

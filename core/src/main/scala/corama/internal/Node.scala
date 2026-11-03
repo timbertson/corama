@@ -79,7 +79,7 @@ private[corama] object Node {
 		override val children = List(block)
 	}
 
-	case class LocalAppend(depot: Identity, arg: VarId) extends NodeOp {
+	case class LocalAppend(depot: DepotId, arg: VarId) extends NodeOp {
 		val deps = Dependencies(List(arg), None)
 	}
 
@@ -94,7 +94,7 @@ private[corama] object Node {
 		case class Put(v: VarId) extends PStateOp
 	}
 
-	case class PStateNode(pstate: Identity, path: CompiledPath, op: PStateOp) extends NodeOp {
+	case class PStateNode(pstate: PStateId, path: CompiledPath, op: PStateOp) extends NodeOp {
 		val deps = {
 			val opDeps = op match {
 				case PStateOp.Add(v) => Dependencies(List(v), None)
@@ -109,7 +109,7 @@ private[corama] object Node {
 	}
 
 	case class PStateUpdate(
-		pos: SourcePos, pstate: Identity, path: CompiledPath, ins: List[VarId],
+		pos: SourcePos, pstate: PStateId, path: CompiledPath, ins: List[VarId],
 		fn: (Option[Any], List[Any]) => Option[Any]
 	) extends NodeOp {
 		val deps = Dependencies(ins ++ path.ins, None)
@@ -170,24 +170,24 @@ private[corama] object Node {
 
 			case g: Flow.Get[a] =>
 				val out = t.define[a](g.lens.schema.tag, g.lens.schema.codec, Var.internal, "get")
-				val path = CompiledPath.from(g.lens.path, g.lens.schema.tag.tag, g.lens.schema.codec)
+				val path = CompiledPath.from(g.lens.path, g.lens.schema.tag.tag, g.lens.schema.codec.asAny)
 				(List(n(Node.PStateNode(g.lens.pstate.id, path, PStateOp.Get(out.vid)))), out.asInstanceOf[Var[A]])
 
 			case Flow.Put(lens, value) =>
-				val path = CompiledPath.from(lens.path, lens.schema.tag.tag, lens.schema.codec)
+				val path = CompiledPath.from(lens.path, lens.schema.tag.tag, lens.schema.codec.asAny)
 				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Put(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Add(lens, value) =>
-				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec)
+				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec.asAny)
 				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Add(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Remove(lens, value) =>
-				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec)
+				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec.asAny)
 				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Remove(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case u: Flow.Update[v] =>
 				val f = u.f
-				val path = CompiledPath.from(u.lens.path, u.lens.schema.tag.tag, u.lens.schema.codec)
+				val path = CompiledPath.from(u.lens.path, u.lens.schema.tag.tag, u.lens.schema.codec.asAny)
 				(List(n(Node.PStateUpdate(u.pos, u.lens.pstate.id, path, u.ins.map(_.vid), f))), Var.unit.asInstanceOf[Var[A]])
 
 			case s: Flow.Select[v] =>

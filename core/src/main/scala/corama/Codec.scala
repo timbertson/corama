@@ -16,6 +16,7 @@ import scalapb.GeneratedMessageCompanion
 import scalapb.GeneratedMessage
 import cats.kernel.Order
 import corama.error.Util._
+import scala.reflect.ClassTag
 
 type Bytes = Array[Byte]
 object Bytes {
@@ -44,6 +45,8 @@ object Bytes {
 	}
 
 	implicit val orderingInstance: Ordering[Bytes] = Order.catsKernelOrderingForOrder[Bytes](orderInstance)
+	
+	def empty: Bytes = Array.empty
 }
 
 // TODO: use ByteString
@@ -54,12 +57,17 @@ object Bytes {
 trait Codec[A] {
 	def encode(a: A): Bytes
 	def decode(bytes: Bytes): Try[A]
+	def decodeEx(bytes: Bytes): A = decode(bytes).get
 }
 
-type AnyCodec = Codec[?]
+type AnyCodec = Codec[Any]
 
 object Codec {
 	def apply[A](implicit codec: Codec[A]) = codec
+	
+	extension[A](c: Codec[A]) {
+		def asAny: Codec[Any] = c.asInstanceOf[Codec[Any]]
+	}
 
 	// this one's explicit, otherwise we may pick up unintended instances
 	def json[T](implicit cd: circe.Decoder[T], ce: circe.Encoder[T]): Codec[T] = new Codec[T] {
@@ -144,6 +152,12 @@ object Codec {
 
 		def encode(a: List[A]): Bytes =
 			streamdsl.rpc.RepeatedBytes.of(a.map(i => ByteString.copyFrom(c.encode(i)))).toByteArray
+	}
+
+	// TODO array is used for internal RPC, make sure it's not doing unnecessary conversions
+	implicit def forArray[A : ClassTag](implicit c: Codec[A]): Codec[Array[A]] = new Codec {
+		def decode(bytes: Bytes) = forList[A].decode(bytes).map(_.toArray)
+		def encode(a: Array[A]): Bytes = forList[A].encode(a.toList)
 	}
 
 	implicit def forOption[A](implicit c: Codec[A]): Codec[Option[A]] = new Codec[Option[A]] {

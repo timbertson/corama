@@ -1,6 +1,7 @@
 package corama
 
 import cats.Monoid
+import cats.Eq
 
 // Utilities for Either[String, T]
 type Result[T] = Either[String, T]
@@ -15,7 +16,7 @@ object Result {
 
 	def unit: Either[String,Unit] = Right(())
 
-	def agg[T](implicit M: Monoid[T]): Agg[Either[String,T]] =
+	def agg[T: Eq](implicit M: Monoid[T]): Agg[Either[String,T]] =
 		Agg(Right(M.empty), { (a,b) =>
 			a.flatMap(a => b.map(M.combine(a, _)))
 		})
