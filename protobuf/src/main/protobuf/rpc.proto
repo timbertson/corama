@@ -1,15 +1,49 @@
 syntax = "proto3";
 package streamdsl;
 
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/empty.proto";
+
+// CoramaApi is a uniform API implemented by all nodes.
+// Requests may land on any node, and will be internally
+// forwarded to the active leader.
+// Requests may still be rejected during leadership changes,
+// this forwarding API will not retry internally (that's up to the client).
 service Corama {
-	rpc Append(Request) returns (Response);
-	rpc Query(Request) returns (Response);
-	
-	// internal
-	rpc Continue(ContinueRequest) returns (Empty);
+	rpc Append(AppendRequest) returns (Response);
+	rpc Query(QueryRequest) returns (Response);
 }
 
-message Empty {}
+// CoramaNode implementations are identity-aware. Requests are
+// sent to a specific instance, and will be rejected if that instance
+// is not the active leader for that partition / task.
+service CoramaNode {
+	rpc Append(AppendRequest) returns (Response);
+	rpc Query(QueryRequest) returns (Response);
+	
+	// internal
+	rpc Continue(ContinueRequest) returns (google.protobuf.Empty);
+}
+
+message AppendRequest {
+	string depot = 1;
+	bytes value = 2;
+	google.protobuf.Int32Value partition = 3;
+}
+
+message QueryRequest {
+	string query = 1;
+	bytes value = 2;
+	google.protobuf.Int32Value partition = 3;
+}
+
+message Response {
+	oneof value {
+		bytes success = 1;
+		bytes failure = 2;
+	}
+}
+
 
 // message ValueBinding {
 // 	int32 id = 1;
@@ -54,11 +88,6 @@ message DbReplication {
 	repeated DbWrite writes = 4;
 }
 
-// service Exchange {
-// 	rpc Recv(ContinuationBatch) returns (Empty);
-// 	rpc Ack(streamdsl.Ack) returns (Empty);
-// }
-
 // -- simple protobuf wrapper types
 
 message RepeatedBytes {
@@ -95,16 +124,4 @@ message EnvBatch {
 message EvalOrigin {
 	string instanceId = 1;
 	int64 evalId = 2;
-}
-
-message Request {
-	string id = 1; // destination (depot name / query name)
-	bytes value = 2;
-}
-
-message Response {
-	oneof value {
-		bytes success = 1;
-		bytes failure = 2;
-	}
 }

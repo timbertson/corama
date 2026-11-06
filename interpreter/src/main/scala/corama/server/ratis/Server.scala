@@ -1,8 +1,9 @@
-package corama.server
+package corama.server.ratis
 
 // import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder
 import corama.interpreter.IOMap
 import corama.*
+import corama.server.*
 import cats.effect.IO
 import cats.effect.kernel.Resource
 import cats.syntax.all.*
@@ -20,10 +21,12 @@ import scala.jdk.CollectionConverters.*
 import flogger.Log
 import flogger.IOLogging
 import corama.interpreter.TaskId
+import corama.server.ClusterConfig
 
 class Server(
 	raft: RaftServer,
 	proposers: IOMap[TaskId, LocalProposer],
+	divisions: IOMap[TaskId, RaftServer.Division],
 	// peers: IOMap[InstanceId, streamdsl.rpc.CoramaFs2Grpc]
 )
 
@@ -59,6 +62,9 @@ object Server extends IOLogging {
 			proposers <- Resource.eval(instanceGroups.traverse { (task, group, _) =>
 				LocalProposer(server, group.getGroupId()).map(task -> _)
 			})
+			divisions = instance.tasks.map { taskId =>
+				(taskId, server.getDivision(config.groupId(taskId)))
+			}
 			_ <- Resource.eval(log.info(s"Starting server on ${networkConfig}"))
 			_ <- Resource.eval(IO.blocking(server.start()))
 
@@ -69,7 +75,7 @@ object Server extends IOLogging {
 			})
 
 			// setGroup only registers one group; must add the rest after startup
-		} yield new Server(server, IOMap(proposers))
+		} yield new Server(server, IOMap(proposers), IOMap(divisions))
 	}
 
 	// add any groups not already registered (e.g. recovered from storage on restart)

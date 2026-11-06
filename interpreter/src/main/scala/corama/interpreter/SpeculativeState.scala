@@ -1,16 +1,12 @@
 package corama.interpreter
 
-import scala.collection.mutable
-import cats.effect.IO
 import cats.effect.kernel.Ref
 import cats.syntax.all.*
 import corama.*
 import corama.interpreter.*
 
 import scala.collection.immutable.TreeMap
-import scala.collection.mutable.ArrayBuffer
-import corama.server.Keyspace
-import scala.annotation.unused
+import cats.effect.SyncIO
 
 /** State of speculative view - tracks replication updates that have
  * been submitted but not yet acknowledged.
@@ -24,14 +20,14 @@ import scala.annotation.unused
  */
 final class SpeculativeState(base: PStateView) {
 	private case class Entry(update: ReplicationUpdate, index: Option[LogIndex])
-	private val pending = Ref.unsafe[IO, TreeMap[Long, Entry]](TreeMap.empty)
+	private val pending = Ref.unsafe[SyncIO, TreeMap[Long, Entry]](TreeMap.empty)
 
-	def append(seq: Long, update: ReplicationUpdate): IO[Unit] = {
+	def append(seq: Long, update: ReplicationUpdate): SyncIO[Unit] = {
 		pending.update(_.updated(seq, Entry(update, None)))
 	}
 
 	// remove an item that was not accepted
-	def discard(seq: Long): IO[Unit] = {
+	def discard(seq: Long): SyncIO[Unit] = {
 		pending.update(_.removed(seq))
 	}
 
@@ -39,7 +35,7 @@ final class SpeculativeState(base: PStateView) {
 	// Note that committed items are still present in their speculative form,
 	// until markCommitted (when the log index has been applied locally
 	// on this node).
-	def markCommitted(seq: Long, index: LogIndex): IO[Unit] = {
+	def markCommitted(seq: Long, index: LogIndex): SyncIO[Unit] = {
 		pending.update { entries =>
 			entries.updatedWith(seq)(_.map(e => e.copy(index = Some(index))))
 		}
@@ -47,11 +43,11 @@ final class SpeculativeState(base: PStateView) {
 
 	// remove entries at or below watermark, as they have been applied
 	// to the local persistent store.
-	def markApplied(watermark: LogIndex): IO[Unit] = {
+	def markApplied(watermark: LogIndex): SyncIO[Unit] = {
 		pending.update(entries => entries.dropWhile((_, entry) => entry.index.exists(_.value <= watermark.value)))
 	}
 	
-	def snapshot: IO[ViewSnapshot] = {
+	def snapshot: SyncIO[ViewSnapshot] = {
 		pending.get.map { pending =>
 			val updates = pending.values.flatMap(_.update.pstateUpdates).map { v =>
 				v.key -> v.value

@@ -16,7 +16,7 @@ object Result {
 
 	def unit: Either[String,Unit] = Right(())
 
-	def agg[T: Eq](implicit M: Monoid[T]): Agg[Either[String,T]] =
+	def agg[T: Eq : Codec](implicit M: Monoid[T]): Agg[Either[String,T]] =
 		Agg(Right(M.empty), { (a,b) =>
 			a.flatMap(a => b.map(M.combine(a, _)))
 		})

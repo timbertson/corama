@@ -1,30 +1,30 @@
 package corama.interpreter
 
 import cats.syntax.all.*
-import cats.data.NonEmptyList
 import cats.effect.IO
 import corama.*
 import corama.internal.*
 import corama.interpreter.Env
 import org.tpolecat.sourcepos.SourcePos
 
-import scala.util.*
 import flogger.*
-import izumi.reflect.Tag
+import cats.effect.SyncIO
 
-class Partition(
-	id: PartitionId,
-	state: SpeculativeState,
+trait SyncIOLogging {
+	protected implicit val logOutputSyncIO: LogOutput[SyncIO] = LogOutput[SyncIO](this.getClass)
+}
+
+// the stateless execution logic for a single task's partitions
+class TaskPartitions(
 	receivers: EvalReceivers,
 	metadata: ClusterMetadata,
 	topologies: Topologies,
 	taskRouter: TaskRouter,
 	log: Log[IO],
-) extends IOLogging {
+) extends IOLogging with SyncIOLogging {
 	import Storage._
 	given Log[IO] = log
-
-	private val idList = topologies.ids.toList
+	given syncLog: Log[SyncIO] = Log.from(log)
 
 	// Run a topology over some values by installing its results into the global GRPC service until completion
 	private def runTopologyEval[R](
@@ -32,88 +32,66 @@ class Partition(
 		evalState: EvalState,
 		topology: Topology[?, R],
 		envs: List[Env],
-	): IO[R] = {
-		runTopologyEvalRaw(results, evalState, topology.id, EdgeId.startingEdge(topology.id), topology.compiled._1, envs)
-	}
-
-	// As above, but also used in sub-aggregations to collect the results of a block
-	private def runTopologyEvalRaw[R](
-		results: LocalEvalSink[R],
-		evalState: EvalState,
-		topologyId: TopologyId,
-		start: EdgeId,
-		nodes: List[Node],
-		envs: List[Env],
-	): IO[R] = {
-		// install into GRPC listener so other partitions can send results
-		receivers.addRunning(results) { origin =>
-			// continue could throw (from user functions), so wrap it in IO.defer
-			this.continue(origin, topologyId, results, evalState, start, nodes, envs).attempt.flatMap {
-				// TODO: how to apply backpressure if clients are not waiting?
-				case Right(_) => IO.unit
-
-				// One bad record must not stop the topology: Rama retries the record and
-				// keeps consuming. There is no retry here, so the failure is reported to
-				// whoever appended it and consumption continues.
-				case Left(e) => results.fail(e)
-			} *> results.await.flatMap(r => log.debug(s"runTopologyEval got results: $r").as(r))
-		}
-	}
-
-	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
-		???
-		// val t = q.topology
-		// val env: Env = Map(t.builder.input.vid -> value)
-		// EvalSink.local(t.output.vid, t.agg, EdgeId.startingEdge(t.id)).flatMap { results =>
-		// 	runTopologyEval(results, t, List(env))
-		// }
+	): SyncIO[Unit] = {
+		// TODO: only addEvalSink when there's a repartitioning that leaves this node
+		evalState.outputs.addEvalSink(results) *>
+			this.continue(
+				???,
+				topology.id,
+				evalState,
+				EdgeId.startingEdge(topology.id),
+				topology.compiled._1,
+				topology.output.vid,
+				envs
+			)
 	}
 
 	private [corama] def continue[R](
 		origin: Origin,
 		topologyId: TopologyId,
-		evalSink: EvalSink[R],
 		evalState: EvalState,
 		edgeId: EdgeId,
 		nodes: List[Node],
+		outputVar: VarId,
 		envs: List[Env],
-	): IO[Unit] = {
+	): SyncIO[Unit] = {
 		// TODO: skip if not debug?
-		val continueLog = log.addContext(
+		val continueLog = syncLog.addContext(
 			"origin" -> origin.instanceId.id,
 			"evalId" -> origin.evalId.hex,
 			"topology" -> topologyId.value.toString(),
 			"edge" -> edgeId.hex,
 		)
 		val continue = continueLog.debug("Continuing computation") *>
-			this.continueInner(origin, topologyId, evalSink, evalState, edgeId, nodes, envs, continueLog)
+			this.continueInner(origin, ???, topologyId, evalState, edgeId, nodes, outputVar, envs, continueLog)
 
-		IO.defer(continue)
+		// continue could throw (from user functions), so wrap it in IO.defer
+		SyncIO.defer(continue)
 	}
 
 	/** Runs a list of nodes with the given envs. Results are returned to `results`.
-	 *  TODO: should this be IO?
 		*/
 	private def continueInner[R](
 		origin: Origin,
+		partitionId: PartitionId,
 		topologyId: TopologyId,
-		evalSink: EvalSink[R],
 		evalState: EvalState,
 		edgeId: EdgeId,
 		nodes: List[Node],
+		outputVar: VarId,
 		envs: List[Env],
-		log: Log[IO],
-	): IO[Unit] = {
+		log: Log[SyncIO],
+	): SyncIO[Unit] = {
 		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
-			// supplies origin / topology / evalSink since those don't change
-			continueInner(origin, topologyId, evalSink, evalState, nextEdgeId, nodes, envs, log)
+			// supplies args that don't change
+			continueInner(origin, partitionId, topologyId, evalState, nextEdgeId, nodes, outputVar, envs, log)
 
 		import Node.DynamicOp
 		import Node.PStateOp
 
 		nodes match {
 			case Nil =>
-				evalSink.completeList(edgeId, envs.map(_(evalSink.varId).asInstanceOf[R]))
+				evalState.outputs.addNotification(origin, edgeId, envs.map(_(outputVar)), ???)
 
 			case node :: tail => {
 				log.debug(s"Executing node: ${node}") *>
@@ -165,14 +143,19 @@ class Partition(
 						combined (via xor) with the opening of all fanout edges at once.
 						*/
 						val taskPartitions = metadata.partitionBatches(envs, env => env(in)).toList
-						taskPartitions.parTraverse { case (taskId, partitionedEnvs) =>
-							EdgeId.generate.flatMap { childEdge =>
-								taskRouter.continue(taskId, topologyId, node.id, childEdge, partitionedEnvs, origin).as(childEdge)
+						for {
+							continuationTasks <- taskPartitions.traverse { case (taskId, partitionedEnvs) =>
+								EdgeId.generate.map { childEdge =>
+									EvalContinuationTask(taskId, childEdge, partitionedEnvs)
+								}
 							}
-						}.flatMap { spawnedEdges =>
-							val closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))
-							evalSink.notify(closeOriginAndOpenChildren, None)
-						}
+							
+							spawnedEdges = continuationTasks.map(_.edge)
+							closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))
+							continuation = EvalContinuation(origin, topologyId, node.id, continuationTasks)
+							_ <- evalState.outputs.addContinuation(continuation)
+							_ <- evalState.outputs.addNotification(origin, closeOriginAndOpenChildren, Nil, ???)
+						} yield ()
 					}
 
 					case Node.Combine(block, agg, collectFrom, out) => {
@@ -193,20 +176,18 @@ class Partition(
 					
 					case Node.PStateNode(ps, path, op) =>
 						envs.traverse { env =>
-							IO.pure(op match {
-								// adding / removing items of a set is just writing to the key of (key,value)
+							op match {
+								// adding / removing items of a set is just writing to the key of (path,value)
 								case PStateOp.Add(v) => {
-									evalState.put(PStateKey.forSetElem(id, ps, path, env, v), Some(Bytes.empty))
-									env
+									evalState.put(PStateKey.forSetElem(partitionId, ps, path, env, v), Some(Bytes.empty)).as(env)
 								}
 
 								case PStateOp.Remove(v) => {
-									evalState.put(PStateKey.forSetElem(id, ps, path, env, v), None)
-									env
+									evalState.put(PStateKey.forSetElem(partitionId, ps, path, env, v), None).as(env)
 								}
 
 								case PStateOp.Select(out, options) => {
-									val key = PStateKey(id, ps, path, env)
+									val key = PStateKey(partitionId, ps, path, env)
 
 									val after = options.after.flatMap { after =>
 										env(after.vid)
@@ -214,17 +195,20 @@ class Partition(
 											.map(after.vid.codec.encode)
 									}
 									val rawOpts = SelectOptions.Raw(after, options.maxItems)
-									env.updated(out, evalState.select(key, rawOpts))
+									evalState.select(key, rawOpts).map { result =>
+										env.updated(out, result.map(out.codec.decodeEx))
+									}
 								}
 
 								case PStateOp.Get(out: VarId) =>
-									env.updated(out, evalState.get(PStateKey(id, ps, path, env)).map(out.codec.decodeEx))
+									evalState.get(PStateKey(partitionId, ps, path, env)).map { stored =>
+										env.updated(out, stored.map(out.codec.decodeEx))
+									}
 
 								case PStateOp.Put(v: VarId) => {
-									evalState.put(PStateKey(id, ps, path, env), Some(v.codec.encode(env(v))))
-									env
+									evalState.put(PStateKey(partitionId, ps, path, env), Some(v.codec.encode(env(v)))).as(env)
 								}
-							})
+							}
 						}.flatMap { updatedEnvs =>
 							continueTopology(tail, updatedEnvs)
 						}
@@ -232,12 +216,13 @@ class Partition(
 					case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
 						val f = fn // TODO is this necessary?
 						envs.traverse_ { env =>
-							val key = PStateKey(id, ps, path, env)
-							val current = evalState.get(key).map(path.codec.decodeEx)
-							val args = ins.map(env(_))
-							val updated = f(current, args).map(path.codec.encode)
-							evalState.put(key, updated)
-							IO.unit
+							val key = PStateKey(partitionId, ps, path, env)
+							evalState.get(key).flatMap { currentBytes =>
+								val current = currentBytes.map(path.codec.decodeEx)
+								val args = ins.map(env(_))
+								val updated = f(current, args).map(path.codec.encode)
+								evalState.put(key, updated)
+							}
 						}.flatMap { _ =>
 							continueTopology(tail, envs)
 						}
@@ -245,11 +230,20 @@ class Partition(
 					case Node.LocalAppend(dep, value) =>
 						envs.traverse_ { env =>
 							val v = env(value)
-							evalState.append(dep, value.codec.encode(v))
-							IO.unit
+							evalState.append(dep, partitionId, value.codec.encode(v))
 						} *> continueTopology(tail, envs)
 				})
 			}
 		}
 	}
+
+	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
+		???
+		// val t = q.topology
+		// val env: Env = Map(t.builder.input.vid -> value)
+		// EvalSink.local(t.output.vid, t.agg, EdgeId.startingEdge(t.id)).flatMap { results =>
+		// 	runTopologyEval(results, t, List(env))
+		// }
+	}
+
 }

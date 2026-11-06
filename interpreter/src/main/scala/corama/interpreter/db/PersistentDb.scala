@@ -9,7 +9,6 @@ import corama._
 import cats.*
 import scala.util.Try
 import org.rocksdb
-import java.io.File
 
 // object PersistentDb extends IOLogging {
 // 	type Base = RocksDb
@@ -49,7 +48,7 @@ import java.io.File
 final class RocksDb private (val client: rocksdb.RocksDB) {
 	import org.rocksdb.*
 
-	def getSync(key: Bytes): Option[Bytes] = Option(client.get(key))
+	def get(key: Bytes): SyncIO[Option[Bytes]] = SyncIO(Option(client.get(key)))
 
 	/** Atomic batched write, fsynced — one WAL fsync spans the whole batch. */
 	def writeSync(updates: Seq[(Bytes, Option[Bytes])]): Unit = {
@@ -66,10 +65,8 @@ final class RocksDb private (val client: rocksdb.RocksDB) {
 		}
 	}
 
-	def closeSync(): Unit = client.close()
+	def close: SyncIO[Unit] = SyncIO(client.close())
 
-	def get(key: Bytes): IO[Option[Bytes]] = IO.delay(getSync(key))
-	
 	def iteratorR = Resource.fromAutoCloseable(IO.delay(client.newIterator()))
 	
 	def scanFromPrefix(it: RocksIterator, prefix: Bytes, startKey: Bytes): Stream[IO, (Bytes, Bytes)] = {
@@ -95,35 +92,24 @@ final class RocksDb private (val client: rocksdb.RocksDB) {
 	def put(key: Bytes, value: Option[Bytes]): IO[Unit] = IO.delay {
 		value.fold(client.delete(key))(value => client.put(key, value))
 	}
-	
-	def close: IO[Unit] = IO.delay(closeSync())
 }
 
 object RocksDb {
-	private[corama] def apply(path: String): Resource[IO, RocksDb] = {
+	private[corama] def apply(path: String): Resource[SyncIO, RocksDb] = {
 		optionsR.flatMap { options =>
 			options.setCreateIfMissing(true)
 			Resource.make(applyF(path, options))(_.close)
 		}
 	}
 
-	// resource management is the responsibility of the caller
-	def openSyncUnsafe(path: File): RocksDb = {
-		org.rocksdb.RocksDB.loadLibrary()
-		val options = new rocksdb.Options()
-		options.setCreateIfMissing(true)
-		try new RocksDb(rocksdb.RocksDB.open(options, path.getAbsolutePath()))
-		finally options.close()
-	}
-
 	private def applyF(
 		path: String,
 		options: rocksdb.Options,
-	): IO[RocksDb] =
-		IO.delay(rocksdb.RocksDB.loadLibrary()) *>
-			IO.delay(rocksdb.RocksDB.open(options, path))
+	): SyncIO[RocksDb] =
+		SyncIO.delay(rocksdb.RocksDB.loadLibrary()) *>
+			SyncIO.delay(rocksdb.RocksDB.open(options, path))
 			.map(new RocksDb(_))
 
-	def optionsR: Resource[IO, rocksdb.Options] = Resource.fromAutoCloseable(IO.delay(new rocksdb.Options()))
+	def optionsR: Resource[SyncIO, rocksdb.Options] = Resource.fromAutoCloseable(SyncIO.delay(new rocksdb.Options()))
 }
 

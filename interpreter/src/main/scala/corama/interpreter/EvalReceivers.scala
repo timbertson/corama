@@ -1,21 +1,17 @@
 package corama.interpreter
 
+import cats.effect.IO
+import cats.effect.Resource
+import cats.effect.kernel.Ref
 import cats.effect.std.Random
 import cats.syntax.all.*
-import cats.effect.IO
-import cats.effect.kernel.Ref
 import corama.*
-import corama.internal.*
-import corama.interpreter.Env
-
-import flogger.*
-import cats.effect.Resource
 import corama.error.Util.err
 
 // manages incoming eval messages for a single instance
+// TODO: do we need to prevent leaks? Should we cap slot availability?
 class EvalReceivers(instance: InstanceId, slots: Ref[IO, Map[EvalId, LocalEvalSink[Any]]])(using Random[IO]) {
-	// not exposing a bare resource so we can eagerly terminate the block if the server has too many outstanding evals
-	def addRunning[A, B](destination: LocalEvalSink[A])(f: Origin => IO[B]): IO[B] = {
+	def running[A](destination: LocalEvalSink[A]): Resource[IO, Origin] = {
 		val acquire = for {
 			evalId <- EvalId.generate
 			origin = Origin(instance, evalId)
@@ -23,7 +19,7 @@ class EvalReceivers(instance: InstanceId, slots: Ref[IO, Map[EvalId, LocalEvalSi
 		} yield origin
 		Resource.make(acquire) { origin =>
 			slots.update(_.removed(origin.evalId))
-		}.use(f)
+		}
 	}
 	
 	def invoke(origin: Origin, edge: EdgeId, value: Option[Any]): IO[Unit] = {

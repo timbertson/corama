@@ -1,4 +1,4 @@
-package corama.server
+package corama.server.ratis
 
 import corama.interpreter.IOMap
 import cats.syntax.all.*
@@ -12,6 +12,7 @@ import org.apache.ratis.conf.RaftProperties
 import org.apache.ratis.conf.Parameters
 import flogger.IOLogging
 import flogger.Log
+import corama.server.ClusterConfig
 
 case class GroupClient(raft: RaftClient, group: RaftGroup)
 

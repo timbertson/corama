@@ -17,7 +17,7 @@ class NotLeader(val leader: Option[InstanceId])
 	extends RuntimeException(s"not the leader (hint: ${leader.fold("unknown")(_.id.toString)})")
 
 trait RepLog {
-	// Waits until submission has been acknowledged.
+	// Waits until proposal has been sent, caller must await proposal.committed
 	// TODO: can/should we pipeline, to allow multiple
 	def submit(update: ReplicationUpdate): IO[Proposal]
 

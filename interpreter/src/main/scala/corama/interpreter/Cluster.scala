@@ -81,7 +81,8 @@ class ClusterMetadata(
 		values.groupBy(v => partitionKey(keyFn(v))).toList.map { case (p, items) =>
 			(p, items)
 		}.groupBy(pair => taskFor(pair._1)).toList.map { case (taskId, partitionedList) =>
-			(taskId, PartitionBatch(partitionedList))
+			val batch = PartitionBatch(partitionedList.map { case (partitionId, value) => Partitioned(partitionId, value) })
+			(taskId, batch)
 		}
 	}
 

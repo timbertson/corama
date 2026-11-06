@@ -14,6 +14,7 @@ import flogger.*
 import cats.effect.Deferred
 import corama.internal.HexString
 import corama.internal.HexId
+import cats.effect.SyncIO
 
 
 // EvalId is dynamically minted each time we perform a fanout
@@ -25,7 +26,9 @@ object EvalId {
 	def generate(using rand: Random[IO]): IO[EvalId] = rand.nextLong.map(EvalId.apply)
 }
 
-case class PartitionBatch[A](value: List[(PartitionId, List[A])])
+case class Partitioned[A](partition: PartitionId, value: A)
+
+case class PartitionBatch[A](items: List[Partitioned[List[A]]])
 
 case class Origin(
 	instanceId: InstanceId,
@@ -49,9 +52,10 @@ private[corama] final class EvalResults(results: Map[TopologyId, LocalEvalSink[?
 	}.map(_.toMap)
 }
 
-private[corama] object EvalResults extends IOLogging {
-	def apply(topologies: List[Topology[?, ?]])(using baseLog: Log[IO]): IO[EvalResults] = {
-		baseLog.debug(s"Creating a local result sink for ${topologies.map(_.id)}") *>
+private[corama] object EvalResults extends IOLogging with SyncIOLogging {
+	def apply(topologies: List[Topology[?, ?]])(using baseLog: Log[IO]): SyncIO[EvalResults] = {
+		val syncLog: Log[SyncIO] = Log.from(baseLog)
+		syncLog.debug(s"Creating a local result sink for ${topologies.map(_.id)}") *>
 		(topologies.traverse { topology =>
 			given log: Log[IO] = baseLog.addContext("topology" -> topology.id.value.toString())
 			EvalSink.local[topology.Result](topology.output.vid, topology.agg, EdgeId.startingEdge(topology.id))
@@ -76,7 +80,7 @@ object EdgeId {
 		// edge IDs must not start at 0
 		EdgeId(topologyId.value.toLong + 1)
 
-	def generate(using rnd: Random[IO]): IO[EdgeId] = {
+	def generate(using rnd: Random[SyncIO]): SyncIO[EdgeId] = {
 		rnd.nextLong.map(apply)
 	}
 	
@@ -135,11 +139,11 @@ private[corama] final class LocalEvalSink[R](
 }
 
 private [corama] object EvalSink {
-	def local[R](out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): IO[LocalEvalSink[R]] = {
+	def local[R](out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): SyncIO[LocalEvalSink[R]] = {
 		for {
-			xorState <- Ref[IO].of(start.id)
-			acc <- Ref[IO].of(agg.zero)
-			done <- Deferred[IO, Try[R]]
+			xorState <- Ref.in[SyncIO, IO, Long](start.id)
+			acc <- Ref.in[SyncIO, IO, R](agg.zero)
+			done <- Deferred.in[SyncIO, IO, Try[R]]
 		} yield new LocalEvalSink(out, agg, log, xorState, acc, done)
 	}
 }

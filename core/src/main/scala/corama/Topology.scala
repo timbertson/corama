@@ -1,5 +1,6 @@
 package corama
 
+import scala.collection.mutable
 import cats.syntax.all.*
 import corama.internal.*
 import izumi.reflect.Tag
@@ -10,6 +11,7 @@ import scala.util.Try
 import cats.Eq
 import corama.error.Util.err
 import cats.Order
+import scala.collection.mutable.ListBuffer
 
 final case class TopologyId(value: Int) extends AnyVal
 object TopologyId {
@@ -48,11 +50,13 @@ final class Topologies {
 	private [corama] var ids = Set.empty[Identity]
 	private var built = List.empty[Topology[?, ?]]
 
-	private var builtPstates = List.empty[PState]
+	private val builtPstates = ListBuffer.empty[PState]
+	private val builtDepots = ListBuffer.empty[Depot[?]]
 
 	def topologies: List[Topology[?, ?]] = built.reverse
 
-	def pstates: List[PState] = builtPstates.reverse
+	def pstates: Map[PStateId, PState] = builtPstates.map(p => p.id -> p).toMap
+	def depots: Map[DepotId, Depot[?]] = builtDepots.map(d => d.id -> d).toMap
 
 	private[corama] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
 
@@ -74,7 +78,7 @@ final class Topologies {
 	}
 	
 	private def registerPstate[A](value: A, access: A => PState): A = {
-		builtPstates = access(value) :: builtPstates
+		builtPstates.append(access(value))
 		value
 	}
 
@@ -87,8 +91,11 @@ final class Topologies {
 	def pstate(name: String, schema: Schema): PState =
 		registerPstate(PState(claim(PStateId(name)), schema), identity)
 
-	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ()): Depot[A] =
-		Depot[A](claim(DepotId(name)))
+	def depot[A](name: String, @unused /* TODO */ partitionBy: Any = ())(using codec: Codec[A]): Depot[A] = {
+		val registered = Depot[A](claim(DepotId(name)), codec)
+		builtDepots.append(registered)
+		registered
+	}
 
 	/** Declare a query topology: invoked by a client, returns one aggregated value.
 	  */

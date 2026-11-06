@@ -1,4 +1,4 @@
-package corama.server
+package corama.server.ratis
 
 import cats.effect.IO
 import corama.Bytes

@@ -45,6 +45,9 @@ lazy val pb = (project in file("protobuf"))
     name := "corama-pb",
     scalacOptions += "-nowarn", // protobuf compiler generates a bunch of warnings
     scalapbCodeGeneratorOptions += CodeGeneratorOption.Fs2Grpc,
+    libraryDependencies ++= Seq(
+      "com.thesamet.scalapb" %% "scalapb-runtime" % scalapb.compiler.Version.scalapbVersion % "protobuf",
+    )
   ).enablePlugins(
     Fs2Grpc
   )
@@ -69,6 +72,7 @@ lazy val interpreter = (project in file("interpreter")).settings(
     "com.lihaoyi" %% "os-lib" % "0.11.4",
     "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
     "io.grpc" % "grpc-netty-shaded" % scalapb.compiler.Version.grpcJavaVersion,
+
   ) ++ List("ratis-grpc", "ratis-server", "ratis-metrics-default").map { component =>
     "org.apache.ratis" % component % "3.3.1"
   },

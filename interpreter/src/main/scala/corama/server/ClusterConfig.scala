@@ -70,13 +70,13 @@ case class ClusterConfig(
 						.build()
 				}
 			}
-		} yield RaftGroup.valueOf(RaftGroupId.valueOf(groupId(taskId)), peers.toList*)
+		} yield RaftGroup.valueOf(groupId(taskId), peers.toList*)
 	}
 
-	def groupId(taskId: TaskId): UUID = {
+	def groupId(taskId: TaskId): RaftGroupId = {
 		// deterministic a hash of the cluster and task IDs
 		val bytes = s"${id.id}-${taskId.id}".getBytes(StandardCharsets.UTF_8)
-		UUID.nameUUIDFromBytes(bytes)
+		RaftGroupId.valueOf(UUID.nameUUIDFromBytes(bytes))
 	}
 }
 

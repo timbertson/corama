@@ -13,6 +13,9 @@ import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 import scala.util.{Failure, Success, Try}
 import corama.interpreter.TaskId
+import cats.effect.SyncIO
+import corama.interpreter.Partitioned
+import corama.PartitionId
 
 /** Wire codecs for the replog payload (`ReplicationUpdate`), built on the existing
 	* `Codec` combinators (tuples / lists / length-prefixed primitives).
@@ -34,7 +37,9 @@ object ReplogCodecs {
 		via[PStateUpdate, (PStateKey, Option[Bytes])](Codec.forTuple[PStateKey, Option[Bytes]])(p => (p.key, p.value)) { case (key, value) => PStateUpdate(key, value) }
 
 	implicit val depotAppends: Codec[DepotAppends] =
-		via[DepotAppends, (DepotId, List[Bytes])](Codec.forTuple[DepotId, List[Bytes]])(d => (d.id, d.updates.map(_.value).toList)) { case (id, values) => DepotAppends(id, values.map(DepotAppend.apply).toArray) }
+		via[DepotAppends, (DepotId, Array[(Int, Bytes)])](Codec.forTuple[DepotId, Array[(Int, Bytes)]])
+			(d => (d.id, d.updates.map(append => (append.partition.id, append.value.value))))
+			{ case (id, values) => DepotAppends(id, values.map { (partition, value) => Partitioned(PartitionId(partition), DepotAppend(value)) }.toArray) }
 
 	implicit val replicationUpdate: Codec[ReplicationUpdate] =
 		via[ReplicationUpdate, ((TxId, List[DepotAppends]), Array[PStateUpdate])](Codec.forTuple[(TxId, List[DepotAppends]), Array[PStateUpdate]])(r => ((r.id, r.depotAppends), r.pstateUpdates)) {
@@ -58,8 +63,8 @@ object Keyspace {
 		* records to the same depot; they get successive `sub` indices, so scanning the
 		* prefix by (index, sub) yields append order
 		*/
-	def depotKey(id: DepotId, index: Long, sub: Int): Bytes =
-		Array(Depot) ++ lenPrefixed(id.value) ++ Codec.forLong.encode(index) ++ Codec.forInt.encode(sub)
+	def depotKey(partition: PartitionId, id: DepotId, index: Long, sub: Int): Bytes =
+		Array(Depot) ++ Codec.forInt.encode(partition.id) ++ lenPrefixed(id.value) ++ Codec.forLong.encode(index) ++ Codec.forInt.encode(sub)
 
 	// def pstateKey(id: PStateId, key: Bytes): Bytes =
 	// 	Array(PState) ++ lenPrefixed(id.value) ++ key
@@ -74,6 +79,9 @@ object Keyspace {
 class StateMachine(task: TaskId) extends BaseStateMachine {
 	private val storage = new SimpleStateMachineStorage()
 	private var db: Option[RocksDb] = None
+	private var release: Option[SyncIO[Unit]] = None
+
+	// private var db: Option[RocksDb] = None
 
 	private def rocks: RocksDb = db.getOrElse(throw new IllegalStateException("StateMachine not initialized"))
 
@@ -81,17 +89,27 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 		super.initialize(server, group, raftStorage)
 		storage.init(raftStorage)
 		val dir = new File(raftStorage.getStorageDir().getStateMachineDir(), s"db-${task.id}")
-		db = Some(RocksDb.openSyncUnsafe(dir))
+		val (db, release) = RocksDb(dir.getPath()).allocated.unsafeRunSync()
+		this.db = Some(db)
+		this.release = Some(release)
 	}
 
 	override def getStateMachineStorage(): StateMachineStorage = storage
 
-	override def close(): Unit = db.foreach(_.closeSync())
+	override def close(): Unit = {
+		release.foreach(_.unsafeRunSync())
+		db = None
+		release = None
+	}
 
 	override def query(request: Message): CompletableFuture[Message] = {
 		// TODO: linearizable reads need readIndex; this reads local state.
-		val offset = rocks.getSync(Keyspace.applyOffsetKey).flatMap(Codec.forLong.decode(_).toOption).getOrElse(0L)
-		CompletableFuture.completedFuture(Message.valueOf(ByteBuffer.wrap(Codec.forLong.encode(offset))))
+		val offset = rocks.get(Keyspace.applyOffsetKey).unsafeRunSync()
+			.flatMap(Codec.forLong.decode(_).toOption)
+			.getOrElse(0L)
+
+		val result = Message.valueOf(ByteBuffer.wrap(Codec.forLong.encode(offset)))
+		CompletableFuture.completedFuture(result)
 	}
 
 	override def applyTransaction(trx: TransactionContext): CompletableFuture[Message] = {
@@ -116,8 +134,8 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 object StateMachine {
 	private[server] def applyWrites(update: ReplicationUpdate, index: Long): Vector[(Bytes, Option[Bytes])] = {
 		val depotWrites = update.depotAppends.flatMap { case DepotAppends(id, appends) =>
-			appends.zipWithIndex.map { case (DepotAppend(value), sub) =>
-				Keyspace.depotKey(id, index, sub) -> Some(value)
+			appends.zipWithIndex.map { case (Partitioned(partitionId, DepotAppend(value)), sub) =>
+				Keyspace.depotKey(partitionId, id, index, sub) -> Some(value)
 			}
 		}
 		val pstateWrites = update.pstateUpdates.map(up => up.key.raw.raw -> up.value)
