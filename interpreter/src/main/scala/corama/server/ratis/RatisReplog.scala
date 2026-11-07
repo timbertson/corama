@@ -23,7 +23,7 @@ final class RatisRepLog(raft: RaftClient)(using Log[IO]) extends RepLog with IOL
 			Proposal(IO.fromCompletableFuture {
 				IO.delay {
 					raft.async().send(Message.valueOf(
-						ByteBuffer.wrap(ReplogCodecs.replicationUpdate.encode(update).array)
+						ByteBuffer.wrap(ServerCodecs.replicationUpdate.encode(update).array)
 					))
 				}
 			}.map(reply => LogIndex(reply.getLogIndex))

@@ -6,7 +6,6 @@ import cats.effect.kernel.Ref
 import cats.syntax.all.*
 import corama.*
 import corama.internal.*
-import corama.interpreter.Env
 import fs2.Stream
 import flogger.Log
 import corama.error.Util.err
@@ -19,7 +18,7 @@ trait TaskRouter {
 		topologyId: TopologyId,
 		afterNode: NodeId,
 		edge: EdgeId,
-		envs: PartitionBatch[Env],
+		// envs: PartitionBatch[Env],
 		origin: Origin,
 	): IO[Unit]
 }
@@ -77,11 +76,11 @@ class ClusterMetadata(
 	// 	Range.exclusive(0, numPartitions).map(PartitionId.apply).filter { partitionId => taskFor(partition) === task }
 	// }
 
-	def partitionBatches[A](values: List[A], keyFn: A => Any): List[(TaskId, PartitionBatch[A])] = {
+	def partitionBatches[A](values: List[A], keyFn: A => Any): List[(TaskId, List[Partitioned[List[A]]])] = {
 		values.groupBy(v => partitionKey(keyFn(v))).toList.map { case (p, items) =>
 			(p, items)
 		}.groupBy(pair => taskFor(pair._1)).toList.map { case (taskId, partitionedList) =>
-			val batch = PartitionBatch(partitionedList.map { case (partitionId, value) => Partitioned(partitionId, value) })
+			val batch = partitionedList.map { case (partitionId, value) => Partitioned(partitionId, value) }
 			(taskId, batch)
 		}
 	}

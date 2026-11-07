@@ -1,21 +1,20 @@
 package corama.interpreter
 
-import cats.effect.std.Random
 import cats.syntax.all.*
 import cats.effect.IO
-import cats.effect.kernel.Ref
 import corama.*
-import corama.error.Util.*
+import corama.internal.*
+import corama.interpreter.Env
 import org.tpolecat.sourcepos.SourcePos
 
-import scala.util.*
-import scala.util.control.NoStackTrace
 import flogger.*
-import cats.effect.Deferred
-import corama.internal.HexString
-import corama.internal.HexId
 import cats.effect.SyncIO
+import cats.effect.std.Random
+import scala.util.control.NoStackTrace
 
+trait SyncIOLogging {
+	protected implicit val logOutputSyncIO: LogOutput[SyncIO] = LogOutput[SyncIO](this.getClass)
+}
 
 // EvalId is dynamically minted each time we perform a fanout
 case class EvalId(id: Long) extends HexId {
@@ -23,127 +22,252 @@ case class EvalId(id: Long) extends HexId {
 }
 
 object EvalId {
-	def generate(using rand: Random[IO]): IO[EvalId] = rand.nextLong.map(EvalId.apply)
+	def generate(using rand: Random[SyncIO]): SyncIO[EvalId] = rand.nextLong.map(EvalId.apply)
 }
 
 case class Partitioned[A](partition: PartitionId, value: A)
 
-case class PartitionBatch[A](items: List[Partitioned[List[A]]])
-
-case class Origin(
-	instanceId: InstanceId,
-	evalId: EvalId, // unique key for this specific append / query root
-)
-
 class EvalError(msg: String, pos: SourcePos, cause: Throwable) extends RuntimeException(s"$msg defined at $pos", cause) with NoStackTrace
 
-// Tracker for every topology spawned by a given depot append (or query)
-private[corama] final class EvalResults(results: Map[TopologyId, LocalEvalSink[?]])(using log: Log[IO]) extends IOLogging {
-	def forTopology[R](topology: Topology[?, R]): Try[LocalEvalSink[R]] =
-		results.get(topology.id)
-			.toRight(err(s"TopologyResults(${topology.id}) not found")).toTry
-			.map(_.asInstanceOf[LocalEvalSink[R]])
-
-	def await: IO[Map[TopologyId, Any]] = results.toList.traverse { (id, results) =>
-		log.debug(s"Awaiting results for append on topology $id") *>
-		results.await.map(id -> _).flatMap { r =>
-			log.debug(s"Got results from append on topology $id").as(r)
-		}
-	}.map(_.toMap)
-}
-
-private[corama] object EvalResults extends IOLogging with SyncIOLogging {
-	def apply(topologies: List[Topology[?, ?]])(using baseLog: Log[IO]): SyncIO[EvalResults] = {
-		val syncLog: Log[SyncIO] = Log.from(baseLog)
-		syncLog.debug(s"Creating a local result sink for ${topologies.map(_.id)}") *>
-		(topologies.traverse { topology =>
-			given log: Log[IO] = baseLog.addContext("topology" -> topology.id.value.toString())
-			EvalSink.local[topology.Result](topology.output.vid, topology.agg, EdgeId.startingEdge(topology.id))
-				.map(topology.id -> _)
-		}.map { topologyResults =>
-			new EvalResults(topologyResults.toMap)
-		})
-	}
-}
-
-
-case class EdgeId(id: Long) extends HexId {
-	// A single ID with parent & ID XOR'd can close the parent edge and atomically spawn a child edge
-	def xor(other: EdgeId) = EdgeId(id ^ other.id)
-	override def toString(): String = s"EdgeId($hex)"
-}
-
-object EdgeId {
-	val empty = EdgeId(0L)
-
-	private[corama] def startingEdge(topologyId: TopologyId) =
-		// edge IDs must not start at 0
-		EdgeId(topologyId.value.toLong + 1)
-
-	def generate(using rnd: Random[SyncIO]): SyncIO[EdgeId] = {
-		rnd.nextLong.map(apply)
-	}
-	
-	def union(ids: List[EdgeId]) = ids.foldLeft(empty)(_.xor(_))
-}
-
-trait EvalSink[R] {
-	val varId: VarId
-
-	def notify(edge: EdgeId, value: Option[R]): IO[Unit]
-
-	def completeList(edge: EdgeId, values: List[R]): IO[Unit]
-}
-
-/* The object which lives on the origin instance for a given evaluation.
- * Performs aggregation, and tracks the event tree. The tree is extended by xoring a
- * (randomly generated) edge ID, and is complete when every edge extension
- * is canceled out (i.e. the state returns to zero).
- *
- * This technique is based on https://storm.apache.org/releases/2.6.0/Acking-framework-implementation.html
- */
-private[corama] final class LocalEvalSink[R](
-	val varId: VarId,
-	agg: Agg[R],
+// stateless logic to eval a set of
+class Eval(
+	metadata: ClusterMetadata,
 	log: Log[IO],
-	xorState: Ref[IO, Long],
-	acc: Ref[IO, R],
-	done: Deferred[IO, Try[R]],
-) extends EvalSink[R] with IOLogging {
-	// NOTE: this can open a new edge, close an edge, or do _both_
-	// (by xoring an open edge with a new edge, the open one is closed
-	// and the new one is opened atomically)
-	def notify(edge: EdgeId, value: Option[R]) = {
-		for {
-			_ <- value.traverse_(value => acc.updateAndGet(x => agg.combine(x, value)))
-			xorValue <- xorState.updateAndGet(x => x ^ edge.id)
-			_ <- log.debug(s"Received notification $edge|${value.fold("None")(_ => "Some")}, state: from ${HexString(xorValue ^ edge.id)} => ${HexString(xorValue)}")
-			_ <- IO.whenA(xorValue === 0L) {
-				log.debug(s"eval complete") *>
-				acc.get.flatMap(x => done.complete(Success(x))).flatMap { wasFirst =>
-					IO.whenA(!wasFirst) {
-						log.warn(s"results returned more than once")
+) extends IOLogging with SyncIOLogging {
+	import Storage._
+	given Log[IO] = log
+	given syncLog: Log[SyncIO] = Log.from(log)
+
+	// Run a topology over some values. This is invoked
+	// only on the owning partition.
+	def run[R](
+		results: LocalEvalSink[R],
+		partitionId: PartitionId,
+		evalState: EvalState,
+		topology: Topology[?, R],
+		envs: List[Env],
+	): SyncIO[Unit] = {
+			this.continue(
+				results,
+				topology.id,
+				partitionId,
+				evalState,
+				EdgeId.startingEdge(topology.id),
+				Continuation.Basic(topology, topology.compiled._1),
+				envs
+			)
+	}
+
+	// Continue a topology. This is invoked on the destination
+	// task after a partition step.
+	private [corama] def continue[R](
+		source: EvalSource,
+		topologyId: TopologyId,
+		partitionId: PartitionId,
+		evalState: EvalState,
+		edgeId: EdgeId,
+		continuation: Continuation,
+		envs: List[Env],
+	): SyncIO[Unit] = {
+		// TODO: skip if not debug?
+		val origin = source.origin
+		val continueLog = syncLog.addContext(
+			"topology" -> topologyId.value.toString(),
+			"edge" -> edgeId.hex,
+			"origin" -> origin.instanceId.id,
+			"evalId" -> origin.evalId.hex,
+		)
+		val continue = continueLog.debug("Continuing computation") *>
+			this.continueInner(source, topologyId, partitionId, evalState, edgeId, continuation, envs, continueLog)
+
+		// continue could throw (from user functions), so wrap it in IO.defer
+		SyncIO.defer(continue)
+	}
+
+	/** Runs a list of nodes with the given envs. Results are returned to `results`.
+		*/
+	private def continueInner[R](
+		source: EvalSource,
+		topologyId: TopologyId,
+		partitionId: PartitionId,
+		evalState: EvalState,
+		edgeId: EdgeId,
+		continuation: Continuation,
+		envs: List[Env],
+		log: Log[SyncIO],
+	): SyncIO[Unit] = {
+		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
+			// supplies args that don't change
+			continueInner(source, topologyId, partitionId, evalState, nextEdgeId, continuation, envs, log)
+
+		import Node.DynamicOp
+		import Node.PStateOp
+
+		continuation.nodes match {
+			case Nil =>
+				evalState.outputs.addNotification(source, edgeId, envs.map(_(continuation.output)), continuation.agg)
+
+			case node :: tail => {
+				log.debug(s"Executing node: ${node}") *>
+				(node.op match {
+					case Node.Dynamic(pos, ins, fn, op) => {
+						val results = try {
+							op match {
+								case DynamicOp.Map(out) =>
+									envs.map(env => env.updated(out, fn(ins.map(env(_)))))
+								case DynamicOp.Explode(out) =>
+									// in each env, `in` holds an `A`
+									// `fn` takes A and yields a Seq of values.
+									// we expand each of these into `out` in a
+									// copy of the parent env
+									envs.flatMap { env =>
+										fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
+											env.updated(out, value)
+										}
+									}
+								case DynamicOp.Filter(_) =>
+									envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
+							}
+						} catch {
+							case e => throw new EvalError(s"Error evaluating node", pos, e)
+						}
+						continueTopology(tail, results)
 					}
-				}
+
+					case Node.Assign(in, out) =>
+						continueTopology(tail, envs.map { env =>
+							env.updated(out, env(in))
+						})
+
+					case Node.If(cond, ifBranch, elseBranch, out) =>
+						// TODO: I don't think we can break up envs like this! Need to statically extend execution tree.
+						// TODO: is single-exec batching even useful? We should batch multiple appends instead
+						envs.traverse_ { env =>
+							if (env(cond).asInstanceOf[Boolean]) {
+								continueTopology(ifBranch ++ tail, List(env))
+							} else {
+								continueTopology(elseBranch ++ tail, List(env))
+							}
+						}
+
+					case Node.Partition(in) => {
+						/*
+						A partition node fans out to multiple partitions. These child edges are
+						started in parallel. The result notification of this edge being complete is
+						combined (via xor) with the opening of all fanout edges at once.
+						*/
+						val taskPartitions = metadata.partitionBatches(envs, env => env(in)).toList
+						for {
+							origin <- source match {
+								case remote: Origin => SyncIO.pure(remote)
+								
+								// if the evaluation started locally and we're repartitioning, register this origin
+								case local: LocalEvalSink[?] =>
+									evalState.outputs.registerEvalSink(local).as(local.origin)
+							}
+							// TODO: short-circuit partitions on this task
+							evalContinuations <- taskPartitions.traverse { case (taskId, partitionedEnvs) =>
+								partitionedEnvs.traverse { partitionedEnv =>
+									EdgeId.generate.map(edge => Partitioned(partitionedEnv.partition, (edge, partitionedEnv.value)))
+								}.map { partitionedEnvs =>
+									EvalContinuation(taskId, origin, topologyId, node.id, partitionedEnvs)
+								}
+							}
+							
+							spawnedEdges = evalContinuations.flatMap(cont => cont.partitions.map(_.value._1))
+							_ <- evalContinuations.traverse_(evalState.outputs.addContinuation)
+
+							closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))
+							_ <- evalState.outputs.addNotification(origin, closeOriginAndOpenChildren, Nil, continuation.agg)
+						} yield ()
+					}
+
+					case Node.Combine(block, agg, collectFrom, out) => {
+						???
+						// envs.parTraverse { env =>
+						// 	// TODO: skip all the bookkeeping if there aren't any
+						// 	// partition jumps in `block`?
+						// 	// Note: reusing parent `edgeId` here, but there's no confusion because this is a new EvalId
+						// 	EvalSink.local(out, agg, edgeId).flatMap { results =>
+						// 		runTopologyEvalRaw(results, evalState, topologyId, edgeId, block, List(env)).map { result =>
+						// 			env.updated(out, result)
+						// 		}
+						// 	}
+						// }.flatMap { outputEnvs =>
+						// 	continueTopology(tail, outputEnvs)
+						// }
+					}
+					
+					case Node.PStateNode(ps, path, op) =>
+						envs.traverse { env =>
+							op match {
+								// adding / removing items of a set is just writing to the key of (path,value)
+								case PStateOp.Add(v) => {
+									evalState.put(PStateKey.forSetElem(partitionId, ps, path, env, v), Some(Bytes.empty)).as(env)
+								}
+
+								case PStateOp.Remove(v) => {
+									evalState.put(PStateKey.forSetElem(partitionId, ps, path, env, v), None).as(env)
+								}
+
+								case PStateOp.Select(out, options) => {
+									val key = PStateKey(partitionId, ps, path, env)
+
+									val after = options.after.flatMap { after =>
+										env(after.vid)
+											.asInstanceOf[Option[Any]]
+											.map(after.vid.codec.encode)
+									}
+									val rawOpts = SelectOptions.Raw(after, options.maxItems)
+									evalState.select(key, rawOpts).map { result =>
+										env.updated(out, result.map(out.codec.decodeEx))
+									}
+								}
+
+								case PStateOp.Get(out: VarId) =>
+									evalState.get(PStateKey(partitionId, ps, path, env)).map { stored =>
+										env.updated(out, stored.map(out.codec.decodeEx))
+									}
+
+								case PStateOp.Put(v: VarId) => {
+									evalState.put(PStateKey(partitionId, ps, path, env), Some(v.codec.encode(env(v)))).as(env)
+								}
+							}
+						}.flatMap { updatedEnvs =>
+							continueTopology(tail, updatedEnvs)
+						}
+
+					case Node.PStateUpdate(_pos, ps, path, ins, fn) =>
+						val f = fn // TODO is this necessary?
+						envs.traverse_ { env =>
+							val key = PStateKey(partitionId, ps, path, env)
+							evalState.get(key).flatMap { currentBytes =>
+								val current = currentBytes.map(path.codec.decodeEx)
+								val args = ins.map(env(_))
+								val updated = f(current, args).map(path.codec.encode)
+								evalState.put(key, updated)
+							}
+						}.flatMap { _ =>
+							continueTopology(tail, envs)
+						}
+
+					case Node.LocalAppend(dep, value) =>
+						envs.traverse_ { env =>
+							val v = env(value)
+							evalState.append(dep, partitionId, value.codec.encode(v))
+						} *> continueTopology(tail, envs)
+				})
 			}
-		} yield ()
+		}
 	}
 
-	def completeList(edge: EdgeId, values: List[R]) = notify(edge, Option.when(!values.isEmpty)(agg.merge(values)))
-
-	def fail(t: Throwable): IO[Unit] = done.complete(Failure(t)).void
-	
-	def await: IO[R] =
-		log.debug("Awaiting...") *>
-		done.get.flatMap(r => log.debug(s"Await returning $r").as(r)).flatMap(IO.fromTry)
-}
-
-private [corama] object EvalSink {
-	def local[R](out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): SyncIO[LocalEvalSink[R]] = {
-		for {
-			xorState <- Ref.in[SyncIO, IO, Long](start.id)
-			acc <- Ref.in[SyncIO, IO, R](agg.zero)
-			done <- Deferred.in[SyncIO, IO, Try[R]]
-		} yield new LocalEvalSink(out, agg, log, xorState, acc, done)
+	def invoke[S, A, R](q: QueryTopology[S, R], value: S): IO[R] = {
+		???
+		// val t = q.topology
+		// val env: Env = Map(t.builder.input.vid -> value)
+		// EvalSink.local(t.output.vid, t.agg, EdgeId.startingEdge(t.id)).flatMap { results =>
+		// 	runTopologyEval(results, t, List(env))
+		// }
 	}
+
 }

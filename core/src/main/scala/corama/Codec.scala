@@ -64,6 +64,16 @@ type AnyCodec = Codec[Any]
 
 object Codec {
 	def apply[A](implicit codec: Codec[A]) = codec
+
+	def via[A, B](to: A => B)(from: B => A)(using codec: Codec[B]): Codec[A] = new Codec[A] {
+		def encode(a: A): Bytes = codec.encode(to(a))
+		def decode(bytes: Bytes): Try[A] = codec.decode(bytes).map(from)
+	}
+
+	def tryVia[A, B](to: A => B)(from: B => Try[A])(using codec: Codec[B]): Codec[A] = new Codec[A] {
+		def encode(a: A): Bytes = codec.encode(to(a))
+		def decode(bytes: Bytes): Try[A] = codec.decode(bytes).flatMap(from)
+	}
 	
 	extension[A](c: Codec[A]) {
 		def asAny: Codec[Any] = c.asInstanceOf[Codec[Any]]
@@ -159,6 +169,9 @@ object Codec {
 		def decode(bytes: Bytes) = forList[A].decode(bytes).map(_.toArray)
 		def encode(a: Array[A]): Bytes = forList[A].encode(a.toList)
 	}
+
+	implicit def forMap[K : Codec, V: Codec]: Codec[Map[K, V]] =
+		via[Map[K,V], List[(K, V)]](_.toList)(_.toMap)
 
 	implicit def forOption[A](implicit c: Codec[A]): Codec[Option[A]] = new Codec[Option[A]] {
 		// TODO: this fails on Option[Unit] or other zero-length type

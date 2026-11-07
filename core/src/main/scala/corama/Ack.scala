@@ -35,7 +35,7 @@ final class AckReturns private[corama] (
 			throw new RuntimeException(s"no result recorded for topology ${t.id}")
 		)
 	}
-
+	
 	def unique[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[T] = {
 		val seq = result[S, M](stream)
 		if (seq.length == 1) {
@@ -46,5 +46,24 @@ final class AckReturns private[corama] (
 	}
 
 	override def toString: String = s"AckReturns(${values.size})"
+}
+
+object AckReturns {
+	def codec(topologies: Topologies): Codec[AckReturns] = {
+		Codec.tryVia[AckReturns, List[(Int, Bytes)]] { ackReturns =>
+			ackReturns.values.toList.traverse { (topologyId, value) =>
+				topologies.get(topologyId).map { t =>
+					(topologyId.value, t.codec.asAny.encode(value))
+				}
+			}.get // TODO unsafe
+		} { list =>
+			list.traverse { (key, bytes) =>
+				val topologyId = TopologyId(key)
+				topologies.get(topologyId).flatMap { t =>
+					t.codec.asAny.decode(bytes).map(topologyId -> _)
+				}
+			}.map(list => AckReturns(list.toMap, topologies))
+		}
+	}
 }
 

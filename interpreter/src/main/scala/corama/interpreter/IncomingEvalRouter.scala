@@ -10,15 +10,13 @@ import corama.error.Util.err
 
 // manages incoming eval messages for a single instance
 // TODO: do we need to prevent leaks? Should we cap slot availability?
-class EvalReceivers(instance: InstanceId, slots: Ref[IO, Map[EvalId, LocalEvalSink[Any]]])(using Random[IO]) {
-	def running[A](destination: LocalEvalSink[A]): Resource[IO, Origin] = {
+class IncomingEvalRouter(slots: Ref[IO, Map[EvalId, LocalEvalSink[Any]]])(using Random[IO]) {
+	def running[A](destination: LocalEvalSink[A]): Resource[IO, Unit] = {
 		val acquire = for {
-			evalId <- EvalId.generate
-			origin = Origin(instance, evalId)
-			_ <- slots.update(_.updated(evalId, destination.asInstanceOf[LocalEvalSink[Any]]))
-		} yield origin
-		Resource.make(acquire) { origin =>
-			slots.update(_.removed(origin.evalId))
+			_ <- slots.update(_.updated(destination.origin.evalId, destination.asInstanceOf[LocalEvalSink[Any]]))
+		} yield ()
+		Resource.make(acquire) { _ =>
+			slots.update(_.removed(destination.origin.evalId))
 		}
 	}
 	
@@ -31,9 +29,9 @@ class EvalReceivers(instance: InstanceId, slots: Ref[IO, Map[EvalId, LocalEvalSi
 	}
 }
 
-object EvalReceivers {
-	def apply(instance: InstanceId): Resource[IO, EvalReceivers] = {
-		val acquire = Ref[IO].of(Map.empty[EvalId, LocalEvalSink[Any]]).map(new EvalReceivers(instance, _))
+object IncomingEvalRouter {
+	def apply: Resource[IO, IncomingEvalRouter] = {
+		val acquire = Ref[IO].of(Map.empty[EvalId, LocalEvalSink[Any]]).map(new IncomingEvalRouter(_))
 		Resource.make(acquire)(_ => IO.unit)
 	}
 }

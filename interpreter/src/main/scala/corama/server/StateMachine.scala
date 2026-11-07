@@ -1,7 +1,7 @@
 package corama.server
 
-import corama.{Bytes, Codec, DepotId, PStateId}
-import corama.interpreter.{DepotAppend, DepotAppends, PStateKey, PStateUpdate, ReplicationUpdate, TxId}
+import corama.{Bytes, Codec, DepotId}
+import corama.interpreter.{DepotAppend, DepotAppends, ReplicationUpdate, TxId}
 import corama.interpreter.db.RocksDb
 import org.apache.ratis.protocol.{Message, RaftGroupId}
 import org.apache.ratis.server.RaftServer
@@ -11,41 +11,12 @@ import org.apache.ratis.statemachine.impl.{BaseStateMachine, SimpleStateMachineS
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Success}
 import corama.interpreter.TaskId
 import cats.effect.SyncIO
 import corama.interpreter.Partitioned
 import corama.PartitionId
 
-/** Wire codecs for the replog payload (`ReplicationUpdate`), built on the existing
-	* `Codec` combinators (tuples / lists / length-prefixed primitives).
-	*/
-object ReplogCodecs {
-	private def via[A, B](codec: Codec[B])(to: A => B)(from: B => A): Codec[A] = new Codec[A] {
-		def encode(a: A): Bytes = codec.encode(to(a))
-		def decode(bytes: Bytes): Try[A] = codec.decode(bytes).map(from)
-	}
-
-	implicit val txId: Codec[TxId] = via[TxId, Long](Codec.forLong)(_.value)(TxId.apply)
-	implicit val depotId: Codec[DepotId] = via[DepotId, String](Codec.forString)(_.value)(DepotId.apply)
-	implicit val pstateId: Codec[PStateId] = via[PStateId, String](Codec.forString)(_.value)(PStateId.apply)
-	implicit val depotAppend: Codec[DepotAppend] = via[DepotAppend, Bytes](Codec.forBytes)(_.value)(DepotAppend.apply)
-	implicit val pstateKey: Codec[PStateKey] =
-		via[PStateKey, Bytes](Codec.forBytes)(k => k.raw.raw) { bytes => PStateKey(Bytes.Value(bytes)) }
-
-	implicit val pstateUpdate: Codec[PStateUpdate] =
-		via[PStateUpdate, (PStateKey, Option[Bytes])](Codec.forTuple[PStateKey, Option[Bytes]])(p => (p.key, p.value)) { case (key, value) => PStateUpdate(key, value) }
-
-	implicit val depotAppends: Codec[DepotAppends] =
-		via[DepotAppends, (DepotId, Array[(Int, Bytes)])](Codec.forTuple[DepotId, Array[(Int, Bytes)]])
-			(d => (d.id, d.updates.map(append => (append.partition.id, append.value.value))))
-			{ case (id, values) => DepotAppends(id, values.map { (partition, value) => Partitioned(PartitionId(partition), DepotAppend(value)) }.toArray) }
-
-	implicit val replicationUpdate: Codec[ReplicationUpdate] =
-		via[ReplicationUpdate, ((TxId, List[DepotAppends]), Array[PStateUpdate])](Codec.forTuple[(TxId, List[DepotAppends]), Array[PStateUpdate]])(r => ((r.id, r.depotAppends), r.pstateUpdates)) {
-			case ((id, depotAppends), pstateUpdates) => ReplicationUpdate(id, depotAppends, pstateUpdates)
-		}
-}
 
 object Keyspace {
 	private val Depot = 'D'.toByte
@@ -115,7 +86,7 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 	override def applyTransaction(trx: TransactionContext): CompletableFuture[Message] = {
 		val entry = trx.getLogEntry
 		try {
-			val update = ReplogCodecs.replicationUpdate.decode(entry.getStateMachineLogEntry.getLogData.toByteArray) match {
+			val update = ServerCodecs.replicationUpdate.decode(entry.getStateMachineLogEntry.getLogData.toByteArray) match {
 				case Success(update) => update
 				case Failure(e) => throw new RuntimeException(s"Failed to decode ReplicationUpdate at log index ${entry.getIndex}", e)
 			}
@@ -128,7 +99,7 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 		}
 	}
 
-	private def ack(id: TxId): Message = Message.valueOf(ByteBuffer.wrap(ReplogCodecs.txId.encode(id)))
+	private def ack(id: TxId): Message = Message.valueOf(ByteBuffer.wrap(ServerCodecs.txId.encode(id)))
 }
 
 object StateMachine {

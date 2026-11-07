@@ -24,10 +24,10 @@ import corama.interpreter.TaskId
 import corama.server.ClusterConfig
 
 class Server(
-	raft: RaftServer,
-	proposers: IOMap[TaskId, LocalProposer],
-	divisions: IOMap[TaskId, RaftServer.Division],
-	// peers: IOMap[InstanceId, streamdsl.rpc.CoramaFs2Grpc]
+	val raft: RaftServer,
+	val client: ClusterClient,
+	val proposers: IOMap[TaskId, LocalProposer],
+	val divisions: IOMap[TaskId, RaftServer.Division],
 )
 
 object Server extends IOLogging {
@@ -70,19 +70,18 @@ object Server extends IOLogging {
 
 			// Note: client only used in setup, so `use` instead of nesting the resource
 			// (a resource would stay active until the server gets released)
-			_ <- Resource.eval(ClusterClient(config).use { client =>
-				joinGroups(client, instance)
-			})
+			client <- ClusterClient(config)
+			_ <- Resource.eval(joinGroups(client, instance))
 
 			// setGroup only registers one group; must add the rest after startup
-		} yield new Server(server, IOMap(proposers), IOMap(divisions))
+		} yield new Server(server, client, IOMap(proposers), IOMap(divisions))
 	}
 
 	// add any groups not already registered (e.g. recovered from storage on restart)
 	private def joinGroups(client: ClusterClient, instance: ClusterInstance)(using log: Log[IO]): IO[Unit] = {
 		log.debug(s"joining additional groups") >>
 		instance.tasks.traverse_ { taskId =>
-			client.invoke(taskId) { client =>
+			client.invokeRaft(taskId) { client =>
 				IO(blocking {
 					client.raft.getGroupManagementApi(instance.peerId).add(client.group, true)
 				})

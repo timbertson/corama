@@ -1,11 +1,15 @@
 package corama.server
 
 import cats.effect.IO
+import cats.effect.Outcome
+import cats.effect.SyncIO
 import cats.effect.kernel.Deferred
+import cats.effect.kernel.Outcome.Canceled
+import cats.effect.kernel.Outcome.Errored
+import cats.effect.kernel.Outcome.Succeeded
 import cats.effect.kernel.Ref
 import cats.effect.kernel.Resource
 import cats.effect.std.Queue
-import cats.effect.std.Semaphore
 import cats.syntax.all.*
 import corama.*
 import corama.AckLevel.AppendAck
@@ -20,29 +24,38 @@ import fs2.Stream
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-import scala.annotation.unused
-import cats.effect.kernel.Resource.ExitCase
-import cats.effect.SyncIO
+import corama.server.ratis.ClusterClient
+import io.grpc.Metadata
+import corama.server.TaskCommand.OpCommand
 
-private[server] case class RatisCommand[A](op: RatisOp[A], reply: Deferred[IO, Try[A]])
-private[server] sealed trait RatisOp[A]
-private[server] object RatisCommand {
+private[server] sealed trait TaskCommand[A]
+private[server] sealed trait TaskOp[A]
+private[server] object TaskCommand {
+	case class Continue(
+		origin: Origin,
+		topologyId: TopologyId,
+		continuation: Continuation,
+		partitions: List[Partitioned[(EdgeId, List[Env])]],
+	) extends TaskCommand[Unit]
+
+	case class OpCommand[A](op: TaskOp[A], reply: Deferred[IO, Try[A]]) extends TaskCommand[A]
 	case class Append(
 		depot: Depot[?],
 		partition: PartitionId,
 		bytes: Bytes,
 		decoded: Any,
 		level: AckLevel[?],
-	) extends RatisOp[AckReturns]
+	) extends TaskOp[AckReturns]
+
 	case class Invoke(
 		q: QueryTopology[?, ?],
 		value: Any,
-	) extends RatisOp[Any]
+	) extends TaskOp[Any]
 }
 
-// rocksDB storage view for a partition
+// rocksDB storage view for a task
 // Note that DBs are shared between all partitions in a task,
-// so this only performs reads
+// so keys embed the partition ID
 class PersistentDbView(db: RocksDb) extends PStateView {
 	override def get(key: PStateKey) = {
 		db.get(key.raw.raw)
@@ -50,7 +63,6 @@ class PersistentDbView(db: RocksDb) extends PStateView {
 
 	override def select(key: PStateKey, options: SelectOptions.Raw) = ???
 }
-
 
 /** Executes actions for one task's raft group. See `background`
  * for details on processing concurrency.
@@ -60,26 +72,24 @@ class PersistentDbView(db: RocksDb) extends PStateView {
  */
 
 final class ServerTask private[server] (
+	val instanceId: InstanceId,
 	val task: TaskId,
+	speculative: SpeculativeState,
+	client: ClusterClient,
 	replog: RepLog,
 	leadership: TaskLeadership,
-	receivers: EvalReceivers,
-	speculative: SpeculativeState,
+	receivers: IncomingEvalRouter,
 	topologies: Topologies,
-	@unused metadata: ClusterMetadata,
+	evaluator: Eval,
 
-	commands: Queue[IO, RatisCommand[?]],
+	// queues
+	commands: Queue[IO, TaskCommand[?]],
 	submissions: Queue[IO, ServerTask.Submission],
-	outputsQueue: Queue[IO, (EvalState.Outputs, ServerTask.PendingAck)],
+	outputsQueue: Queue[IO, (EvalState.Outputs, Option[ServerTask.PendingAck])],
 	pendingAcks: Queue[IO, ServerTask.PendingAck],
 
-	permits: Semaphore[IO],
-	partitions: TaskPartitions,
-	// partitions evaluated on this instance for this task
-	pstateView: PStateView,
-	@unused partitionFor: PartitionId => IO[TaskPartitions],
 )(using log: Log[IO]) extends IOLogging {
-	import RatisCommand.*
+	import TaskCommand.*
 	import ServerTask.*
 
 	private val nextSeq = Ref.unsafe[IO, Long](0L)
@@ -100,29 +110,30 @@ final class ServerTask private[server] (
 		IO.raiseUnless(isLeader)(NotLeader(None))
 	}
 
-	def append[A, R](depot: corama.Depot[A], partition: PartitionId, bytes: Bytes, level: AckLevel[R]): IO[R] = {
-		// TODO: we could skip this, but it gives some protection from invalid bytes. Pass both through?
-		IO.fromTry(depot.codec.decode(bytes)).flatMap { decoded =>
-			submitCommand(Append(depot, partition, bytes, decoded, level)).map { returns =>
-				level match {
-					case AckLevel.Ack => returns.asInstanceOf[R]
-					
-					// TODO: can we wait only until replicated, instead of until fully executed?
-					// Need to also trigger execution post-append, rather then at-append-time
-					case AckLevel.NoAck | AckLevel.AppendAck => ().asInstanceOf[R] // R is always Unit for these ack levels
-				}
+	def append[A, R](append: Append): IO[R] = {
+		submitOp(append).map { returns =>
+			append.level match {
+				case AckLevel.Ack => returns.asInstanceOf[R]
+				
+				// TODO: can we wait only until replicated, instead of until fully executed?
+				// Need to also trigger execution post-append, rather then at-append-time
+				case AckLevel.NoAck | AckLevel.AppendAck => ().asInstanceOf[R] // R is always Unit for these ack levels
 			}
 		}
 	}
 
+	def continue[A, R](cont: Continue): IO[Unit] = {
+		commands.offer(cont)
+	}
+
 	def invoke[S, R](q: QueryTopology[S, R], value: S): IO[R] = {
-		submitCommand(Invoke(q, value)).map(_.asInstanceOf[R])
+		submitOp(Invoke(q, value)).map(_.asInstanceOf[R])
 	}
 	
-	private def submitCommand[A](op: RatisOp[A]): IO[A] = {
+	private def submitOp[A](op: TaskOp[A]): IO[A] = {
 		for {
 			replyRef <- Deferred[IO, Try[A]]
-			_ <- commands.offer(RatisCommand(op, replyRef)).to[IO]
+			_ <- commands.offer(OpCommand(op, replyRef)).to[IO]
 			reply <- replyRef.get.flatMap(IO.fromTry)
 		} yield reply
 	}
@@ -132,61 +143,81 @@ final class ServerTask private[server] (
 		commands.take.flatMap(handle).foreverM
 	}
 
-	private def handle(cmd: RatisCommand[?]): IO[Unit] = {
-		cmd.op match {
-			case Append(depot, partition, bytes, decoded, level) =>
-				// all appends are RatisCommand[AckReturns]
-				val reply = cmd.asInstanceOf[RatisCommand[AckReturns]].reply
-				// TODO: return early if the client isn't actually waiting for returns
-
-				// TODO: allocate the TxId here, inside the serialized fiber so tx ids
-				// and log indices stay consistent while leadership holds.
-				// A bare counter is not enough — key on (instanceId, txId) or take
-				// client-supplied ids, since a leader change resets a bare counter
-				// and uncommitted old-leader txs collide.
-				// A retry of a committed action must dedup by TxId at execution time.
-				val txId = ??? : TxId
-				val eval: SyncIO[(EvalState, PendingAck)] = for {
+	private def handle(cmd: TaskCommand[?]): IO[Unit] = {
+		cmd match {
+			case c: Continue => {
+				val eval: SyncIO[EvalState] = for {
 					// TODO create state per batch, not individual elem
-					evalState <- EvalState(pstateView, speculative)
-					_ <- evalState.append(depot.id, partition, bytes)
+					evalState <- EvalState(speculative, pendingAck = None)
+					_ <- c.partitions.traverse_ { partitioned =>
+						val (edgeId, envs) = partitioned.value
+						evaluator.continue(
+							c.origin,
+							c.topologyId,
+							partitioned.partition,
+							evalState,
+							edgeId,
+							c.continuation,
+							envs
+						)
+					}
+					_ <- if (evalState.outputs.registeredEvalSinks.isEmpty) {
+						SyncIO.unit
+					} else {
+						SyncIO.raiseError(new RuntimeException("Continuation registered eval sinks"))
+					}
+				} yield (evalState)
+				handleEval(eval)
+			}
 
-					// TODO: multiplex multiple commands into a single receiver, so we can just install one per batch
-					results <- EvalResults(subscribers(depot.id))
-					// speculative execution: run the depot-driven topologies for this
-					// record, capturing all writes into evalState
-					_ <- partitions.continue(
-						???,
-						???,
-						???,
-						???,
-						???,
-						???,
-						???
-					)
-					update = evalState.toUpdate(txId)
+			case OpCommand(op, reply) => op match {
+				case Append(depot, partition, bytes, decoded, level) =>
+					// TODO: return early if the client isn't actually waiting for returns
+					val evalTopologies = subscribers(depot.id)
+					val eval: SyncIO[EvalState] = for {
+						// TODO create state per batch, not individual elem
+						results <- EvalResults(instanceId, evalTopologies)
+						evalState <- EvalState(speculative, Some(PendingAck(results, reply, None)))
+						_ <- evalState.append(depot.id, partition, bytes)
 
-					// raw <- results.await
-					// notifications = evalState.notifications
-				} yield (evalState, PendingAck(results, reply, None))
+						// TODO: multiplex multiple commands into a single receiver, so we can just install one per batch
+						// speculative execution: run the depot-driven topologies for this
+						// record, capturing all writes into evalState
+						_ <- evalTopologies.traverse { topology =>
+							SyncIO.fromTry(results.forTopology(topology)).flatMap { localResults =>
+								evaluator.run(
+									localResults,
+									partition,
+									evalState,
+									topology,
+									List(Map(topology.input.vid -> decoded))
+								)
+							}
+						}
+					} yield evalState
+					handleEval(eval)
 
-				eval.attempt.to[IO].flatMap {
-					case Right((evalState, pendingAck)) =>
-						val update = evalState.toUpdate(txId)
-						// pipeline: block only when the in-flight bound is reached —
-						// the slot is released by the await loop when this proposal resolves
-						for {
-							_ <- permits.acquire
-							seq <- nextSeq.updateAndGet(_ + 1)
-							proposal <- replog.submit(update)
-							submission = ServerTask.Submission(seq, proposal, pendingAck, evalState.outputs)
-							_ <- speculative.append(seq, update).to[IO]
-							_ <- submissions.offer(submission)
-						} yield ()
-					case Left(ex) => ???
-				}
+				case Invoke(q, value) => ???
+			}
+		}
+	}
 
-			case Invoke(q, value) => ???
+	private def handleEval(eval: SyncIO[EvalState]): IO[Unit] = {
+		// common logic for append & continue branches in `handle`
+		eval.attempt.to[IO].flatMap {
+			case Right(evalState) =>
+				val txId = ??? : TxId
+				val update = evalState.toUpdate(txId)
+				// pipeline: block only when the in-flight bound is reached —
+				// the slot is released by the await loop when this proposal resolves
+				for {
+					seq <- nextSeq.updateAndGet(_ + 1)
+					proposal <- replog.submit(update)
+					submission = ServerTask.Submission(seq, proposal, evalState.pendingAck, evalState.outputs)
+					_ <- speculative.append(seq, update).to[IO]
+					_ <- submissions.offer(submission)
+				} yield ()
+			case Left(ex) => ???
 		}
 	}
 
@@ -202,16 +233,15 @@ final class ServerTask private[server] (
 						// results and additional edges, as well as sending continuations.
 						// We can't do this before the proposal is accepted, as
 						// - the origin has no visibility into our consensus state
-						// - I don't think it's valid (TODO: verify?) for the second
-						//   half of a topology to be comitted if the first half was rejected.
+						// - We don't want to start work on the new partition if the current
+						//   partition's writes may later be rejected.
 						_ <- outputsQueue.offer((submission.outputs, submission.pendingAck))
 					} yield ()
 				case Left(e) =>
 					speculative.discard(submission.seq).to[IO] *>
 						// immediately reject, don't go via pendingAcks
-						submission.pendingAck.onCommit(topologies, Failure(e))
+						submission.pendingAck.traverse_(_.onCommit(topologies, Failure(e)))
 			}
-			_ <- permits.release
 		} yield ()).foreverM
 	}
 
@@ -228,24 +258,39 @@ final class ServerTask private[server] (
 		// to be reordered with concurrently-executing eval steps
 		Stream.fromQueueUnterminated(outputsQueue)
 			.parEvalMapUnordered(MAX_INFLIGHT_ACKS) { (outputs, pendingAck) =>
-				// install all local eval receivers first, then perform remote ops (continuations and notifications)
-				outputs.evalSinks.traverse { sink =>
-					receivers.running(sink).allocated
-				}.flatMap { sinksAndFinalizers =>
+				// complete any local results
+				outputs.localResults.traverse_ { (local, edge, values) =>
+					local.completeList(edge, values)
+				} *>
+				// install all eval receivers
+				outputs.registeredEvalSinks.traverse { sink =>
+					receivers.running(sink).allocated.map(_._2)
+				}.flatMap { releaseEvalSinks =>
+					val cleanup = releaseEvalSinks.sequence_
+					// then perform remote ops in parallel (continuations and notifications)
 					IO.race(
 						// TODO group by task, then by leader?
 						outputs.continuations.traverse_ { cont =>
-							???
+							client.invokeGrpc(cont.origin.instanceId) { client =>
+								client.continue(EvalContinuation.toProtobuf(cont), Metadata())
+							}
 						},
 						
 						// TODO group by origin
 						outputs.notifications.traverse_ { (origin, notification) => notifyOriginOrLog(origin, notification) }
-					).guaranteeCase {
-						// TODO: cleanup if not successful, otherwise add to pendingAcks
-						case ExitCase.Succeeded => pendingAcks.offer(pendingAck.copy(release = Some(
-							sinksAndFinalizers.traverse_(_._2)
-						)))
-						case _ => ???
+					).guaranteeCase { outcome =>
+						pendingAck match {
+							// TODO: when pendingAck is None, it's a continuation. We could notify the origin so it doesn't have to rely on a timeout
+							case None => outcome match {
+									case Outcome.Succeeded(_) => IO.unit
+									case _ => cleanup
+							}
+							case Some(pendingAck) => outcome match {
+								case Outcome.Succeeded(_) => pendingAcks.offer(pendingAck.copy(release = Some(cleanup)))
+								case Outcome.Errored(t) => cleanup *> pendingAck.reply.complete(Failure(t)).void
+								case Outcome.Canceled() => cleanup *> pendingAck.reply.complete(Failure(new RuntimeException("Canceled"))).void
+							}
+						}
 					}
 				}
 			}
@@ -281,7 +326,7 @@ object ServerTask {
 	private[server] case class Submission(
 		seq: Long,
 		proposal: Proposal,
-		pendingAck: PendingAck,
+		pendingAck: Option[PendingAck],
 		outputs: EvalState.Outputs
 	)
 
@@ -309,37 +354,41 @@ object ServerTask {
 
 	/** One executor per task; its fibers run for the resource's lifetime */
 	def resource(
+		instanceId: InstanceId,
 		task: TaskId,
-		replog: RepLog,
-		view: SpeculativeState,
 		topologies: Topologies,
+		client: ClusterClient,
+		
+		// state
+		replog: RepLog,
+		speculative: SpeculativeState,
+		
+		// TODO: join metadata, leeadership and evalRouter into one resource?
 		metadata: ClusterMetadata,
-		partitionFor: PartitionId => IO[TaskPartitions],
+		taskLeadership: TaskLeadership,
+		evalRouter: IncomingEvalRouter,
+
 		maxInFlight: Int = 16,
 	)(using log: Log[IO]): ActiveResource[IO, ServerTask] = {
 		ActiveResource(for {
-			commands <- Resource.eval(Queue.bounded[IO, RatisCommand[?]](10))
+			commands <- Resource.eval(Queue.bounded[IO, TaskCommand[?]](10))
 			submissions <- Resource.eval(Queue.bounded[IO, Submission](10))
-			outputs <- Resource.eval(Queue.bounded[IO, (EvalState.Outputs, PendingAck)](10))
+			outputs <- Resource.eval(Queue.bounded[IO, (EvalState.Outputs, Option[PendingAck])](10))
 			pendingAcks <- Resource.eval(Queue.bounded[IO, PendingAck](10))
-			permits <- Resource.eval(Semaphore[IO](maxInFlight.toLong))
-			rocksDbState = identity[PStateView](???)
 			serverTask = ServerTask(
+				instanceId,
 				task,
+				speculative,
+				client,
 				replog,
-				???,
-				???,
-				view,
+				taskLeadership,
+				evalRouter,
 				topologies,
-				metadata,
+				new Eval(metadata, log),
 				commands,
 				submissions,
 				outputs,
-				???,
-				permits,
-				???,
-				rocksDbState,
-				partitionFor
+				pendingAcks
 			)
 		} yield (serverTask, serverTask.background))
 	}

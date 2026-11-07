@@ -60,6 +60,7 @@ final class Topologies {
 
 	private[corama] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
 
+	// TODO build a map
 	private[corama] def get(id: TopologyId): Try[Topology[?, ?]] =
 		topologies.find(_.id === id)
 			.toRight(err(s"Unknown topology ID: ${id}"))
@@ -173,7 +174,7 @@ final case class Topology[S, R](
 			case Nil => None
 			case node :: tail => {
 				if (node.id === afterNode) {
-					Some(Continuation.Basic(tail))
+					Some(Continuation.Basic(this, tail))
 				} else {
 					node.op match {
 						// non-branching nodes just continue onto tail
@@ -217,24 +218,31 @@ final case class Topology[S, R](
 }
 
 private [corama] sealed trait Continuation {
+	def agg: Agg[?]
+	def output: VarId
+	val nodes: List[Node]
+
+	// modifiers
 	def withParent(tail: List[Node]): Continuation
 	def withinAggregation(node: Node.Combine): Continuation
-	val nodes: List[Node]
 }
 
 object Continuation {
-	case class WithinAggregation(agg: Agg[?], out: VarId, nodes: List[Node]) extends Continuation {
+	case class WithinAggregation(agg: Agg[?], output: VarId, nodes: List[Node]) extends Continuation {
 		// aggregations terminate at the end of the block, continuation of parent tail
 		// occurs back on the original (aggregating) node
 		override def withParent(tail: List[Node]) = this
 		override def withinAggregation(combine: Node.Combine): Continuation = this
 	}
 
-	case class Basic(nodes: List[Node]) extends Continuation {
+	case class Basic(topology: Topology[?, ?], nodes: List[Node]) extends Continuation {
 		override def withParent(tail: List[Node]) = copy(nodes = nodes ++ tail)
 		override def withinAggregation(combine: Node.Combine): Continuation = {
 			Continuation.WithinAggregation(combine.agg, combine.out, nodes)
 		}
+		
+		def agg = topology.agg
+		def output = topology.output.vid
 	}
 }
 
