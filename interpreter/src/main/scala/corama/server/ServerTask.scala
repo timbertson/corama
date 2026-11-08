@@ -75,7 +75,7 @@ final class ServerTask private[server] (
 	val instanceId: InstanceId,
 	val task: TaskId,
 	speculative: SpeculativeState,
-	client: ClusterClient,
+	clusterClient: ClusterClient,
 	replog: RepLog,
 	leadership: TaskLeadership,
 	receivers: IncomingEvalRouter,
@@ -271,7 +271,7 @@ final class ServerTask private[server] (
 					IO.race(
 						// TODO group by task, then by leader?
 						outputs.continuations.traverse_ { cont =>
-							client.invokeGrpc(cont.origin.instanceId) { client =>
+							clusterClient.invokeGrpc(cont.origin.instanceId) { client =>
 								client.continue(EvalContinuation.toProtobuf(cont), Metadata())
 							}
 						},
@@ -357,7 +357,7 @@ object ServerTask {
 		instanceId: InstanceId,
 		task: TaskId,
 		topologies: Topologies,
-		client: ClusterClient,
+		clusterClient: ClusterClient,
 		
 		// state
 		replog: RepLog,
@@ -378,7 +378,7 @@ object ServerTask {
 				instanceId,
 				task,
 				speculative,
-				client,
+				clusterClient,
 				replog,
 				taskLeadership,
 				evalRouter,

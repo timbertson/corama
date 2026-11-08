@@ -18,16 +18,7 @@ Execution installs a `EvalReceiver` slot in the global `EvalReceivers` registry.
 
 ## Eval machinery
 
-Only the active leader for a task performs evaluation, for all partitions in that task.
-
-Evaluation interacts with the cluster in two ways:
-
- - execution is shifted to another partition via the `TaskRouter` instance
- - eval results are returned to the origin via the `EvalRouter` instance
-
-Note that a `LocalEvalSink` also implements `EvalSink`, for when the continuation happens to be running on the local instance.
-(TODO: this is not short-circuited when the continuation returns to the origin instance yet).
-
+Only the active leader for a task performs evaluation, for all partitions in that task. Evaluation continuations / returns occur over the internal GRPC interface.
 
 To track evaluations for a specific topology + source event:
 
