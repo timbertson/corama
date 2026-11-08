@@ -15,6 +15,9 @@ import org.apache.ratis.protocol.RaftPeerId
 import java.nio.charset.StandardCharsets
 import corama.interpreter.TaskId
 import cats.data.NonEmptyList
+import corama.PartitionId
+import corama.interpreter.Partitioned
+import cats.effect.std.Random
 
 case class PerInstance[T](default: Option[T], overrides: Map[InstanceId, T]) {
 	def get(id: InstanceId): Try[T] = {
@@ -40,6 +43,7 @@ case class NetworkConfig(
 ) {
 	def advertisedSocket = InetSocketAddress.createUnresolved(advertisedAddress, port)
 	def advertisedAdminSocket = InetSocketAddress.createUnresolved(advertisedAddress, adminPort)
+	def bindGrpcSocket = InetSocketAddress.createUnresolved(bindAddress, grpcPort)
 }
 
 case class ClusterId(id: String)
@@ -56,6 +60,9 @@ case class ClusterConfig(
 	numPartitions: Int,
 	dataRoot: String,
 ) {
+	private val numTasks = instances.size
+	assert(numTasks >= 3)
+
 	def raftGroup(taskId: TaskId): Try[RaftGroup] = {
 		for {
 			groupInstances <- NonEmptyList.fromList(instances.filter(_.tasks.contains_(taskId))).toRight(
@@ -77,6 +84,39 @@ case class ClusterConfig(
 		// deterministic a hash of the cluster and task IDs
 		val bytes = s"${id.id}-${taskId.id}".getBytes(StandardCharsets.UTF_8)
 		RaftGroupId.valueOf(UUID.nameUUIDFromBytes(bytes))
+	}
+
+	def taskFor(partition: PartitionId): TaskId = TaskId(partition.id % numTasks)
+	
+	def allPartitions = (0 until numPartitions).map(PartitionId.apply)
+
+	def partitionsIn(task: TaskId): List[PartitionId] = {
+		allPartitions.filter(p => taskFor(p) === task).toList
+	}
+
+	def partitionBatches[A](values: List[A], keyFn: A => Any): List[(TaskId, List[Partitioned[List[A]]])] = {
+		values.groupBy(v => partitionKey(keyFn(v))).toList.map { case (p, items) =>
+			(p, items)
+		}.groupBy(pair => taskFor(pair._1)).toList.map { case (taskId, partitionedList) =>
+			val batch = partitionedList.map { case (partitionId, value) => Partitioned(partitionId, value) }
+			(taskId, batch)
+		}
+	}
+
+	def partitionKey(value: Any) = PartitionId(rawPartitionKey(value))
+
+	def randomPartition(using rnd: Random[IO]): IO[PartitionId] = {
+		rnd.nextIntBounded(numPartitions).map(PartitionId.apply)
+	}
+
+	// TODO make much better
+	private def rawPartitionKey(value: Any) = {
+		val mod = value.hashCode() % numPartitions
+		if (mod < 0) {
+			mod + numPartitions
+		} else {
+			mod
+		}
 	}
 }
 

@@ -5,20 +5,30 @@ import cats.Eq
 import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
 import izumi.reflect.macrortti.LightTypeTag
+import scala.util.Try
+import scala.util.Success
+import scala.util.Failure
 
 // Allocates var ids within one topology.
 private[corama] class VarRegistry {
-	private var defined = 0
-	private var list: List[Var[Any]] = Nil
+	private var list: Vector[Var[Any]] = Vector.empty
 
 	def add[A](hint: String, tag: Tag[A], codec: Codec[A], pos: SourcePos): Var[A] = {
-		val v = new Var[A](new VarId(defined, hint, tag.tag), tag, codec, pos)
-		list = v.asAny :: list
-		defined += 1
+		val v = new Var[A](new VarId(list.length, hint, tag.tag), tag, codec, pos)
+		list = list.appended(v.asAny)
 		v
 	}
 
-	def count: Int = defined
+	def count: Int = list.length
+
+	def lookup(raw: Int): Try[Var[Any]] = Try(list(raw)).flatMap { v =>
+		// TODO this should be true by construction, write a test instead
+		if (v.vid.id == raw) {
+			Success(v)
+		} else {
+			Failure(new RuntimeException("varID mismatch"))
+		}
+	}
 	
 	private [corama] def all = list
 }

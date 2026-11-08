@@ -363,8 +363,7 @@ object ServerTask {
 		replog: RepLog,
 		speculative: SpeculativeState,
 		
-		// TODO: join metadata, leeadership and evalRouter into one resource?
-		metadata: ClusterMetadata,
+		metadata: ClusterConfig,
 		taskLeadership: TaskLeadership,
 		evalRouter: IncomingEvalRouter,
 

@@ -12,6 +12,7 @@ import cats.effect.Async
 import flogger.Log
 import flogger.IOLogging
 import cats.Eq
+import cats.Applicative
 
 case class TxId(value: Long)
 object TxId {
@@ -78,19 +79,6 @@ object ReplicationChannel extends IOLogging {
 			channel = new ReplicationChannel(queue, waiters, follower)
 		} yield (channel, channel.ackLoop))
 }
-
-// A Resource[IO,A] with a background IO[Nothing]. When used, the background
-// task is run concurrently with the foreground, and errors / cancelation propagate.
-case class ActiveResource[F[_], A](resource: Resource[F, (A, F[Nothing])])(implicit F: Async[F]) {
-	def use[B](action: A => F[B]): F[B] = {
-		resource.use { case (res, task) =>
-			F.race(action(res), task).map(_.merge)
-		}
-	}
-
-	def map[B](f: A => B): ActiveResource[F, B] = ActiveResource(resource.map { case (a, task) => (f(a), task) })
-}
-// TODO: build algebras for activeresource
 
 case class LeaderConfig(
 	maxBatchSize: Int, // currently an update count, but maybe a byte size eventually

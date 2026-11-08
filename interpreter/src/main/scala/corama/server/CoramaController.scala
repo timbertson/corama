@@ -9,7 +9,6 @@ import streamdsl.rpc.Response
 import corama.Topologies
 import corama.error.Util
 import corama.DepotId
-import corama.interpreter.ClusterMetadata
 import corama.AckLevel
 import corama.interpreter.TaskId
 import corama.interpreter.IOMap
@@ -23,13 +22,12 @@ import corama.server.TaskCommand.Append
 import corama.interpreter.EvalId
 import corama.interpreter.Origin
 import corama.InstanceId
-import corama.VarId
 import corama.interpreter.Partitioned
 import corama.interpreter.EdgeId
 import corama.internal.NodeId
 
 class CoramaController(
-	metadata: ClusterMetadata,
+	config: ClusterConfig,
 	topologies: Topologies,
 	tasks: IOMap[TaskId, ServerTask],
 ) extends streamdsl.rpc.CoramaNodeFs2Grpc[IO, Metadata] {
@@ -45,7 +43,7 @@ class CoramaController(
 			// TODO: we could skip this, but it gives some protection from invalid bytes. Pass both through?
 			decoded <- IO.fromTry(depot.codec.decode(bytes))
 			partition <- IO.fromEither(request.partition.toRight(Util.err("Partition required"))).map(PartitionId.apply)
-			taskId = metadata.taskFor(partition)
+			taskId = config.taskFor(partition)
 			task <- requireLeader(taskId)
 			result <- task.append(TaskCommand.Append(depot, partition, bytes, decoded, AckLevel.Ack)) // TODO configurable ack level
 			serialized = AckReturns.codec(topologies).encode(result)
@@ -69,8 +67,9 @@ class CoramaController(
 				request.partitions.toList.traverse { partitionEnvs =>
 					partitionEnvs.envs.toList.traverse { env =>
 						env.items.toList.traverse { item =>
-							val vid: VarId = ???
-							vid.codec.decode(item.value.toByteArray()).map(vid -> _)
+							topology.builder.vars.lookup(item.varId).flatMap { v =>
+								v.codec.decode(item.value.toByteArray()).map(v.vid -> _)
+							}
 						}.map(_.toMap)
 					}.map { envs =>
 						val edgeId = EdgeId(partitionEnvs.edgeId)

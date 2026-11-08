@@ -11,6 +11,7 @@ import flogger.*
 import cats.effect.SyncIO
 import cats.effect.std.Random
 import scala.util.control.NoStackTrace
+import corama.server.ClusterConfig
 
 trait SyncIOLogging {
 	protected implicit val logOutputSyncIO: LogOutput[SyncIO] = LogOutput[SyncIO](this.getClass)
@@ -31,7 +32,7 @@ class EvalError(msg: String, pos: SourcePos, cause: Throwable) extends RuntimeEx
 
 // stateless logic to eval a set of
 class Eval(
-	metadata: ClusterMetadata,
+	metadata: ClusterConfig,
 	log: Log[IO],
 ) extends IOLogging with SyncIOLogging {
 	import Storage._

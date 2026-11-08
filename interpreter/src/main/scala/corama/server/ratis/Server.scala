@@ -1,6 +1,5 @@
 package corama.server.ratis
 
-// import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder
 import corama.interpreter.IOMap
 import corama.*
 import corama.server.*
@@ -20,28 +19,34 @@ import scala.concurrent.blocking
 import scala.jdk.CollectionConverters.*
 import flogger.Log
 import flogger.IOLogging
-import corama.interpreter.TaskId
 import corama.server.ClusterConfig
+import java.net.InetSocketAddress
+import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder
+import corama.ActiveResource
+import cats.data.NonEmptyList
+import corama.error.Util
+import corama.interpreter.SpeculativeState
+import corama.interpreter.IncomingEvalRouter
 
 class Server(
 	val raft: RaftServer,
 	val client: ClusterClient,
-	val proposers: IOMap[TaskId, LocalProposer],
-	val divisions: IOMap[TaskId, RaftServer.Division],
 )
 
 object Server extends IOLogging {
-	def running(config: ClusterConfig, instance: ClusterInstance)(using log: Log[IO]) = {
+	def running(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance)(using log: Log[IO]) = {
 		val storagePath = Path(s"${config.dataRoot}/node-${instance.id.id}")
+
+		val res: Resource[IO, (Server, IO[Nothing])] =
 		for {
 			networkConfig <- Resource.eval(config.networkConfig.getIO(instance.id))
 			_ <- Resource.eval(log.debug(s"Creating $storagePath"))
 			_ <- Resource.eval(Files.forIO.createDirectories(storagePath))
-			instanceGroups <- Resource.eval(instance.tasks.traverse { taskId =>
-				IO.fromTry(config.raftGroup(taskId).map { group =>
-					(taskId, group, new StateMachine(taskId))
-				})
-			})
+
+			client <- ClusterClient(config)
+
+			firstGroup <- Resource.eval(IO.fromTry(config.raftGroup(instance.tasks.head)))
+
 			props = {
 				val props = new RaftProperties()
 				GrpcConfigKeys.Server.setPort(props, networkConfig.port)
@@ -49,32 +54,57 @@ object Server extends IOLogging {
 				RaftServerConfigKeys.setStorageDir(props, List(storagePath.toNioPath.toFile()).asJava)
 				props
 			}
-			stateMachineMap = instanceGroups.map { (_, group, sm) => group.getGroupId() -> sm }.toList.toMap
+
+			stateMachineMap = IOMap(instance.tasks.map(task => (config.groupId(task), new StateMachine(task))))
 			server <- Resource.fromAutoCloseable(IO(RaftServer.newBuilder()
 				.setServerId(instance.peerId)
-				.setGroup(instanceGroups.head._2)
+				.setGroup(firstGroup)
 				.setProperties(props)
-				.setStateMachineRegistry(groupId => stateMachineMap.getOrElse(groupId, {
-					throw new RuntimeException(s"Unknown group: ${groupId}")
-				}))
+				.setStateMachineRegistry(groupId => stateMachineMap.get(groupId).toTry.get)
 				.build()
 			))
-			proposers <- Resource.eval(instanceGroups.traverse { (task, group, _) =>
-				LocalProposer(server, group.getGroupId()).map(task -> _)
-			})
-			divisions = instance.tasks.map { taskId =>
-				(taskId, server.getDivision(config.groupId(taskId)))
+
+			taskResources <- instance.tasks.traverse { taskId =>
+				val groupId = config.groupId(taskId)
+				for {
+					stateMachine <- Resource.eval(IO.fromEither(stateMachineMap.get(groupId)))
+					speculativeState = new SpeculativeState(StateMachine.view(stateMachine))
+					proposer <- Resource.eval(LocalProposer(server, groupId))
+					(serverTask, bg) <- ServerTask.resource(
+						instance.id,
+						taskId,
+						topologies,
+						client,
+						new RatisRepLog(proposer),
+						speculativeState,
+						config,
+						new RatisTaskLeadership(server.getDivision(config.groupId(taskId))),
+						identity[IncomingEvalRouter](???),
+						maxInFlight = 10
+					).resource
+				} yield (
+					(taskId, serverTask), // serverTask KV
+					bg
+				)
 			}
+			taskResourcesBg = taskResources.parTraverse(_.last) *> Util.neverReached
+			
 			_ <- Resource.eval(log.info(s"Starting server on ${networkConfig}"))
-			_ <- Resource.eval(IO.blocking(server.start()))
+			_ <- Resource.eval(IO.blocking {
+				server.start()
+			})
 
-			// Note: client only used in setup, so `use` instead of nesting the resource
-			// (a resource would stay active until the server gets released)
-			client <- ClusterClient(config)
+			// server builder only takes one group; must add the rest after startup
 			_ <- Resource.eval(joinGroups(client, instance))
+			
+			serverTaskMap = IOMap(taskResources.map(_._1))
+			controller = new CoramaController(config, topologies, serverTaskMap)
 
-			// setGroup only registers one group; must add the rest after startup
-		} yield new Server(server, client, IOMap(proposers), IOMap(divisions))
+			_ <- grpcServer(networkConfig.bindGrpcSocket, controller)
+
+		} yield (new Server(server, client), taskResourcesBg)
+		
+		ActiveResource(res)
 	}
 
 	// add any groups not already registered (e.g. recovered from storage on restart)
@@ -91,19 +121,24 @@ object Server extends IOLogging {
 		}
 	}
 
-	def runningCluster(config: ClusterConfig)(using log: Log[IO]) = {
-		config.instances.parTraverse { instance =>
+	def runningCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, NonEmptyList[Server]] = {
+		val resources = config.instances.parTraverse { instance =>
 			val instanceLog = log.addContext("instance" -> instance.id.id.toString())
-			running(config, instance)(using instanceLog)
+			running(config, topologies, instance)(using instanceLog).resource
 		}
+		ActiveResource(resources.map { tuples =>
+			(tuples.map(_._1), tuples.map(_._2).parSequence *> Util.neverReached)
+		})
 	}
 	
-	// private def grpcService: Resource[streamdsl.rpc.CoramaFs2Grpc] = {
-	// 	NettyServerBuilder
-	// 		.forPort(9999)
-	// 		.addService(service)
-	// 		.resource[IO]
-	// 		.evalMap(server => IO(server.start()))
-	// 		.useForever
-	// }
+	private def grpcServer(address: InetSocketAddress, controller: CoramaController): Resource[IO, io.grpc.Server] = {
+		import fs2.grpc.syntax.all._
+		streamdsl.rpc.CoramaNodeFs2Grpc.bindServiceResource(controller).flatMap { service =>
+			NettyServerBuilder
+				.forAddress(address)
+				.addService(service)
+				.resource[IO]
+				.evalMap(server => IO(server.start()))
+		}
+	}
 }

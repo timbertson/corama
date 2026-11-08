@@ -16,6 +16,9 @@ import corama.interpreter.TaskId
 import cats.effect.SyncIO
 import corama.interpreter.Partitioned
 import corama.PartitionId
+import corama.interpreter.PStateView
+import corama.interpreter.PStateKey
+import corama.SelectOptions.Raw
 
 
 object Keyspace {
@@ -54,7 +57,7 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 
 	// private var db: Option[RocksDb] = None
 
-	private def rocks: RocksDb = db.getOrElse(throw new IllegalStateException("StateMachine not initialized"))
+	private[corama] def rocks: RocksDb = db.getOrElse(throw new IllegalStateException("StateMachine not initialized"))
 
 	override def initialize(server: RaftServer, group: RaftGroupId, raftStorage: RaftStorage): Unit = {
 		super.initialize(server, group, raftStorage)
@@ -112,5 +115,12 @@ object StateMachine {
 		val pstateWrites = update.pstateUpdates.map(up => up.key.raw.raw -> up.value)
 		val meta = Keyspace.applyOffsetKey -> Some(Codec.forLong.encode(index))
 		(depotWrites ++ pstateWrites).toVector :+ meta
+	}
+
+	def view(sm: StateMachine): PStateView = new PStateView {
+
+		override def get(key: PStateKey): SyncIO[Option[Bytes]] = sm.rocks.get(key.raw.raw)
+
+		override def select(key: PStateKey, options: Raw): SyncIO[Vector[Bytes]] = ???
 	}
 }
