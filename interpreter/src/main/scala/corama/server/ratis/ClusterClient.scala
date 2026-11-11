@@ -24,7 +24,7 @@ case class GroupClient(raft: RaftClient, group: RaftGroup)
 
 class RatisClusterClient(
 	val raftClients: IOMap[TaskId, GroupClient],
-	val instanceClients: IOMap[InstanceId, rpc.CoramaNodeFs2Grpc[IO, Metadata]],
+	val instanceClients: IOMap[InstanceId, rpc.CoramaInstanceFs2Grpc[IO, Metadata]],
 ) extends ClusterClient {
 	def invokeRaft(taskId: TaskId)(block: GroupClient => IO[RaftClientReply]): IO[RaftClientReply] = {
 		raftClients.use(taskId)(block).flatMap { reply =>
@@ -32,7 +32,7 @@ class RatisClusterClient(
 		}
 	}
 	
-	def invokeGrpc[A](instanceId: InstanceId)(block: rpc.CoramaNodeFs2Grpc[IO, Metadata] => IO[A]) = {
+	def invokeGrpc[A](instanceId: InstanceId)(block: rpc.CoramaInstanceFs2Grpc[IO, Metadata] => IO[A]) = {
 		instanceClients.use(instanceId)(block)
 	}
 }
@@ -48,7 +48,7 @@ object RatisClusterClient extends IOLogging {
 			instanceClients <- config.instances.parTraverse { instance =>
 				Resource.eval(IO.fromTry(config.networkConfig.get(instance.id))).flatMap { nc =>
 					GrpcChannel(nc.advertisedAddress, nc.grpcPort).map { channel =>
-						rpc.CoramaNodeFs2Grpc.stub(dispatcher, channel)
+						rpc.CoramaInstanceFs2Grpc.stub(dispatcher, channel)
 					}
 				}.map(instance.id -> _)
 			}

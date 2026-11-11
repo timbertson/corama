@@ -28,12 +28,12 @@ import corama.internal.NodeId
 import streamdsl.rpc.NotifyRequest
 import corama.interpreter.IncomingEvalRouter
 
-class CoramaController(
+class InstanceController(
 	config: ClusterConfig,
 	topologies: Topologies,
 	incomingEvalRouter: IncomingEvalRouter,
 	tasks: IOMap[TaskId, ServerTask],
-) extends streamdsl.rpc.CoramaNodeFs2Grpc[IO, Metadata] {
+) extends streamdsl.rpc.CoramaInstanceFs2Grpc[IO, Metadata] {
 	private def requireLeader(id: TaskId): IO[ServerTask] = tasks.use(id) { serverTask =>
 		serverTask.requireLeader.as(serverTask)
 	}

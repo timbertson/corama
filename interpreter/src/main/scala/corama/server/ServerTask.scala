@@ -80,7 +80,7 @@ final class ServerTask private[server] (
 	speculative: SpeculativeState,
 	clusterClient: ClusterClient,
 	replog: RepLog,
-	leadership: TaskLeadership,
+	leadership: InstanceTaskLeadership,
 	receivers: IncomingEvalRouter,
 	topologies: Topologies,
 	evaluator: Eval,
@@ -376,7 +376,7 @@ object ServerTask {
 		speculative: SpeculativeState,
 		
 		metadata: ClusterConfig,
-		taskLeadership: TaskLeadership,
+		taskLeadership: InstanceTaskLeadership,
 		evalRouter: IncomingEvalRouter,
 
 		maxInFlight: Int = 16,

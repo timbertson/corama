@@ -17,7 +17,7 @@ service Corama {
 // CoramaNode implementations are identity-aware. Requests are
 // sent to a specific instance, and will be rejected if that instance
 // is not the active leader for that partition / task.
-service CoramaNode {
+service CoramaInstance {
 	rpc Append(AppendRequest) returns (Response);
 	rpc Query(QueryRequest) returns (Response);
 	

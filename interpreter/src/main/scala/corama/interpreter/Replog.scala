@@ -25,8 +25,8 @@ trait RepLog {
 	// Note: not correct if the given TX's `propose` is still pending on this replog
 	def isCommitted(txId: TxId): IO[Boolean]
 
-	// current leader, if known
-	def leader: IO[Option[InstanceId]]
+	// // current leader, if known
+	// def leader: IO[Option[InstanceId]]
 
 	// consumed to drive the stream. TODO: is this necessary?
 	def appliedOffsets: Stream[IO, LogIndex]
@@ -57,9 +57,10 @@ final class InMemoryRepLog(
 	private val log = Ref.unsafe[IO, Vector[(LogIndex, ReplicationUpdate)]](Vector.empty)
 	private val appliedRef = Ref.unsafe[IO, LogIndex](LogIndex(-1L))
 	private val committedTx = Ref.unsafe[IO, Set[TxId]](Set.empty)
+	private val taskLeadership = group.leadership(instanceId)
 
-	private def requireLeader: IO[Unit] = group.state.get.flatMap { state =>
-		IO.raiseUnless(state.leader === Some(instanceId))(NotLeader(state.leader))
+	private def requireLeader: IO[Unit] = taskLeadership.currentLeader.flatMap { leader =>
+		IO.raiseUnless(leader.contains(instanceId))(NotLeader(leader))
 	}
 
 	// TODO: reuse OpenBatch handling from ratis backend
@@ -85,8 +86,6 @@ final class InMemoryRepLog(
 	}.foreverM
 
 	def isCommitted(txId: TxId): IO[Boolean] = committedTx.get.map(_.contains(txId))
-
-	def leader: IO[Option[InstanceId]] = group.state.get.map(_.leader)
 
 	def appliedOffsets: Stream[IO, LogIndex] = {
 		Stream.fromQueueUnterminated(appliedOffsetsQueue)

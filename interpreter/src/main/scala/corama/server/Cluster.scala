@@ -20,7 +20,7 @@ object Cluster {
 	def inMemoryCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, InMemoryClusterClient] = {
 		val res = for {
 			groups <- Resource.eval(config.tasks.traverse { taskId =>
-				(InMemoryGroup.apply).map(taskId -> _)
+				InMemoryGroup(taskId).map(taskId -> _)
 			}.map(IOMap.apply))
 
 			clusterClient <- Resource.eval(ClusterClient.inMemory(groups))

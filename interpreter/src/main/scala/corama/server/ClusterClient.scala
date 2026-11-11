@@ -6,26 +6,26 @@ import io.grpc.Metadata
 import corama.interpreter.IOMap
 import cats.effect.Ref
 import corama.interpreter.TaskId
-import streamdsl.rpc.CoramaNodeFs2Grpc
+import streamdsl.rpc.CoramaInstanceFs2Grpc
 
 trait ClusterClient {
-	def invokeGrpc[A](instanceId: InstanceId)(block: rpc.CoramaNodeFs2Grpc[IO, Metadata] => IO[A]): IO[A]
+	def invokeGrpc[A](instanceId: InstanceId)(block: rpc.CoramaInstanceFs2Grpc[IO, Metadata] => IO[A]): IO[A]
 }
 
 object ClusterClient {
 	def inMemory(
 		groups: IOMap[TaskId, InMemoryGroup],
 	): IO[InMemoryClusterClient] = for {
-		instances <- Ref[IO].of(IOMap.empty[InstanceId, CoramaController])
+		instances <- Ref[IO].of(IOMap.empty[InstanceId, InstanceController])
 	} yield new InMemoryClusterClient(groups, instances)
 }
 
 class InMemoryClusterClient(
 	groups: IOMap[TaskId, InMemoryGroup],
-	instances: Ref[IO, IOMap[InstanceId, CoramaController]],
+	instances: Ref[IO, IOMap[InstanceId, InstanceController]],
 ) extends ClusterClient {
-	def setInstances(updated: IOMap[InstanceId, CoramaController]): IO[Unit] = instances.set(updated)
-	override def invokeGrpc[A](instanceId: InstanceId)(block: CoramaNodeFs2Grpc[IO, Metadata] => IO[A]): IO[A] = {
+	def setInstances(updated: IOMap[InstanceId, InstanceController]): IO[Unit] = instances.set(updated)
+	override def invokeGrpc[A](instanceId: InstanceId)(block: CoramaInstanceFs2Grpc[IO, Metadata] => IO[A]): IO[A] = {
 		instances.get.flatMap(_.use(instanceId)(block))
 	}
 	

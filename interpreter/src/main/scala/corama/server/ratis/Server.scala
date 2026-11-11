@@ -40,7 +40,7 @@ class RatisServer(val instanceId: InstanceId, val server: RaftServer, val client
 object Server extends IOLogging {
 	class InMemoryServer(
 		val instanceId: InstanceId,
-		val controller: CoramaController,
+		val controller: InstanceController,
 	) extends Server
 
 	def inMemory(
@@ -55,7 +55,7 @@ object Server extends IOLogging {
 				for {
 					pstate <- Resource.eval(PStateView.inMemory)
 					speculativeState = new SpeculativeState(pstate)
-					group <- Resource.eval(InMemoryGroup.apply)
+					group <- Resource.eval(InMemoryGroup(taskId))
 					replog = RepLog.inMemory(instance.id, group)
 					proposer = group.proposer(instance.id)
 					(serverTask, bg) <- ServerTask.resource(
@@ -76,7 +76,7 @@ object Server extends IOLogging {
 				)
 			}
 			serverTaskMap = IOMap(taskResources.map(_._1))
-			controller = new CoramaController(config, topologies, incomingEvalRouter, serverTaskMap)
+			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
 			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
 			server = new InMemoryServer(instance.id, controller)
 		} yield (server, bg)
@@ -130,7 +130,7 @@ object Server extends IOLogging {
 						new RatisRepLog(proposer),
 						speculativeState,
 						config,
-						new RatisTaskLeadership(server.getDivision(config.groupId(taskId))),
+						new RatisTaskLeadership(taskId, server.getDivision(config.groupId(taskId))),
 						incomingEvalRouter,
 						maxInFlight = 10
 					).resource
@@ -150,7 +150,7 @@ object Server extends IOLogging {
 			_ <- Resource.eval(joinGroups(client, instance))
 			
 			serverTaskMap = IOMap(taskResources.map(_._1))
-			controller = new CoramaController(config, topologies, incomingEvalRouter, serverTaskMap)
+			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
 
 			_ <- grpcServer(networkConfig.bindGrpcSocket, controller)
 
@@ -174,9 +174,9 @@ object Server extends IOLogging {
 	}
 
 	
-	private def grpcServer(address: InetSocketAddress, controller: CoramaController): Resource[IO, io.grpc.Server] = {
+	private def grpcServer(address: InetSocketAddress, controller: InstanceController): Resource[IO, io.grpc.Server] = {
 		import fs2.grpc.syntax.all._
-		streamdsl.rpc.CoramaNodeFs2Grpc.bindServiceResource(controller).flatMap { service =>
+		streamdsl.rpc.CoramaInstanceFs2Grpc.bindServiceResource(controller).flatMap { service =>
 			NettyServerBuilder
 				.forAddress(address)
 				.addService(service)
