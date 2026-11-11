@@ -15,6 +15,7 @@ class IOMap[K,V](val inner: Map[K, V]) {
 }
 
 object IOMap {
+	def empty[K, V]: IOMap[K,V] = new IOMap(Map.empty[K, V])
 	def apply[K, V](map: Map[K,V]): IOMap[K,V] = new IOMap(map)
 	def apply[K, V](map: NonEmptyList[(K,V)]): IOMap[K,V] = new IOMap(map.toList.toMap)
 }

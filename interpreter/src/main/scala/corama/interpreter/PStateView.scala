@@ -7,10 +7,15 @@ import corama.interpreter.*
 import corama.server.Keyspace
 
 import scala.annotation.unused
+import cats.effect.IO
 
 trait PStateView {
 	def get(key: PStateKey): SyncIO[Option[Bytes]]
 	def select(key: PStateKey, options: SelectOptions.Raw): SyncIO[Vector[Bytes]]
+}
+
+object PStateView {
+	def inMemory: IO[PStateView] = ???
 }
 
 // an encoded, prefixed key composed of (partition, pstate, key)

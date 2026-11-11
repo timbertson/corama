@@ -10,6 +10,7 @@ import cats.effect.SyncIO
 import corama.internal.NodeId
 import com.google.protobuf.ByteString
 import corama.server.ServerTask
+import cats.data.NonEmptyList
 
 // A mutable snapshot collecting updates (and serving a view), used for a single eval batch
 // Unsafe (mutation), must not be accessed concurrently
@@ -59,16 +60,10 @@ object EvalState {
 
 		def notifications: Seq[(Origin, EvalNotification)] = notificationBuffer.toSeq
 
-		def addNotification(source: EvalSource, edge: EdgeId, values: List[Any], agg: Agg[?]): SyncIO[Unit] =
+		def addNotification(source: EvalSource, edge: EdgeId, values: Option[NonEmptyList[Any]], agg: Agg[?]): SyncIO[Unit] =
 			source match {
 				case origin: Origin => SyncIO {
-					val updated = notificationBuffer.get(origin) match {
-						// TODO this always sends Agg.zero for edge notifications, seems unnecessary?
-						case None => EvalNotification(edge, values.foldLeft(agg.zero)(agg.combineAny), agg)
-
-						// agg and codec must be equivalent for given origin, so we can ignore them
-						case Some(current) => current.merge(edge, values)
-					}
+					val updated = EvalNotification.merge(notificationBuffer.get(origin), edge, values, agg.asAny)
 					notificationBuffer.put(origin, updated)
 				}.void
 
@@ -77,7 +72,8 @@ object EvalState {
 				// TODO this seems like a roundabout way to return values. Could we return them
 				// from Eval directly?
 				case local: LocalEvalSink[?] => SyncIO {
-					localResultsBuffer.addOne((local.asInstanceOf[LocalEvalSink[Any]], edge, values))
+					// TODO should this store List or Option[Nel]?
+					localResultsBuffer.addOne((local.asAny, edge, values.fold(Nil)(_.toList)))
 				}
 			}
 		
@@ -101,9 +97,26 @@ object EvalState {
 }
 
 
-case class EvalNotification(edge: EdgeId, value: Any, agg: Agg[?]) {
-	def merge(newEdge: EdgeId, newValue: List[Any]) = {
-		copy(edge = edge.xor(newEdge), value = newValue.foldLeft(value)(agg.combineAny))
+case class EvalNotification(edge: EdgeId, value: Option[Any], agg: Agg[Any]) {
+	def merge(newEdge: EdgeId, newValue: Option[NonEmptyList[Any]]) = {
+		copy(edge = edge.xor(newEdge), value = EvalNotification.mergeAgg(agg, value, newValue))
+	}
+}
+
+object EvalNotification {
+	def merge(current: Option[EvalNotification], edge: EdgeId, value: Option[NonEmptyList[Any]], agg: Agg[Any]) = {
+		current.fold(
+			EvalNotification(edge = edge, value = mergeAgg(agg, None, value), agg = agg)
+		) { current =>
+			// agg / codec must be equivalent for given origin, so we can ignore them
+			current.copy(edge = current.edge.xor(edge), value = mergeAgg(agg, current.value, value))
+		}
+	}
+
+	private def mergeAgg[A](agg: Agg[A], current: Option[A], values: Option[NonEmptyList[A]]): Option[A] = {
+		values.fold(current) { nel =>
+			Some(nel.foldLeft(current.getOrElse(agg.zero))(agg.combineAny))
+		}
 	}
 }
 
@@ -112,7 +125,7 @@ case class EvalContinuation(
 	origin: Origin,
 	topologyId: TopologyId,
 	afterNode: NodeId,
-	partitions: List[Partitioned[(EdgeId, List[Env])]]
+	partitions: NonEmptyList[Partitioned[(EdgeId, NonEmptyList[Env])]]
 )
 
 object EvalContinuation {
@@ -122,12 +135,12 @@ object EvalContinuation {
 		origin = Some(rpc.EvalOrigin.of(instanceId = c.origin.instanceId.id, evalId = c.origin.evalId.id)),
 		topologyId = c.topologyId.value,
 		afterNode = c.afterNode.id,
-		partitions = c.partitions.map { t =>
+		partitions = c.partitions.toList.map { t =>
 			val (edge, envs) = t.value
 			rpc.PartitionEnvs.of(
 				partitionId = t.partition.id,
 				edgeId = edge.id,
-				envs = envs.map { env =>
+				envs = envs.toList.map { env =>
 					rpc.Env.of(
 						items = env.toList.map { (key, value) =>
 							rpc.EnvItem.of(varId = key.id, value = ByteString.copyFrom(key.codec.asAny.encode(value)))

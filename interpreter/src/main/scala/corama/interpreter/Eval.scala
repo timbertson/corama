@@ -9,24 +9,13 @@ import org.tpolecat.sourcepos.SourcePos
 
 import flogger.*
 import cats.effect.SyncIO
-import cats.effect.std.Random
 import scala.util.control.NoStackTrace
 import corama.server.ClusterConfig
+import cats.data.NonEmptyList
 
 trait SyncIOLogging {
 	protected implicit val logOutputSyncIO: LogOutput[SyncIO] = LogOutput[SyncIO](this.getClass)
 }
-
-// EvalId is dynamically minted each time we perform a fanout
-case class EvalId(id: Long) extends HexId {
-	override def toString(): String = s"EvalId($hex)"
-}
-
-object EvalId {
-	def generate(using rand: Random[SyncIO]): SyncIO[EvalId] = rand.nextLong.map(EvalId.apply)
-}
-
-case class Partitioned[A](partition: PartitionId, value: A)
 
 class EvalError(msg: String, pos: SourcePos, cause: Throwable) extends RuntimeException(s"$msg defined at $pos", cause) with NoStackTrace
 
@@ -46,7 +35,7 @@ class Eval(
 		partitionId: PartitionId,
 		evalState: EvalState,
 		topology: Topology[?, R],
-		envs: List[Env],
+		envs: NonEmptyList[Env],
 	): SyncIO[Unit] = {
 			this.continue(
 				results,
@@ -68,7 +57,7 @@ class Eval(
 		evalState: EvalState,
 		edgeId: EdgeId,
 		continuation: Continuation,
-		envs: List[Env],
+		envs: NonEmptyList[Env],
 	): SyncIO[Unit] = {
 		// TODO: skip if not debug?
 		val origin = source.origin
@@ -94,10 +83,10 @@ class Eval(
 		evalState: EvalState,
 		edgeId: EdgeId,
 		continuation: Continuation,
-		envs: List[Env],
+		envs: NonEmptyList[Env],
 		log: Log[SyncIO],
 	): SyncIO[Unit] = {
-		def continueTopology(nodes: List[Node], envs: List[Env], nextEdgeId: EdgeId = edgeId) =
+		def continueTopology(nodes: List[Node], envs: NonEmptyList[Env], nextEdgeId: EdgeId = edgeId) =
 			// supplies args that don't change
 			continueInner(source, topologyId, partitionId, evalState, nextEdgeId, continuation, envs, log)
 
@@ -106,33 +95,36 @@ class Eval(
 
 		continuation.nodes match {
 			case Nil =>
-				evalState.outputs.addNotification(source, edgeId, envs.map(_(continuation.output)), continuation.agg)
+				evalState.outputs.addNotification(source, edgeId, Some(envs.map(_(continuation.output))), continuation.agg)
 
 			case node :: tail => {
 				log.debug(s"Executing node: ${node}") *>
 				(node.op match {
 					case Node.Dynamic(pos, ins, fn, op) => {
-						val results = try {
+						val results: Option[NonEmptyList[Env]] = try {
 							op match {
 								case DynamicOp.Map(out) =>
-									envs.map(env => env.updated(out, fn(ins.map(env(_)))))
+									Some(envs.map(env => env.updated(out, fn(ins.map(env(_))))))
 								case DynamicOp.Explode(out) =>
 									// in each env, `in` holds an `A`
 									// `fn` takes A and yields a Seq of values.
 									// we expand each of these into `out` in a
 									// copy of the parent env
-									envs.flatMap { env =>
-										fn(ins.map(env(_))).asInstanceOf[Seq[?]].toList.map { value =>
-											env.updated(out, value)
+									envs.flatTraverse { env =>
+										val seq = fn(ins.map(env(_))).asInstanceOf[Seq[?]]
+										NonEmptyList.fromList(seq.toList).map { nel =>
+											nel.map { value =>
+												env.updated(out, value)
+											}
 										}
 									}
 								case DynamicOp.Filter(_) =>
-									envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean])
+									NonEmptyList.fromList(envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean]))
 							}
 						} catch {
 							case e => throw new EvalError(s"Error evaluating node", pos, e)
 						}
-						continueTopology(tail, results)
+						results.traverse_(continueTopology(tail, _))
 					}
 
 					case Node.Assign(in, out) =>
@@ -145,9 +137,9 @@ class Eval(
 						// TODO: is single-exec batching even useful? We should batch multiple appends instead
 						envs.traverse_ { env =>
 							if (env(cond).asInstanceOf[Boolean]) {
-								continueTopology(ifBranch ++ tail, List(env))
+								continueTopology(ifBranch ++ tail, NonEmptyList.one(env))
 							} else {
-								continueTopology(elseBranch ++ tail, List(env))
+								continueTopology(elseBranch ++ tail, NonEmptyList.one(env))
 							}
 						}
 
@@ -157,7 +149,7 @@ class Eval(
 						started in parallel. The result notification of this edge being complete is
 						combined (via xor) with the opening of all fanout edges at once.
 						*/
-						val taskPartitions = metadata.partitionBatches(envs, env => env(in)).toList
+						val taskPartitions = metadata.partitionBatches(envs, env => env(in))
 						for {
 							origin <- source match {
 								case remote: Origin => SyncIO.pure(remote)
@@ -179,7 +171,7 @@ class Eval(
 							_ <- evalContinuations.traverse_(evalState.outputs.addContinuation)
 
 							closeOriginAndOpenChildren = spawnedEdges.foldLeft(edgeId)(_.xor(_))
-							_ <- evalState.outputs.addNotification(origin, closeOriginAndOpenChildren, Nil, continuation.agg)
+							_ <- evalState.outputs.addNotification(origin, closeOriginAndOpenChildren, None, continuation.agg)
 						} yield ()
 					}
 

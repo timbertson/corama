@@ -25,10 +25,13 @@ import corama.InstanceId
 import corama.interpreter.Partitioned
 import corama.interpreter.EdgeId
 import corama.internal.NodeId
+import streamdsl.rpc.NotifyRequest
+import corama.interpreter.IncomingEvalRouter
 
 class CoramaController(
 	config: ClusterConfig,
 	topologies: Topologies,
+	incomingEvalRouter: IncomingEvalRouter,
 	tasks: IOMap[TaskId, ServerTask],
 ) extends streamdsl.rpc.CoramaNodeFs2Grpc[IO, Metadata] {
 	private def requireLeader(id: TaskId): IO[ServerTask] = tasks.use(id) { serverTask =>
@@ -51,11 +54,17 @@ class CoramaController(
 	}
 
 	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = ???
-	
-	private def require[A](name: String, v: Option[A]): IO[A] =
-		IO.fromEither(v.toRight(new RuntimeException(s"Missing property: $name")))
 
+	override def notify(request: NotifyRequest, ctx: Metadata): IO[Empty] = {
+		incomingEvalRouter.invoke(
+			EvalId(request.evalId),
+			EdgeId(request.edge),
+			request.value.map(_.toByteArray())
+		).as(Empty())
+	}
+	
 	override def continue(request: ContinueRequest, ctx: Metadata): IO[Empty] = {
+		import Util.*
 		val topologyId = TopologyId(request.topologyId)
 		val taskId = TaskId(request.taskId)
 		for {
@@ -64,17 +73,21 @@ class CoramaController(
 			originProto <- require("origin", request.origin)
 			origin = Origin(InstanceId(originProto.instanceId), EvalId(originProto.evalId))
 			partitions <- IO.fromTry {
-				request.partitions.toList.traverse { partitionEnvs =>
-					partitionEnvs.envs.toList.traverse { env =>
-						env.items.toList.traverse { item =>
-							topology.builder.vars.lookup(item.varId).flatMap { v =>
-								v.codec.decode(item.value.toByteArray()).map(v.vid -> _)
+				requireNel("partitions", request.partitions.toList).flatMap { partitions =>
+					partitions.traverse { partitionEnvs =>
+						requireNel("partitionEnvs", partitionEnvs.envs.toList).flatMap { envs =>
+							envs.traverse { env =>
+								env.items.toList.traverse { item =>
+									topology.builder.vars.lookup(item.varId).flatMap { v =>
+										v.codec.decode(item.value.toByteArray()).map(v.vid -> _)
+									}
+								}.map(_.toMap)
+							}.map { envs =>
+								val edgeId = EdgeId(partitionEnvs.edgeId)
+								val partitionId = PartitionId(partitionEnvs.partitionId)
+								Partitioned(partitionId, (edgeId, envs))
 							}
-						}.map(_.toMap)
-					}.map { envs =>
-						val edgeId = EdgeId(partitionEnvs.edgeId)
-						val partitionId = PartitionId(partitionEnvs.partitionId)
-						Partitioned(partitionId, (edgeId, envs))
+						}
 					}
 				}
 			}

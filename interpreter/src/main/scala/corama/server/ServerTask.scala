@@ -1,5 +1,7 @@
 package corama.server
 
+import scala.concurrent.duration._
+import streamdsl.rpc
 import cats.effect.IO
 import cats.effect.Outcome
 import cats.effect.SyncIO
@@ -24,9 +26,10 @@ import fs2.Stream
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-import corama.server.ratis.ClusterClient
 import io.grpc.Metadata
 import corama.server.TaskCommand.OpCommand
+import com.google.protobuf.ByteString
+import cats.data.NonEmptyList
 
 private[server] sealed trait TaskCommand[A]
 private[server] sealed trait TaskOp[A]
@@ -35,7 +38,7 @@ private[server] object TaskCommand {
 		origin: Origin,
 		topologyId: TopologyId,
 		continuation: Continuation,
-		partitions: List[Partitioned[(EdgeId, List[Env])]],
+		partitions: NonEmptyList[Partitioned[(EdgeId, NonEmptyList[Env])]],
 	) extends TaskCommand[Unit]
 
 	case class OpCommand[A](op: TaskOp[A], reply: Deferred[IO, Try[A]]) extends TaskCommand[A]
@@ -190,7 +193,7 @@ final class ServerTask private[server] (
 									partition,
 									evalState,
 									topology,
-									List(Map(topology.input.vid -> decoded))
+									NonEmptyList.one(Map(topology.input.vid -> decoded))
 								)
 							}
 						}
@@ -250,7 +253,16 @@ final class ServerTask private[server] (
 		// future evaluations on attempting to reach an unavailable origin.
 		// Origins which are still waiting on an evaluation will timeout anyway
 		// TODO: special-case shortcut when origin instance is self?
-		??? // TODO
+		// TODO: retry once when we receive information about a new leader
+		clusterClient.invokeGrpc(origin.instanceId) { instance =>
+			instance.notify(rpc.NotifyRequest.of(
+				evalId = origin.evalId.id,
+				edge = notification.edge.id,
+				value = notification.value.map { v =>
+					ByteString.copyFrom(notification.agg.codec.asAny.encode(v))
+				}
+			), Metadata()).void.timeout(2.seconds)
+		}
 	}
 	
 	private def processOutputsLoop: IO[Nothing] = {

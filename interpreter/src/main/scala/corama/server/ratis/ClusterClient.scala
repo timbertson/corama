@@ -1,5 +1,6 @@
 package corama.server.ratis
 
+import corama.server.ClusterClient
 import streamdsl.rpc
 import corama.interpreter.IOMap
 import cats.syntax.all.*
@@ -21,10 +22,10 @@ import cats.effect.std.Dispatcher
 
 case class GroupClient(raft: RaftClient, group: RaftGroup)
 
-class ClusterClient(
+class RatisClusterClient(
 	val raftClients: IOMap[TaskId, GroupClient],
 	val instanceClients: IOMap[InstanceId, rpc.CoramaNodeFs2Grpc[IO, Metadata]],
-) {
+) extends ClusterClient {
 	def invokeRaft(taskId: TaskId)(block: GroupClient => IO[RaftClientReply]): IO[RaftClientReply] = {
 		raftClients.use(taskId)(block).flatMap { reply =>
 			IO.fromEither(Option(reply.getException()).toLeft(reply))
@@ -36,9 +37,9 @@ class ClusterClient(
 	}
 }
 
-object ClusterClient extends IOLogging {
+object RatisClusterClient extends IOLogging {
 	// one RaftClient per task in a trenchcoat
-	def apply(config: ClusterConfig)(using log: Log[IO]): Resource[IO, ClusterClient] = {
+	def apply(config: ClusterConfig)(using log: Log[IO]): Resource[IO, RatisClusterClient] = {
 		for {
 			dispatcher <- Dispatcher.sequential[IO]
 			raftClients <- config.tasks.parTraverse { task =>
@@ -51,7 +52,7 @@ object ClusterClient extends IOLogging {
 					}
 				}.map(instance.id -> _)
 			}
-		} yield new ClusterClient(IOMap(raftClients), IOMap(instanceClients))
+		} yield new RatisClusterClient(IOMap(raftClients), IOMap(instanceClients))
 	}
 
 	private def groupClient(config: ClusterConfig, taskId: TaskId)(using log: Log[IO]): Resource[IO, GroupClient] = {

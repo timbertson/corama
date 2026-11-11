@@ -64,8 +64,8 @@ class RamaBackend(codecRegistry: CodecRegistry) {
 			}
 		}
 
-		topologies.pstates.foreach { pstate =>
-			val id = compileIdentity(pstate.id)
+		topologies.pstates.foreach { (pstateId, pstate) =>
+			val id = compileIdentity(pstateId)
 			compileSchema(pstate.schema) match {
 				case Left(schema) => streamTopology.pstate(id, schema)
 				case Right(schema) => streamTopology.pstate(id, schema)

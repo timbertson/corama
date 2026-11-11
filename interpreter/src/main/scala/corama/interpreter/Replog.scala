@@ -7,6 +7,7 @@ import cats.syntax.all.*
 import corama.InstanceId
 import fs2.Stream
 import flogger.{Log, IOLogging}
+import corama.server.InMemoryGroup
 
 
 // interfaces used to swap out real server backend for an in-memory one in tests
@@ -47,7 +48,7 @@ object Proposal {
 	*/
 final class InMemoryRepLog(
 	instanceId: InstanceId,
-	leaderRef: Ref[IO, InstanceId],
+	group: InMemoryGroup,
 	onApply: (LogIndex, ReplicationUpdate) => IO[Unit],
 	applyDelay: IO[Unit],
 	pendingApply: Queue[IO, (LogIndex, ReplicationUpdate)],
@@ -57,8 +58,8 @@ final class InMemoryRepLog(
 	private val appliedRef = Ref.unsafe[IO, LogIndex](LogIndex(-1L))
 	private val committedTx = Ref.unsafe[IO, Set[TxId]](Set.empty)
 
-	private def requireLeader: IO[Unit] = leaderRef.get.flatMap { leader =>
-		IO.raiseUnless(leader === instanceId)(NotLeader(Some(leader)))
+	private def requireLeader: IO[Unit] = group.state.get.flatMap { state =>
+		IO.raiseUnless(state.leader === Some(instanceId))(NotLeader(state.leader))
 	}
 
 	// TODO: reuse OpenBatch handling from ratis backend
@@ -84,23 +85,24 @@ final class InMemoryRepLog(
 	}.foreverM
 
 	def isCommitted(txId: TxId): IO[Boolean] = committedTx.get.map(_.contains(txId))
-	def leader: IO[Option[InstanceId]] = leaderRef.get.map(Some(_))
+
+	def leader: IO[Option[InstanceId]] = group.state.get.map(_.leader)
 
 	def appliedOffsets: Stream[IO, LogIndex] = {
 		Stream.fromQueueUnterminated(appliedOffsetsQueue)
 	}
 }
 
-object InMemoryRepLog {
-	def apply(
+object RepLog {
+	def inMemory(
 		instanceId: InstanceId,
-		onApply: (LogIndex, ReplicationUpdate) => IO[Unit],
+		group: InMemoryGroup,
+		onApply: (LogIndex, ReplicationUpdate) => IO[Unit] = (_, _) => IO.unit,
 		applyDelay: IO[Unit] = IO.unit,
 	)(using Log[IO]): IO[InMemoryRepLog] = {
 		for {
-			leaderRef <- Ref[IO].of(instanceId) // TODO?
 			pendingApply <- Queue.unbounded[IO, (LogIndex, ReplicationUpdate)]
 			offsets <- Queue.unbounded[IO, LogIndex]
-		} yield new InMemoryRepLog(instanceId, leaderRef, onApply, applyDelay, pendingApply, offsets)
+		} yield new InMemoryRepLog(instanceId, group, onApply, applyDelay, pendingApply, offsets)
 	}
 }

@@ -23,6 +23,7 @@ service CoramaNode {
 	
 	// internal
 	rpc Continue(ContinueRequest) returns (google.protobuf.Empty);
+	rpc Notify(NotifyRequest) returns (google.protobuf.Empty);
 }
 
 message AppendRequest {
@@ -35,6 +36,12 @@ message QueryRequest {
 	string query = 1;
 	bytes value = 2;
 	google.protobuf.Int32Value partition = 3;
+}
+
+message NotifyRequest {
+	int64 evalId = 1;
+	int64 edge = 2;
+	google.protobuf.BytesValue value = 3; // optional, return value
 }
 
 message Response {

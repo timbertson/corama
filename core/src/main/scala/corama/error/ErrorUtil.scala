@@ -2,6 +2,8 @@ package corama.error
 
 import cats.ApplicativeError
 import cats.effect.IO
+import cats.data.NonEmptyList
+import scala.util.Try
 
 object Util {
 	// private [corama] def formatError(e: Throwable) = {
@@ -28,4 +30,12 @@ object Util {
 			E.raiseError(new RuntimeException(desc, e))
 		}
 	}
+	
+	def requireNel[A](desc: String, list: List[A]): Try[NonEmptyList[A]] = {
+		NonEmptyList.fromList(list).toRight(err(s"${desc} is empty")).toTry
+	}
+
+	def require[A](name: String, v: Option[A]): IO[A] =
+		IO.fromEither(v.toRight(new RuntimeException(s"Missing property: $name")))
+
 }

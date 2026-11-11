@@ -20,19 +20,19 @@ class IncomingEvalRouter(slots: Ref[IO, Map[EvalId, LocalEvalSink[Any]]])(using 
 		}
 	}
 	
-	def invoke(origin: Origin, edge: EdgeId, value: Option[Any]): IO[Unit] = {
+	def invoke(evalId: EvalId, edge: EdgeId, value: Option[Bytes]): IO[Unit] = {
 		for {
 			map <- slots.get
-			slot <- map.get(origin.evalId).fold(IO.raiseError(err(s"No slot for ${origin}")))(IO.pure)
+			// TODO: classify as 404
+			slot <- map.get(evalId).fold(IO.raiseError(err(s"No slot for $evalId")))(IO.pure)
 			_ <- slot.notify(edge, value)
 		} yield ()
 	}
 }
 
 object IncomingEvalRouter {
-	def apply: Resource[IO, IncomingEvalRouter] = {
-		val acquire = Ref[IO].of(Map.empty[EvalId, LocalEvalSink[Any]]).map(new IncomingEvalRouter(_))
-		Resource.make(acquire)(_ => IO.unit)
+	def apply: IO[IncomingEvalRouter] = {
+		Ref[IO].of(Map.empty[EvalId, LocalEvalSink[Any]]).map(new IncomingEvalRouter(_))
 	}
 }
 

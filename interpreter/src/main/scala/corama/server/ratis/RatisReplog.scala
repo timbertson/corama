@@ -7,11 +7,7 @@ import corama.interpreter.*
 import flogger.IOLogging
 import flogger.Log
 import fs2.Stream
-import org.apache.ratis.client.RaftClient
-import org.apache.ratis.protocol.Message
 import org.apache.ratis.protocol.exceptions.NotLeaderException
-
-import java.nio.ByteBuffer
 
 /** The ratis backend of [[RepLog]] for one task's group. */
 final class RatisRepLog(proposer: LocalProposer)(using Log[IO]) extends RepLog with IOLogging {

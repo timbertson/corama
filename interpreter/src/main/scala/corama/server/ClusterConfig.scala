@@ -94,10 +94,10 @@ case class ClusterConfig(
 		allPartitions.filter(p => taskFor(p) === task).toList
 	}
 
-	def partitionBatches[A](values: List[A], keyFn: A => Any): List[(TaskId, List[Partitioned[List[A]]])] = {
-		values.groupBy(v => partitionKey(keyFn(v))).toList.map { case (p, items) =>
-			(p, items)
-		}.groupBy(pair => taskFor(pair._1)).toList.map { case (taskId, partitionedList) =>
+	def partitionBatches[A](values: NonEmptyList[A], keyFn: A => Any): NonEmptyList[(TaskId, NonEmptyList[Partitioned[NonEmptyList[A]]])] = {
+		val partitions = values.groupByNem(v => partitionKey(keyFn(v))).toNel
+		val tasks = partitions.groupByNem(pair => taskFor(pair._1)).toNel
+		tasks.map { case (taskId, partitionedList) =>
 			val batch = partitionedList.map { case (partitionId, value) => Partitioned(partitionId, value) }
 			(taskId, batch)
 		}

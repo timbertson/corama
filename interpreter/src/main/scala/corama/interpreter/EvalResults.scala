@@ -100,6 +100,8 @@ private[corama] final class LocalEvalSink[R](
 	acc: Ref[IO, R],
 	done: Deferred[IO, Try[R]],
 ) extends EvalSink[R] with EvalSource with IOLogging {
+	def asAny: LocalEvalSink[Any] = this.asInstanceOf[LocalEvalSink[Any]]
+
 	// NOTE: this can open a new edge, close an edge, or do _both_
 	// (by xoring an open edge with a new edge, the open one is closed
 	// and the new one is opened atomically)

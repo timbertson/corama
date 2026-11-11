@@ -27,23 +27,73 @@ import cats.data.NonEmptyList
 import corama.error.Util
 import corama.interpreter.SpeculativeState
 import corama.interpreter.IncomingEvalRouter
+import corama.interpreter.RepLog
+import corama.interpreter.PStateView
+import corama.server.InMemoryGroup
 
-class Server(
-	val raft: RaftServer,
-	val client: ClusterClient,
-)
+trait Server {
+	def instanceId: InstanceId
+}
+
+class RatisServer(val instanceId: InstanceId, val server: RaftServer, val client: RatisClusterClient) extends Server
 
 object Server extends IOLogging {
-	def running(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance)(using log: Log[IO]) = {
+	class InMemoryServer(
+		val instanceId: InstanceId,
+		val controller: CoramaController,
+	) extends Server
+
+	def inMemory(
+		config: ClusterConfig,
+		topologies: Topologies,
+		clusterClient: InMemoryClusterClient,
+		instance: ClusterInstance
+	)(using log: Log[IO]): ActiveResource[IO, InMemoryServer] = {
+		val res = for {
+			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
+			taskResources <- instance.tasks.traverse { taskId =>
+				for {
+					pstate <- Resource.eval(PStateView.inMemory)
+					speculativeState = new SpeculativeState(pstate)
+					group <- Resource.eval(InMemoryGroup.apply)
+					replog = RepLog.inMemory(instance.id, group)
+					proposer = group.proposer(instance.id)
+					(serverTask, bg) <- ServerTask.resource(
+						instance.id,
+						taskId,
+						topologies,
+						clusterClient,
+						new RatisRepLog(proposer),
+						speculativeState,
+						config,
+						group.leadership(instance.id),
+						incomingEvalRouter,
+						maxInFlight = 10
+					).resource
+				} yield (
+					(taskId, serverTask), // serverTask KV
+					bg
+				)
+			}
+			serverTaskMap = IOMap(taskResources.map(_._1))
+			controller = new CoramaController(config, topologies, incomingEvalRouter, serverTaskMap)
+			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
+			server = new InMemoryServer(instance.id, controller)
+		} yield (server, bg)
+		ActiveResource(res)
+	}
+	
+	def running(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance)(using log: Log[IO]):
+		ActiveResource[IO, Server] =
+	{
 		val storagePath = Path(s"${config.dataRoot}/node-${instance.id.id}")
 
-		val res: Resource[IO, (Server, IO[Nothing])] =
-		for {
+		val res: Resource[IO, (Server, IO[Nothing])] = for {
 			networkConfig <- Resource.eval(config.networkConfig.getIO(instance.id))
 			_ <- Resource.eval(log.debug(s"Creating $storagePath"))
 			_ <- Resource.eval(Files.forIO.createDirectories(storagePath))
 
-			client <- ClusterClient(config)
+			client <- RatisClusterClient(config)
 
 			firstGroup <- Resource.eval(IO.fromTry(config.raftGroup(instance.tasks.head)))
 
@@ -63,6 +113,8 @@ object Server extends IOLogging {
 				.setStateMachineRegistry(groupId => stateMachineMap.get(groupId).toTry.get)
 				.build()
 			))
+			
+			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
 
 			taskResources <- instance.tasks.traverse { taskId =>
 				val groupId = config.groupId(taskId)
@@ -79,7 +131,7 @@ object Server extends IOLogging {
 						speculativeState,
 						config,
 						new RatisTaskLeadership(server.getDivision(config.groupId(taskId))),
-						identity[IncomingEvalRouter](???),
+						incomingEvalRouter,
 						maxInFlight = 10
 					).resource
 				} yield (
@@ -98,17 +150,17 @@ object Server extends IOLogging {
 			_ <- Resource.eval(joinGroups(client, instance))
 			
 			serverTaskMap = IOMap(taskResources.map(_._1))
-			controller = new CoramaController(config, topologies, serverTaskMap)
+			controller = new CoramaController(config, topologies, incomingEvalRouter, serverTaskMap)
 
 			_ <- grpcServer(networkConfig.bindGrpcSocket, controller)
 
-		} yield (new Server(server, client), taskResourcesBg)
+		} yield (new RatisServer(instance.id, server, client), taskResourcesBg)
 		
 		ActiveResource(res)
 	}
 
 	// add any groups not already registered (e.g. recovered from storage on restart)
-	private def joinGroups(client: ClusterClient, instance: ClusterInstance)(using log: Log[IO]): IO[Unit] = {
+	private def joinGroups(client: RatisClusterClient, instance: ClusterInstance)(using log: Log[IO]): IO[Unit] = {
 		log.debug(s"joining additional groups") >>
 		instance.tasks.traverse_ { taskId =>
 			client.invokeRaft(taskId) { client =>
@@ -121,15 +173,6 @@ object Server extends IOLogging {
 		}
 	}
 
-	def runningCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, NonEmptyList[Server]] = {
-		val resources = config.instances.parTraverse { instance =>
-			val instanceLog = log.addContext("instance" -> instance.id.id.toString())
-			running(config, topologies, instance)(using instanceLog).resource
-		}
-		ActiveResource(resources.map { tuples =>
-			(tuples.map(_._1), tuples.map(_._2).parSequence *> Util.neverReached)
-		})
-	}
 	
 	private def grpcServer(address: InetSocketAddress, controller: CoramaController): Resource[IO, io.grpc.Server] = {
 		import fs2.grpc.syntax.all._
