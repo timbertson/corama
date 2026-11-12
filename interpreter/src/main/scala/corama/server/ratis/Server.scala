@@ -1,5 +1,6 @@
 package corama.server.ratis
 
+import streamdsl.rpc
 import corama.interpreter.IOMap
 import corama.*
 import corama.server.*
@@ -83,7 +84,7 @@ object Server extends IOLogging {
 		ActiveResource(res)
 	}
 	
-	def running(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance)(using log: Log[IO]):
+	private [corama] def apply(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance, clusterClient: RatisClusterClient)(using log: Log[IO]):
 		ActiveResource[IO, Server] =
 	{
 		val storagePath = Path(s"${config.dataRoot}/node-${instance.id.id}")
@@ -93,7 +94,6 @@ object Server extends IOLogging {
 			_ <- Resource.eval(log.debug(s"Creating $storagePath"))
 			_ <- Resource.eval(Files.forIO.createDirectories(storagePath))
 
-			client <- RatisClusterClient(config)
 
 			firstGroup <- Resource.eval(IO.fromTry(config.raftGroup(instance.tasks.head)))
 
@@ -126,7 +126,7 @@ object Server extends IOLogging {
 						instance.id,
 						taskId,
 						topologies,
-						client,
+						clusterClient,
 						new RatisRepLog(proposer),
 						speculativeState,
 						config,
@@ -147,14 +147,15 @@ object Server extends IOLogging {
 			})
 
 			// server builder only takes one group; must add the rest after startup
-			_ <- Resource.eval(joinGroups(client, instance))
+			_ <- Resource.eval(joinGroups(clusterClient, instance))
 			
 			serverTaskMap = IOMap(taskResources.map(_._1))
 			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
+			apiController = new ApiController(config, clusterClient)
 
-			_ <- grpcServer(networkConfig.bindGrpcSocket, controller)
+			_ <- grpcServer(networkConfig.bindGrpcSocket, controller, apiController)
 
-		} yield (new RatisServer(instance.id, server, client), taskResourcesBg)
+		} yield (new RatisServer(instance.id, server, clusterClient), taskResourcesBg)
 		
 		ActiveResource(res)
 	}
@@ -173,15 +174,21 @@ object Server extends IOLogging {
 		}
 	}
 
-	
-	private def grpcServer(address: InetSocketAddress, controller: InstanceController): Resource[IO, io.grpc.Server] = {
+	private def grpcServer(
+		address: InetSocketAddress,
+		controller: InstanceController,
+		apiController: ApiController,
+	): Resource[IO, io.grpc.Server] = {
 		import fs2.grpc.syntax.all._
-		streamdsl.rpc.CoramaInstanceFs2Grpc.bindServiceResource(controller).flatMap { service =>
-			NettyServerBuilder
+		for {
+			instanceService <- rpc.CoramaInstanceFs2Grpc.bindServiceResource(controller)
+			apiService <- rpc.CoramaFs2Grpc.bindServiceResource(apiController)
+			server <- NettyServerBuilder
 				.forAddress(address)
-				.addService(service)
+				.addService(instanceService)
+				.addService(apiService)
 				.resource[IO]
-				.evalMap(server => IO(server.start()))
-		}
+			_ <- Resource.eval(IO(server.start()))
+		} yield server
 	}
 }

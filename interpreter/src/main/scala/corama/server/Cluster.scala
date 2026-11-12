@@ -8,13 +8,30 @@ import cats.data.NonEmptyList
 import cats.effect.Resource
 import corama.server.ratis.Server
 import corama.interpreter.IOMap
+import corama.server.ratis.RatisClusterClient
 
 object Cluster {
 	def runningCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, NonEmptyList[Server]] = {
-		ActiveResource.parTraverse(config.instances) { instance =>
-			val instanceLog = log.addContext("instance" -> instance.id.id.toString())
-			Server.running(config, topologies, instance)(using instanceLog)
+		{
+			ActiveResource(for {
+				client <- RatisClusterClient(config)
+				pair <- ActiveResource.parTraverse(config.instances) { instance =>
+					val instanceLog = log.addContext("instance" -> instance.id.id.toString())
+					Server(config, topologies, instance, client)(using instanceLog)
+				}.resource
+			} yield pair)
 		}
+	}
+
+	// standalone server. Use runningCluster when running a full cluster
+	def runningInstance(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance)(using log: Log[IO]):
+		ActiveResource[IO, Server] =
+	{
+		val instanceLog = log.addContext("instance" -> instance.id.id.toString())
+		ActiveResource(for {
+			client <- RatisClusterClient(config)
+			pair <- Server(config, topologies, instance, client)(using instanceLog).resource
+		} yield pair)
 	}
 
 	def inMemoryCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, InMemoryClusterClient] = {

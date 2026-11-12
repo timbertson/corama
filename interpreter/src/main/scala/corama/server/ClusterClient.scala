@@ -10,6 +10,9 @@ import streamdsl.rpc.CoramaInstanceFs2Grpc
 
 trait ClusterClient {
 	def invokeGrpc[A](instanceId: InstanceId)(block: rpc.CoramaInstanceFs2Grpc[IO, Metadata] => IO[A]): IO[A]
+	def currentLeader(task: TaskId): IO[Option[InstanceId]]
+	def requireCurrentLeader(task: TaskId): IO[InstanceId] =
+		InstanceTaskLeadership.requireCurrentLeader(task, currentLeader(task))
 }
 
 object ClusterClient {

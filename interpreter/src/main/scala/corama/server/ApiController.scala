@@ -14,24 +14,28 @@ import streamdsl.rpc.Response
 
 class ApiController(
 	clusterConfig: ClusterConfig,
-	leadership: IOMap[TaskId, InstanceTaskLeadership],
-	instances: IOMap[InstanceId, rpc.CoramaNodeFs2Grpc[IO, Metadata]],
+	clusterClient: ClusterClient,
 ) extends rpc.CoramaFs2Grpc[IO, Metadata] {
+	// TODO: accept requests without an explicit partition
 	override def append(request: AppendRequest, ctx: Metadata): IO[Response] = {
 		delegateTo(request.partition.map(PartitionId.apply)) { instance =>
 			instance.append(request, ctx)
 		}
 	}
 
-	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = ???
+	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = {
+		delegateTo(request.partition.map(PartitionId.apply)) { instance =>
+			instance.query(request, ctx)
+		}
+	}
 	
 	// TODO: retry if group leadership was stale
-	private def delegateTo[A](partition: Option[PartitionId])(block: rpc.CoramaNodeFs2Grpc[IO, Metadata] => IO[A]): IO[A] = {
+	private def delegateTo[A](partition: Option[PartitionId])(block: rpc.CoramaInstanceFs2Grpc[IO, Metadata] => IO[A]): IO[A] = {
 		for {
 			partition <- Util.require("partition", partition)
 			taskId = clusterConfig.taskFor(partition)
-			leader <- leadership.use(taskId)(_.requireCurrentLeader)
-			response <- instances.use(leader)(block)
+			leader <- clusterClient.requireCurrentLeader(taskId)
+			response <- clusterClient.invokeGrpc(leader)(block)
 		} yield response
 	}
 }

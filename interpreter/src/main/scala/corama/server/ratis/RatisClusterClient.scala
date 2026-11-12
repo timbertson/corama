@@ -35,6 +35,14 @@ class RatisClusterClient(
 	def invokeGrpc[A](instanceId: InstanceId)(block: rpc.CoramaInstanceFs2Grpc[IO, Metadata] => IO[A]) = {
 		instanceClients.use(instanceId)(block)
 	}
+	
+	// Note: both RatisClusterGroup and RatisTaskLeadership expose this, but
+	// RatisTaskLeadership is only created for tasks a given server participates in
+	override def currentLeader(taskId: TaskId): IO[Option[InstanceId]] = {
+		raftClients.use(taskId) { client =>
+			IO(RatisTaskLeadership.instanceOfNullableLeader(client.raft.getLeaderId()))
+		}
+	}
 }
 
 object RatisClusterClient extends IOLogging {
