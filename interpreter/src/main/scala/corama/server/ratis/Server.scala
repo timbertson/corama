@@ -57,14 +57,13 @@ object Server extends IOLogging {
 					pstate <- Resource.eval(PStateView.inMemory)
 					speculativeState = new SpeculativeState(pstate)
 					group <- Resource.eval(InMemoryGroup(taskId))
-					replog = RepLog.inMemory(instance.id, group)
-					proposer = group.proposer(instance.id)
+					replog <- Resource.eval(RepLog.inMemory(instance.id, group))
 					(serverTask, bg) <- ServerTask.resource(
 						instance.id,
 						taskId,
 						topologies,
 						clusterClient,
-						new RatisRepLog(proposer),
+						replog,
 						speculativeState,
 						config,
 						group.leadership(instance.id),
@@ -105,7 +104,12 @@ object Server extends IOLogging {
 				props
 			}
 
-			stateMachineMap = IOMap(instance.tasks.map(task => (config.groupId(task), new StateMachine(task))))
+			stateMachines <- Resource.eval {
+				instance.tasks.traverse { task =>
+					StateMachine(task).map(sm => (config.groupId(task), sm))
+				}
+			}
+			stateMachineMap = IOMap(stateMachines)
 			server <- Resource.fromAutoCloseable(IO(RaftServer.newBuilder()
 				.setServerId(instance.peerId)
 				.setGroup(firstGroup)
@@ -116,9 +120,17 @@ object Server extends IOLogging {
 			
 			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
 
-			taskResources <- instance.tasks.traverse { taskId =>
+			_ <- Resource.eval(log.info(s"Starting server on ${networkConfig}"))
+			_ <- Resource.eval(IO.blocking {
+				server.start()
+			})
+
+			// server builder only takes one group; must add the rest after startup
+			_ <- Resource.eval(joinGroups(clusterClient, instance))
+
+			(taskResources, bg) <- ActiveResource.parTraverse(instance.tasks) { taskId =>
 				val groupId = config.groupId(taskId)
-				for {
+				ActiveResource(for {
 					stateMachine <- Resource.eval(IO.fromEither(stateMachineMap.get(groupId)))
 					speculativeState = new SpeculativeState(StateMachine.view(stateMachine))
 					proposer <- Resource.eval(LocalProposer(server, groupId))
@@ -127,7 +139,7 @@ object Server extends IOLogging {
 						taskId,
 						topologies,
 						clusterClient,
-						new RatisRepLog(proposer),
+						new RatisRepLog(proposer, stateMachine),
 						speculativeState,
 						config,
 						new RatisTaskLeadership(taskId, server.getDivision(config.groupId(taskId))),
@@ -137,25 +149,15 @@ object Server extends IOLogging {
 				} yield (
 					(taskId, serverTask), // serverTask KV
 					bg
-				)
-			}
-			taskResourcesBg = taskResources.parTraverse(_.last) *> Util.neverReached
+				))
+			}.resource
 			
-			_ <- Resource.eval(log.info(s"Starting server on ${networkConfig}"))
-			_ <- Resource.eval(IO.blocking {
-				server.start()
-			})
-
-			// server builder only takes one group; must add the rest after startup
-			_ <- Resource.eval(joinGroups(clusterClient, instance))
-			
-			serverTaskMap = IOMap(taskResources.map(_._1))
-			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
+			controller = new InstanceController(config, topologies, incomingEvalRouter, IOMap(taskResources))
 			apiController = new ApiController(config, clusterClient)
 
 			_ <- grpcServer(networkConfig.bindGrpcSocket, controller, apiController)
 
-		} yield (new RatisServer(instance.id, server, clusterClient), taskResourcesBg)
+		} yield (new RatisServer(instance.id, server, clusterClient), bg)
 		
 		ActiveResource(res)
 	}
@@ -178,7 +180,7 @@ object Server extends IOLogging {
 		address: InetSocketAddress,
 		controller: InstanceController,
 		apiController: ApiController,
-	): Resource[IO, io.grpc.Server] = {
+	)(using log: Log[IO]): Resource[IO, io.grpc.Server] = {
 		import fs2.grpc.syntax.all._
 		for {
 			instanceService <- rpc.CoramaInstanceFs2Grpc.bindServiceResource(controller)
@@ -188,6 +190,7 @@ object Server extends IOLogging {
 				.addService(instanceService)
 				.addService(apiService)
 				.resource[IO]
+			_ <- Resource.eval(log.debug(s"starting GRPC service on ${address}"))
 			_ <- Resource.eval(IO(server.start()))
 		} yield server
 	}

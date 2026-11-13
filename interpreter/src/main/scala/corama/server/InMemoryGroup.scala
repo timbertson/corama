@@ -11,7 +11,6 @@ import corama.interpreter.TaskId
 
 
 class InMemoryGroup(private val taskId: TaskId, state: Ref[IO, InMemoryGroup.State]) {
-	def proposer(instance: InstanceId): LocalProposer = ???
 	def currentLeader = state.get.map(_.leader)
 
 	private val group = this

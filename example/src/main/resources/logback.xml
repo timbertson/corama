@@ -10,8 +10,8 @@
 	</root>
 
 	<logger name="corama" level="DEBUG" />
-	<logger name="org.apache.ratis" level="WARN" />
-	<logger name="org.apache.ratis" level="WARN" />
+	<logger name="org.apache.ratis" level="INFO" />
+	<!-- <logger name="org.apache.ratis" level="WARN" /> -->
 	
 	<!-- this one gives a full stacktrace warning for AlreadyExistsException,
 	which we catch and ignore -->

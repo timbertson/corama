@@ -14,7 +14,7 @@ private[corama] class VarRegistry {
 	private var list: Vector[Var[Any]] = Vector.empty
 
 	def add[A](hint: String, tag: Tag[A], codec: Codec[A], pos: SourcePos): Var[A] = {
-		val v = new Var[A](new VarId(list.length, hint, tag.tag), tag, codec, pos)
+		val v = new Var[A](new VarId(list.length, hint, tag.tag, codec.asAny), tag, codec, pos)
 		list = list.appended(v.asAny)
 		v
 	}
@@ -37,7 +37,7 @@ private[corama] final class VarId(
 	private[corama] val id: Int,
 	private[corama] val hint: String,
 	private[corama] val tag: LightTypeTag,
-	private[corama] val codec: AnyCodec = ???,
+	private[corama] val codec: AnyCodec,
 ) {
 	override def equals(other: Any): Boolean = other match {
 		case that: VarId => that.id == id
@@ -146,7 +146,12 @@ object Var {
 	case class Literal[A](value: A, tag: Tag[A]) extends MaybeVar[A]
 
 	// Virtual vars have a unique id < 0 and are never given a Rama name
-	val unit: Var[Unit] = new Var[Unit](new VarId(-2, "unit", implicitly[Tag[Unit]].tag), implicitly[Tag[Unit]], implicitly[Codec[Unit]], implicitly[SourcePos])
+	val unit: Var[Unit] = new Var[Unit](
+		new VarId(-2, "unit", implicitly[Tag[Unit]].tag, implicitly[Codec[Unit]].asAny),
+		implicitly[Tag[Unit]],
+		implicitly[Codec[Unit]],
+		implicitly[SourcePos]
+	)
 
 	private [corama] val internal = SourcePos("internal", 1)
 

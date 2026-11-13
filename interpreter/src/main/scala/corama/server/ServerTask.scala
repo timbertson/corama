@@ -209,7 +209,7 @@ final class ServerTask private[server] (
 		// common logic for append & continue branches in `handle`
 		eval.attempt.to[IO].flatMap {
 			case Right(evalState) =>
-				val txId = ??? : TxId
+				val txId = ??? : LogIndex
 				val update = evalState.toUpdate(txId)
 				// pipeline: block only when the in-flight bound is reached —
 				// the slot is released by the await loop when this proposal resolves

@@ -103,7 +103,8 @@ final class Topologies {
 	def query[S, R](name: String, agg: Agg[R])(
 		block: Var[S] => Flow[R, QueryContext],
 	)(implicit tagS: Tag[S], tagR: Tag[R], codecS: Codec[S], codecR: Codec[R], pos: SourcePos): QueryTopology[S, R] = {
-		QueryTopology(declare[S, R, QueryContext](claim(QueryId(name)), agg, tagS, tagR, pos)(block))
+		val id = claim(QueryId(name))
+		QueryTopology(id, declare[S, R, QueryContext](id, agg, tagS, tagR, pos)(block))
 	}
 
 	/** A stream topology: driven by an append, writes PStates, returns nothing.
@@ -247,7 +248,7 @@ object Continuation {
 }
 
 // wrappers for the different types of topology
-final case class QueryTopology[S, R] private[corama](topology: Topology[S, R])
+final case class QueryTopology[S, R] private[corama](id: QueryId, topology: Topology[S, R])
 
 final case class StreamTopology[S, R] private[corama](topology: Topology[S, R])
 

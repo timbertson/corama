@@ -19,10 +19,11 @@ import cats.Order
 	*/
 type Env = Map[VarId, Any]
 
-case class TxId(value: Long)
-object TxId {
-	implicit val ord: Ordering[TxId] = Ordering.by(_.value)
-	implicit val eq: Eq[TxId] = Eq.by(_.value)
+case class LogIndex(value: Long)
+object LogIndex {
+	val initial = LogIndex(-1)
+	implicit val ord: Ordering[LogIndex] = Ordering.by(_.value)
+	implicit val eq: Eq[LogIndex] = Eq.by(_.value)
 }
 
 // There are `n` tasks in an `n` node setup.
@@ -39,7 +40,7 @@ case class DepotAppend(value: Bytes)
 case class DepotAppends(id: DepotId, updates: Array[Partitioned[DepotAppend]])
 
 case class ReplicationUpdate(
-	id: TxId,
+	id: LogIndex,
 	depotAppends: List[DepotAppends],
 	pstateUpdates: Array[PStateUpdate],
 )

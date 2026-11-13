@@ -72,7 +72,7 @@ lazy val interpreter = (project in file("interpreter")).settings(
     "com.lihaoyi" %% "os-lib" % "0.11.4",
     "org.typelevel" %% "cats-effect-testkit" % ceVersion % Test,
     "io.grpc" % "grpc-netty-shaded" % scalapb.compiler.Version.grpcJavaVersion,
-
+    "com.github.cb372" %% "cats-retry" % "4.0.0",
   ) ++ List("ratis-grpc", "ratis-server", "ratis-metrics-default").map { component =>
     "org.apache.ratis" % component % "3.3.1"
   },

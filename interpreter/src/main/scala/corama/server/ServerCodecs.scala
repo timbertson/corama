@@ -9,7 +9,7 @@ import corama.*
 	*/
 object ServerCodecs {
 	import Codec.via
-	implicit val txId: Codec[TxId] = via[TxId, Long](_.value)(TxId.apply)
+	implicit val txId: Codec[LogIndex] = via[LogIndex, Long](_.value)(LogIndex.apply)
 	implicit val depotId: Codec[DepotId] = via[DepotId, String](_.value)(DepotId.apply)
 	implicit val pstateId: Codec[PStateId] = via[PStateId, String](_.value)(PStateId.apply)
 	implicit val depotAppend: Codec[DepotAppend] = via[DepotAppend, Bytes](_.value)(DepotAppend.apply)
@@ -25,7 +25,7 @@ object ServerCodecs {
 			{ case (id, values) => DepotAppends(id, values.map { (partition, value) => Partitioned(PartitionId(partition), DepotAppend(value)) }.toArray) }
 
 	implicit val replicationUpdate: Codec[ReplicationUpdate] =
-		via[ReplicationUpdate, ((TxId, List[DepotAppends]), Array[PStateUpdate])](r => ((r.id, r.depotAppends), r.pstateUpdates)) {
+		via[ReplicationUpdate, ((LogIndex, List[DepotAppends]), Array[PStateUpdate])](r => ((r.id, r.depotAppends), r.pstateUpdates)) {
 			case ((id, depotAppends), pstateUpdates) => ReplicationUpdate(id, depotAppends, pstateUpdates)
 		}
 }

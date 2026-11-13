@@ -8,11 +8,8 @@ import corama.InstanceId
 import fs2.Stream
 import flogger.{Log, IOLogging}
 import corama.server.InMemoryGroup
+import org.apache.ratis.server.protocol.TermIndex
 
-
-// interfaces used to swap out real server backend for an in-memory one in tests
-
-case class LogIndex(value: Long)
 
 class NotLeader(val leader: Option[InstanceId])
 	extends RuntimeException(s"not the leader (hint: ${leader.fold("unknown")(_.id.toString)})")
@@ -22,13 +19,6 @@ trait RepLog {
 	// TODO: can/should we pipeline, to allow multiple
 	def submit(update: ReplicationUpdate): IO[Proposal]
 
-	// Note: not correct if the given TX's `propose` is still pending on this replog
-	def isCommitted(txId: TxId): IO[Boolean]
-
-	// // current leader, if known
-	// def leader: IO[Option[InstanceId]]
-
-	// consumed to drive the stream. TODO: is this necessary?
 	def appliedOffsets: Stream[IO, LogIndex]
 }
 
@@ -55,8 +45,8 @@ final class InMemoryRepLog(
 	appliedOffsetsQueue: Queue[IO, LogIndex],
 )(using Log[IO]) extends RepLog with IOLogging {
 	private val log = Ref.unsafe[IO, Vector[(LogIndex, ReplicationUpdate)]](Vector.empty)
-	private val appliedRef = Ref.unsafe[IO, LogIndex](LogIndex(-1L))
-	private val committedTx = Ref.unsafe[IO, Set[TxId]](Set.empty)
+	private val appliedRef = Ref.unsafe[IO, LogIndex](LogIndex(0))
+	private val committedTx = Ref.unsafe[IO, Set[LogIndex]](Set.empty)
 	private val taskLeadership = group.leadership(instanceId)
 
 	private def requireLeader: IO[Unit] = taskLeadership.currentLeader.flatMap { leader =>
@@ -85,7 +75,7 @@ final class InMemoryRepLog(
 		} yield ()
 	}.foreverM
 
-	def isCommitted(txId: TxId): IO[Boolean] = committedTx.get.map(_.contains(txId))
+	def isCommitted(txId: LogIndex): IO[Boolean] = committedTx.get.map(_.contains(txId))
 
 	def appliedOffsets: Stream[IO, LogIndex] = {
 		Stream.fromQueueUnterminated(appliedOffsetsQueue)

@@ -37,7 +37,7 @@ final class EvalState(base: PStateView, val pendingAck: Option[ServerTask.Pendin
 		???
 	}
 
-	def toUpdate(txId: TxId): ReplicationUpdate = ReplicationUpdate(
+	def toUpdate(txId: LogIndex): ReplicationUpdate = ReplicationUpdate(
 		txId,
 		depotAppends = depotAppends.toList.map { (id, partitioned) =>
 			DepotAppends(id, partitioned.toArray)

@@ -414,6 +414,6 @@ object RamaBackend {
 	//  - local consumption (i.e. not cross-partition)
 	//  - internal (i.e. not exposed as a var that user code can reference)
 	private def unsafeInternalVar(base: VarId, suffix: String, tag: LightTypeTag = implicitly[Tag[Any]].tag) = {
-		VarId(id = base.id, hint = s"${base.hint}|${suffix}", tag = tag)
+		VarId(id = base.id, hint = s"${base.hint}|${suffix}", tag = tag, codec = Codec.notImplemented)
 	}
 }

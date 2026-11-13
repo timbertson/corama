@@ -43,7 +43,7 @@ case class NetworkConfig(
 ) {
 	def advertisedSocket = InetSocketAddress.createUnresolved(advertisedAddress, port)
 	def advertisedAdminSocket = InetSocketAddress.createUnresolved(advertisedAddress, adminPort)
-	def bindGrpcSocket = InetSocketAddress.createUnresolved(bindAddress, grpcPort)
+	def bindGrpcSocket = InetSocketAddress(bindAddress, grpcPort)
 }
 
 case class ClusterId(id: String)
@@ -61,8 +61,6 @@ case class ClusterConfig(
 	dataRoot: String,
 ) {
 	private val numTasks = instances.size
-	assert(numTasks >= 3)
-
 	def raftGroup(taskId: TaskId): Try[RaftGroup] = {
 		for {
 			groupInstances <- NonEmptyList.fromList(instances.filter(_.tasks.contains_(taskId))).toRight(
@@ -163,8 +161,8 @@ object ClusterConfig {
 					adminPort <- freeLocalPort
 					grpcPort <- freeLocalPort
 				} yield (instance.id -> NetworkConfig(
-					"localhost",
-					"localhost",
+					"127.0.0.1",
+					"127.0.0.1",
 					port,
 					adminPort,
 					grpcPort,

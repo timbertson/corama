@@ -1,7 +1,7 @@
 package corama.server
 
 import corama.{Bytes, Codec, DepotId}
-import corama.interpreter.{DepotAppend, DepotAppends, ReplicationUpdate, TxId}
+import corama.interpreter.{DepotAppend, DepotAppends, ReplicationUpdate, LogIndex}
 import corama.interpreter.db.RocksDb
 import org.apache.ratis.protocol.{Message, RaftGroupId}
 import org.apache.ratis.server.RaftServer
@@ -19,7 +19,10 @@ import corama.PartitionId
 import corama.interpreter.PStateView
 import corama.interpreter.PStateKey
 import corama.SelectOptions.Raw
-
+import fs2.concurrent.SignallingRef
+import cats.effect.IO
+import org.apache.ratis.server.protocol.TermIndex
+import cats.effect.unsafe.IORuntime
 
 object Keyspace {
 	private val Depot = 'D'.toByte
@@ -50,7 +53,7 @@ object Keyspace {
 	* Apply is idempotent by key, so replaying uncommitted entries after a
 	* crash is fine.
 	*/
-class StateMachine(task: TaskId) extends BaseStateMachine {
+class StateMachine(task: TaskId, val appliedOffsets: SignallingRef[IO, LogIndex], ioRuntime: IORuntime) extends BaseStateMachine {
 	private val storage = new SimpleStateMachineStorage()
 	private var db: Option[RocksDb] = None
 	private var release: Option[SyncIO[Unit]] = None
@@ -94,18 +97,25 @@ class StateMachine(task: TaskId) extends BaseStateMachine {
 				case Failure(e) => throw new RuntimeException(s"Failed to decode ReplicationUpdate at log index ${entry.getIndex}", e)
 			}
 			// TODO: why is this a future if we're writing sync?
-			rocks.writeSync(StateMachine.applyWrites(update, entry.getIndex))
-			updateLastAppliedTermIndex(entry.getTerm, entry.getIndex)
-			CompletableFuture.completedFuture(ack(update.id))
+			val rawIndex = entry.getIndex()
+			rocks.writeSync(StateMachine.applyWrites(update, rawIndex))
+			updateLastAppliedTermIndex(entry.getTerm(), rawIndex)
+			appliedOffsets.set(LogIndex(rawIndex)).as(ack(update.id)).unsafeToCompletableFuture()(using ioRuntime)
 		} catch {
 			case e: Exception => CompletableFuture.failedFuture(e)
 		}
 	}
 
-	private def ack(id: TxId): Message = Message.valueOf(ByteBuffer.wrap(ServerCodecs.txId.encode(id)))
+	private def ack(id: LogIndex): Message = Message.valueOf(ByteBuffer.wrap(ServerCodecs.txId.encode(id)))
 }
 
 object StateMachine {
+	def apply(task: TaskId) = {
+		for {
+			appliedOffsets <- SignallingRef.of[IO, LogIndex](LogIndex.initial)
+		} yield new StateMachine(task, appliedOffsets, IORuntime.global)
+	}
+
 	private[server] def applyWrites(update: ReplicationUpdate, index: Long): Vector[(Bytes, Option[Bytes])] = {
 		val depotWrites = update.depotAppends.flatMap { case DepotAppends(id, appends) =>
 			appends.zipWithIndex.map { case (Partitioned(partitionId, DepotAppend(value)), sub) =>
