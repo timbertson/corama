@@ -11,15 +11,16 @@ import corama.interpreter.IOMap
 import corama.server.ratis.RatisClusterClient
 
 object Cluster {
-	def runningCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, NonEmptyList[Server]] = {
+	// Run a full cluster on localhost
+	def runningCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, ClusterClient] = {
 		{
 			ActiveResource(for {
 				client <- RatisClusterClient(config)
-				pair <- ActiveResource.parTraverse(config.instances) { instance =>
+				(_servers, bg) <- ActiveResource.parTraverse(config.instances) { instance =>
 					val instanceLog = log.addContext("instance" -> instance.id.id.toString())
 					Server(config, topologies, instance, client)(using instanceLog)
 				}.resource
-			} yield pair)
+			} yield (client, bg))
 		}
 	}
 
@@ -34,6 +35,7 @@ object Cluster {
 		} yield pair)
 	}
 
+	// Run a mock cluster without real IO (stubs out ratis, grpc, network & disk)
 	def inMemoryCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, InMemoryClusterClient] = {
 		val res = for {
 			groups <- Resource.eval(config.tasks.traverse { taskId =>

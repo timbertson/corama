@@ -14,6 +14,8 @@ sealed trait Flow[A, -Ctx] {
 
 	def as[B](v: Var[B]): Flow[B, Ctx] = Bind(Var.internal, this, (_: Var[A]) => Pure(v))
 
+	def as[B, C](f: Flow[B, C]): Flow[B, Ctx & C] = Bind(Var.internal, this, (_: Var[A]) => f)
+
 	def void: Flow[Unit, Ctx] = as(Var.unit)
 
 	// def agg(agg: corama.Agg[A])(implicit tag: Tag[A]): Flow[A, Ctx & Batch] = Flow.Combine(tag, this, agg)

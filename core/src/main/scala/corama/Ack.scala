@@ -4,6 +4,7 @@ import cats.syntax.all.*
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
+import corama.error.Util
 
 sealed trait AckLevel[R]
 
@@ -25,23 +26,39 @@ final class AckReturns private[corama] (
 	private val values: Map[TopologyId, Any],
 	private val topologies: Topologies) {
 
-	def result[S, R](stream: StreamTopology[S, R]): R = {
+	def result[S, R](stream: StreamTopology[S, R]): Try[R] = {
 		val t = stream.topology
-		require(
-			topologies.declared(t),
-			s"${t.builder.source} was not declared in the module this append went to")
-
-		values.get(t.builder.id).map(_.asInstanceOf[R]).getOrElse(
-			throw new RuntimeException(s"no result recorded for topology ${t.id}")
-		)
+		for {
+			_ <- if (topologies.declared(t)) {
+				Success(())
+			} else {
+				Failure(Util.err(s"${t.builder.source} was not declared in this depot's topologies"))
+			}
+			any <- values.get(t.builder.id)
+				.toRight(Util.err(s"no result recorded for topology ${t.id}")).toTry
+			value <- Try(any.asInstanceOf[R])
+		} yield value
 	}
 	
 	def unique[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[T] = {
-		val seq = result[S, M](stream)
-		if (seq.length == 1) {
-			Success(seq.head)
-		} else {
-			Failure(new RuntimeException(s"Expected ${stream.topology.builder.source} to produce 1 element, but received ${seq.length}"))
+		result[S, M](stream).flatMap(extractOne(stream))
+	}
+
+	private def extractOne[A](stream: StreamTopology[?, ?])(seq: Seq[A]): Try[A] = {
+			if (seq.length == 1) {
+				Success(seq.head)
+			} else {
+				Failure(new RuntimeException(s"Expected ${stream.topology.builder.source} to produce 1 element, but received ${seq.length}"))
+			}
+	}
+
+	def uniqueOpt[S, T, M <: Seq[T]](stream: StreamTopology[S, M]): Try[Option[T]] = {
+		result[S, M](stream).flatMap { seq =>
+			if (seq.isEmpty) {
+				Success(None)
+			} else {
+				extractOne(stream)(seq).map(Some.apply)
+			}
 		}
 	}
 
@@ -49,6 +66,8 @@ final class AckReturns private[corama] (
 }
 
 object AckReturns {
+	// TODO: should there be a SerializedAckReturns type so that consumers
+	// don't have to deserialize every topology if they're only interested in one?
 	def codec(topologies: Topologies): Codec[AckReturns] = {
 		Codec.tryVia[AckReturns, List[(Int, Bytes)]] { ackReturns =>
 			ackReturns.values.toList.traverse { (topologyId, value) =>

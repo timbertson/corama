@@ -1,10 +1,12 @@
 package example
 
 import corama._
-import corama.interpreter.Interpreter
 import cats.syntax.all._
 import cats.effect._
 import flogger.Log
+import corama.server.ClusterConfig
+import corama.server.Cluster
+import corama.client.TopologyClient
 
 /** A slice of `example.HelloWorldModule` rewritten in [[Flow]], as an API check.
   *
@@ -41,6 +43,7 @@ object Example extends IOApp {
 	val userTickets = topologies.pstateKVSet[Long, Long]("userTickets")
 	val users = topologies.pstateKV[Long, String]("users")
 
+	val newTickets: Depot[Ticket] = topologies.depot("newTickets")
 	val ticketAssignment: Depot[Assignment] = topologies.depot("ticketAssignment")
 
 	/** Propagate an assignment: update the ticket, add to the new owner's set,
@@ -102,8 +105,32 @@ object Example extends IOApp {
 	val userTicketsQuery: QueryTopology[Long, List[Ticket]] =
 		topologies.query("userTickets", Agg.list[Ticket])(listUserTickets)
 
+	val fullTicketsQuery: QueryTopology[Long, List[FullTicket]] =
+		topologies.query("fullTicket", Agg.list[FullTicket]){ ticketId =>
+			for {
+				_ <- Flow.hashPartition(ticketId)
+				ticket <- fullTickets.key(ticketId).get
+				tickets <- ticket.map(_.toList)
+			} yield tickets
+		}
+
 	val assigning: StreamTopology[Assignment, List[Option[Long]]] =
 		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(propagateAssignment)
+
+	val ticketCreation = topologies.stream(newTickets, Result.agg[Unit]) { ticket =>
+		for {
+			ticketId <- ticket.map(_.id)
+			_ <- Flow.hashPartition(ticketId)
+			// lens = fullTickets.key(ticketId)
+			fullTicket <- ticket.map(FullTicket(_, None))
+			existing <- fullTickets.key(ticketId).get
+			result <- existing.fold {
+				fullTickets.key(ticketId).put(fullTicket).as(Flow.pure(Result.unit))
+			} { _existing =>
+				ticketId.map(id => Result.failure(s"Ticket ID ${id} already exists"))
+			}
+		} yield result
+	}
 
 	override def run(args: List[String]): IO[ExitCode] = {
 		println("flow.Example")
@@ -114,50 +141,59 @@ object Example extends IOApp {
 			Ticket(2, "Troubles McGee", "I don't have water"),
 			Ticket(3, "Passerby", "There seems to be a fire"))
 
-		Interpreter.createCluster(
-			topologies,
-			Vector("node0", "node1", "node2").map(InstanceId.apply),
-			numPartitions = 12
-		).use { interp =>
-			for {
-				_ <- tickets.traverse_ { t =>
-					interp.access(fullTickets, t.id).flatMap(_.put(FullTicket(t, Some(111L))))
-				}
-				_ <- interp.access(userTickets, 111L).flatMap(_.put(Set(1L, 2L)))
-				_ <- interp.access(userTickets, 222).flatMap(_.put(Set(3L)))
-
-				_ = println("Getting user tickets")
-				listed <- interp.invoke(userTicketsQuery, 111L)
-				_ = println(s"  user 111 tickets: $listed")
-
-				expected = List(tickets(0), tickets(1))
-				_ = assert(listed == expected, s"expected $expected, got $listed")
-				
-
-				// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
-				acks <- interp.append(ticketAssignment, Assignment(1L, 222L))
-
-				// And the ack *return* carries a value back: who owned the ticket before.
-				previous <- IO.fromTry(acks.unique(assigning))
-				_ = println(s"  reassigned ticket 1, previously owned by: $previous")
-				_ = assert(previous == Some(111L), s"ack return: $previous")
-
-				_ <- interp.access(userTickets, 222L).flatMap(_.get).map { result =>
-					assert(result === Some(Set(3L, 1L)), s"new owner: ${result}")
-				}
-				_ <- interp.access(userTickets, 111L).flatMap(_.get).map { result =>
-					assert(result === Some(Set(2L)), s"old owner: ${result}")
-				}
-				_ <- interp.access(fullTickets, 1L).flatMap(_.get).map { result =>
-					assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
+		ClusterConfig.ephemeral(numPartitions = 12).flatMap(config => TopologyClient(config, topologies)).use { client =>
+			Cluster.runningCluster(client.config, topologies).use { _ =>
+				def createTicket(ticket: Ticket) = {
+					for {
+						acks <- client.append(newTickets, ticket)
+						result <- IO.fromTry(acks.result(ticketCreation))
+						_ <- Result.to[IO](result)
+					} yield ()
 				}
 
-				// Reassigning to the same owner must not remove the ticket.
-				_ <- interp.append(ticketAssignment, Assignment(1L, 222L))
-				_ <- interp.access(userTickets, 222L).flatMap(_.get).map { result =>
-					assert(result == Some(Set(3L, 1L)), s"self-reassign: ${result}")
+				def assignTicket(userId: Long, ticketId: Long): IO[AckReturns] = {
+					client.append(ticketAssignment, Assignment(ticketId = ticketId, assigneeId = userId))
 				}
-			} yield ExitCode.Success
+
+				for {
+					_ <- tickets.traverse_(createTicket)
+					_ <- assignTicket(111L, 1L)
+					_ <- assignTicket(111L, 2L)
+					_ <- assignTicket(222L, 3L)
+
+					_ = println("Getting user tickets")
+					listed <- client.query(userTicketsQuery, 111L)
+					_ = println(s"  user 111 tickets: $listed")
+
+					expected = List(tickets(0), tickets(1))
+					_ = assert(listed == expected, s"expected $expected, got $listed")
+					
+
+					// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
+					acks <- assignTicket(222L, 1L)
+
+					// And the ack *return* carries a value back: who owned the ticket before.
+					previous <- IO.fromTry(acks.unique(assigning))
+					_ = println(s"  reassigned ticket 1, previously owned by: $previous")
+					_ = assert(previous == Some(111L), s"ack return: $previous")
+
+					_ <- client.query(userTicketsQuery, 222L).map { result =>
+						assert(result.map(_.id).toSet === Set(3L, 1L), s"new owner: ${result}")
+					}
+					_ <- client.query(userTicketsQuery, 111L).map { result =>
+						assert(result.map(_.id).toSet === Set(2L), s"old owner: ${result}")
+					}
+					_ <- client.query(fullTicketsQuery, 1L).map { result =>
+						assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
+					}
+
+					// Reassigning to the same owner must not remove the ticket.
+					_ <- assignTicket(222L, 1L)
+					_ <- client.query(userTicketsQuery, 222L).map { result =>
+						assert(result.map(_.id).toSet == Set(3L, 1L), s"self-reassign: ${result}")
+					}
+				} yield ExitCode.Success
+			}
 		}
 	}
 }

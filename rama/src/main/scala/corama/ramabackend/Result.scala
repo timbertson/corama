@@ -2,6 +2,7 @@ package corama
 
 import cats.Monoid
 import cats.Eq
+import cats.MonadError
 
 // Utilities for Either[String, T]
 type Result[T] = Either[String, T]
@@ -20,4 +21,15 @@ object Result {
 		Agg(Right(M.empty), { (a,b) =>
 			a.flatMap(a => b.map(M.combine(a, _)))
 		})
+	
+	class ResultTo[M[_]](M: MonadError[M, Throwable]) {
+		def apply[A](value: Result[A]): M[A] = {
+			value match {
+				case Left(msg) => M.raiseError(new RuntimeException(msg))
+				case Right(value) => M.pure(value)
+			}
+		}
+	}
+
+	def to[M[_]](using M: MonadError[M, Throwable]) = new ResultTo[M](M)
 }

@@ -260,7 +260,9 @@ sealed trait Identity {
 }
 
 // IDs which can be referenced directly by clients
-sealed trait PublicIdentity extends Identity
+sealed trait PublicIdentity extends Identity {
+	val value: String
+}
 
 case class PStateId(value: String) extends Identity
 case class DepotId(value: String) extends PublicIdentity

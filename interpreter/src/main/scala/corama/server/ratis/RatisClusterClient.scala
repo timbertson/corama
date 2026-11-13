@@ -17,7 +17,7 @@ import flogger.Log
 import corama.server.ClusterConfig
 import io.grpc.Metadata
 import corama.InstanceId
-import corama.interpreter.GrpcChannel
+import corama.client.GrpcChannel
 import cats.effect.std.Dispatcher
 
 case class GroupClient(raft: RaftClient, group: RaftGroup)

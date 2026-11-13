@@ -128,7 +128,7 @@ final case class PState(id: PStateId, schema: Schema) {
 // A convenience API with additional type safety for simple K/V PStates
 final case class PStateKV[K: Tag : Codec, V: Tag : Codec](id: PStateId) {
 	private [corama] var inner: PState = PState(id, Schema.mapOf[K](Schema[V], Subindex.nonIndexed))
-	def key(k: Var[K]) = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
+	def key(k: Var[K]): ValueLens[V] = inner.valueAt[V](Path(k)(using IntoVar.varIntoVar[K]))
 }
 
 final case class PStateKVSet[K: Tag : Codec, V: Tag : Codec : Order](id: PStateId, subindex: Subindex) {

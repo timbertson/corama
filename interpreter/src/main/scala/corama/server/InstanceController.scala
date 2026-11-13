@@ -50,7 +50,7 @@ class InstanceController(
 			task <- requireLeader(taskId)
 			result <- task.append(TaskCommand.Append(depot, partition, bytes, decoded, AckLevel.Ack)) // TODO configurable ack level
 			serialized = AckReturns.codec(topologies).encode(result)
-		} yield Response(Response.Value.Success(ByteString.copyFrom(serialized)))
+		} yield Response.of(value = Some(ByteString.copyFrom(serialized)))
 	}
 
 	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = ???

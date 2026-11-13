@@ -1,4 +1,4 @@
-package corama.interpreter
+package corama.client
 
 import scala.concurrent.blocking
 import io.grpc.ManagedChannel
