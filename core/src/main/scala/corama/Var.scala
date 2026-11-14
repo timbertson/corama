@@ -44,7 +44,7 @@ private[corama] final class VarId(
 		case _           => false
 	}
 	override def hashCode: Int = id.hashCode
-	override def toString: String = s"${hint}_${id}"
+	override def toString: String = s"${hint}_${id}: ${tag}"
 }
 
 object VarId {
@@ -68,9 +68,9 @@ trait IntoVar[A] {
 }
 
 trait DefaultIntoVar {
-	implicit def anyIntoVar[A](implicit tag: Tag[A]): IntoVar[A] = new IntoVar[A] {
+	implicit def anyIntoVar[A](implicit tag: Tag[A], codec: Codec[A]): IntoVar[A] = new IntoVar[A] {
 		type T = A
-		def intoVar(value: A): MaybeVar[T] = Var.Literal(value, tag)
+		def intoVar(value: A): MaybeVar[T] = Var.Literal(Encoded[A](value), tag)
 	}
 }
 
@@ -143,7 +143,7 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 private def impossible(reason: String) = throw new IllegalStateException(reason)
 
 object Var {
-	case class Literal[A](value: A, tag: Tag[A]) extends MaybeVar[A]
+	case class Literal[A](value: Encoded[A], tag: Tag[A]) extends MaybeVar[A]
 
 	// Virtual vars have a unique id < 0 and are never given a Rama name
 	val unit: Var[Unit] = new Var[Unit](

@@ -39,50 +39,6 @@ trait Server {
 class RatisServer(val instanceId: InstanceId, val server: RaftServer, val client: RatisClusterClient) extends Server
 
 object Server extends IOLogging {
-	class InMemoryServer(
-		val instanceId: InstanceId,
-		val controller: InstanceController,
-	) extends Server
-
-	def inMemory(
-		config: ClusterConfig,
-		topologies: Topologies,
-		clusterClient: InMemoryClusterClient,
-		instance: ClusterInstance
-	)(using log: Log[IO]): ActiveResource[IO, InMemoryServer] = {
-		val res = for {
-			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
-			taskResources <- instance.tasks.traverse { taskId =>
-				for {
-					pstate <- Resource.eval(PStateView.inMemory)
-					speculativeState = new SpeculativeState(pstate)
-					group <- Resource.eval(InMemoryGroup(taskId))
-					replog <- Resource.eval(RepLog.inMemory(instance.id, group))
-					(serverTask, bg) <- ServerTask.resource(
-						instance.id,
-						taskId,
-						topologies,
-						clusterClient,
-						replog,
-						speculativeState,
-						config,
-						group.leadership(instance.id),
-						incomingEvalRouter,
-						maxInFlight = 10
-					).resource
-				} yield (
-					(taskId, serverTask), // serverTask KV
-					bg
-				)
-			}
-			serverTaskMap = IOMap(taskResources.map(_._1))
-			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
-			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
-			server = new InMemoryServer(instance.id, controller)
-		} yield (server, bg)
-		ActiveResource(res)
-	}
-	
 	private [corama] def apply(config: ClusterConfig, topologies: Topologies, instance: ClusterInstance, clusterClient: RatisClusterClient)(using log: Log[IO]):
 		ActiveResource[IO, Server] =
 	{
@@ -92,7 +48,6 @@ object Server extends IOLogging {
 			networkConfig <- Resource.eval(config.networkConfig.getIO(instance.id))
 			_ <- Resource.eval(log.debug(s"Creating $storagePath"))
 			_ <- Resource.eval(Files.forIO.createDirectories(storagePath))
-
 
 			firstGroup <- Resource.eval(IO.fromTry(config.raftGroup(instance.tasks.head)))
 
@@ -164,9 +119,9 @@ object Server extends IOLogging {
 
 	// add any groups not already registered (e.g. recovered from storage on restart)
 	private def joinGroups(client: RatisClusterClient, instance: ClusterInstance)(using log: Log[IO]): IO[Unit] = {
-		log.debug(s"joining additional groups") >>
 		instance.tasks.traverse_ { taskId =>
 			client.invokeRaft(taskId) { client =>
+				log.debug(s"joining group ${client.group.getGroupId()} of size ${client.group.getPeers().size()} for task ${taskId}") *>
 				IO(blocking {
 					client.raft.getGroupManagementApi(instance.peerId).add(client.group, true)
 				})
@@ -194,4 +149,49 @@ object Server extends IOLogging {
 			_ <- Resource.eval(IO(server.start()))
 		} yield server
 	}
+
+	class InMemoryServer(
+		val instanceId: InstanceId,
+		val controller: InstanceController,
+	) extends Server
+
+	def inMemory(
+		config: ClusterConfig,
+		topologies: Topologies,
+		clusterClient: InMemoryClusterClient,
+		instance: ClusterInstance
+	)(using log: Log[IO]): ActiveResource[IO, InMemoryServer] = {
+		val res = for {
+			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
+			taskResources <- instance.tasks.traverse { taskId =>
+				for {
+					pstate <- Resource.eval(PStateView.inMemory)
+					speculativeState = new SpeculativeState(pstate)
+					group <- Resource.eval(InMemoryGroup(taskId))
+					replog <- Resource.eval(RepLog.inMemory(instance.id, group))
+					(serverTask, bg) <- ServerTask.resource(
+						instance.id,
+						taskId,
+						topologies,
+						clusterClient,
+						replog,
+						speculativeState,
+						config,
+						group.leadership(instance.id),
+						incomingEvalRouter,
+						maxInFlight = 10
+					).resource
+				} yield (
+					(taskId, serverTask), // serverTask KV
+					bg
+				)
+			}
+			serverTaskMap = IOMap(taskResources.map(_._1))
+			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
+			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
+			server = new InMemoryServer(instance.id, controller)
+		} yield (server, bg)
+		ActiveResource(res)
+	}
+	
 }

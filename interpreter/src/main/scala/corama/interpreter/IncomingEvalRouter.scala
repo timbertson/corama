@@ -25,6 +25,9 @@ class IncomingEvalRouter(slots: Ref[IO, Map[EvalId, LocalEvalSink[Any]]])(using 
 			map <- slots.get
 			// TODO: classify as 404
 			slot <- map.get(evalId).fold(IO.raiseError(err(s"No slot for $evalId")))(IO.pure)
+			value <- value.traverse { bytes =>
+				IO.fromTry(slot.agg.codec.decode(bytes))
+			}
 			_ <- slot.notify(edge, value)
 		} yield ()
 	}

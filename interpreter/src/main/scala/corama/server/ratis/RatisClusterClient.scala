@@ -19,13 +19,14 @@ import io.grpc.Metadata
 import corama.InstanceId
 import corama.client.GrpcChannel
 import cats.effect.std.Dispatcher
+import org.apache.ratis.protocol.Message
 
 case class GroupClient(raft: RaftClient, group: RaftGroup)
 
 class RatisClusterClient(
 	val raftClients: IOMap[TaskId, GroupClient],
 	val instanceClients: IOMap[InstanceId, rpc.CoramaInstanceFs2Grpc[IO, Metadata]],
-) extends ClusterClient {
+)(using log: Log[IO]) extends ClusterClient with IOLogging {
 	def invokeRaft(taskId: TaskId)(block: GroupClient => IO[RaftClientReply]): IO[RaftClientReply] = {
 		raftClients.use(taskId)(block).flatMap { reply =>
 			IO.fromEither(Option(reply.getException()).toLeft(reply))
@@ -38,9 +39,17 @@ class RatisClusterClient(
 	
 	// Note: both RatisClusterGroup and RatisTaskLeadership expose this, but
 	// RatisTaskLeadership is only created for tasks a given server participates in
+	private var hasConnected = false
 	override def currentLeader(taskId: TaskId): IO[Option[InstanceId]] = {
 		raftClients.use(taskId) { client =>
-			IO(RatisTaskLeadership.instanceOfNullableLeader(client.raft.getLeaderId()))
+			IO.unlessA(hasConnected) {
+				log.debug("initializing group client with an empty message") *>
+				IO.fromCompletableFuture(IO { client.raft.async().sendReadOnly(Message.EMPTY) }).void
+			} *> IO {
+				val leader = RatisTaskLeadership.instanceOfNullableLeader(client.raft.getLeaderId())
+				hasConnected = true
+				leader
+			}
 		}
 	}
 }

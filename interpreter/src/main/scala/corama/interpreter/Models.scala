@@ -40,7 +40,6 @@ case class DepotAppend(value: Bytes)
 case class DepotAppends(id: DepotId, updates: Array[Partitioned[DepotAppend]])
 
 case class ReplicationUpdate(
-	id: LogIndex,
 	depotAppends: List[DepotAppends],
 	pstateUpdates: Array[PStateUpdate],
 )

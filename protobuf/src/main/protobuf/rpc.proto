@@ -42,6 +42,7 @@ message NotifyRequest {
 	int64 evalId = 1;
 	int64 edge = 2;
 	google.protobuf.BytesValue value = 3; // optional, return value
+	bool failure = 4;
 }
 
 message Response {

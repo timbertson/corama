@@ -29,7 +29,7 @@ object Path {
 
 object CompiledPath {
 	sealed trait Component
-	case class Literal(inner: Any) extends Component
+	case class Literal(inner: Encoded[Any]) extends Component
 	case class Variable(id: VarId) extends Component
 	
 	// strip down to minimum information needed for serialization,
@@ -40,7 +40,7 @@ object CompiledPath {
 	def from(path: Path, terminalTag: LightTypeTag, codec: AnyCodec): CompiledPath = {
 		CompiledPath(path.raw.map { part =>
 			part.value match {
-				case lit: Var.Literal[?] => Literal(lit.value)
+				case lit: Var.Literal[?] => Literal(lit.value.asAny)
 				case v: Var[?] => Variable(v.vid)
 			}
 		}, terminalTag, codec)

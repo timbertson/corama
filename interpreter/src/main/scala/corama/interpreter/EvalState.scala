@@ -37,8 +37,7 @@ final class EvalState(base: PStateView, val pendingAck: Option[ServerTask.Pendin
 		???
 	}
 
-	def toUpdate(txId: LogIndex): ReplicationUpdate = ReplicationUpdate(
-		txId,
+	def toUpdate: ReplicationUpdate = ReplicationUpdate(
 		depotAppends = depotAppends.toList.map { (id, partitioned) =>
 			DepotAppends(id, partitioned.toArray)
 		},
@@ -76,6 +75,10 @@ object EvalState {
 					localResultsBuffer.addOne((local.asAny, edge, values.fold(Nil)(_.toList)))
 				}
 			}
+
+		def addFailureNotification(origin: Origin, edge: EdgeId): SyncIO[Unit] = SyncIO {
+			notificationBuffer.addOne(origin, new EvalNotification(edge, None, Agg.unit.asAny, failure = true))
+		}
 		
 		def localResults: Seq[(LocalEvalSink[Any], EdgeId, List[Any])] = localResultsBuffer.toSeq
 
@@ -97,7 +100,7 @@ object EvalState {
 }
 
 
-case class EvalNotification(edge: EdgeId, value: Option[Any], agg: Agg[Any]) {
+case class EvalNotification(edge: EdgeId, value: Option[Any], agg: Agg[Any], failure: Boolean) {
 	def merge(newEdge: EdgeId, newValue: Option[NonEmptyList[Any]]) = {
 		copy(edge = edge.xor(newEdge), value = EvalNotification.mergeAgg(agg, value, newValue))
 	}
@@ -106,7 +109,7 @@ case class EvalNotification(edge: EdgeId, value: Option[Any], agg: Agg[Any]) {
 object EvalNotification {
 	def merge(current: Option[EvalNotification], edge: EdgeId, value: Option[NonEmptyList[Any]], agg: Agg[Any]) = {
 		current.fold(
-			EvalNotification(edge = edge, value = mergeAgg(agg, None, value), agg = agg)
+			EvalNotification(edge = edge, value = mergeAgg(agg, None, value), agg = agg, failure = false)
 		) { current =>
 			// agg / codec must be equivalent for given origin, so we can ignore them
 			current.copy(edge = current.edge.xor(edge), value = mergeAgg(agg, current.value, value))
@@ -142,8 +145,9 @@ object EvalContinuation {
 				edgeId = edge.id,
 				envs = envs.toList.map { env =>
 					rpc.Env.of(
-						items = env.toList.map { (key, value) =>
-							rpc.EnvItem.of(varId = key.id, value = ByteString.copyFrom(key.codec.asAny.encode(value)))
+						items = env.toList.map { (varId, value) =>
+							println(s"Encoding ${value} with ${varId.codec} @ ${varId}")
+							rpc.EnvItem.of(varId = varId.id, value = ByteString.copyFrom(varId.codec.asAny.encode(value)))
 						}
 					)
 				}

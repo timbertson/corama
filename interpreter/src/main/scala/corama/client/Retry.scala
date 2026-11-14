@@ -7,6 +7,7 @@ import retry.RetryPolicies
 import retry.ResultHandler
 import flogger.Log
 import flogger.IOLogging
+import flogger.api.Level
 
 case class RetryConfig(
 	limit: Int,
@@ -21,9 +22,12 @@ object Retry extends IOLogging {
 	def apply[A](config: RetryPolicy[IO, Any])(block: IO[A])(using log: Log[IO]): IO[A] = {
 		retry.retryingOnErrors(block)(
 			config,
-			ResultHandler.retryOnAllErrors[IO, A](log = (e, details) =>
-				log.info(s"Retrying request (retries:${details.retriesSoFar}, delay:${details.cumulativeDelay.toMillis}ms): $e")
-			)
+			ResultHandler.retryOnAllErrors[IO, A](log = (e, details) => {
+				log.isEnabledFor(Level.Debug).flatMap {
+					case true => log.debug(s"Retrying request (retries:${details.retriesSoFar}, delay:${details.cumulativeDelay.toMillis}ms)", e)
+					case false => log.info(s"Retrying request (retries:${details.retriesSoFar}, delay:${details.cumulativeDelay.toMillis}ms): $e")
+				}
+			})
 		)
 	}
 

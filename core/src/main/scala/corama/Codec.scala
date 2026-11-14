@@ -9,45 +9,11 @@ import com.google.protobuf
 import scala.util.Failure
 import com.google.protobuf.ByteString
 import java.nio.ByteBuffer
-import java.util.Arrays
-import cats.Eq
 import streamdsl.rpc.Either.Value.Empty
 import scalapb.GeneratedMessageCompanion
 import scalapb.GeneratedMessage
-import cats.kernel.Order
 import corama.error.Util._
 import scala.reflect.ClassTag
-
-type Bytes = Array[Byte]
-object Bytes {
-	// A wrapper type with proper equality / hashcode
-	class Value(val raw: Array[Byte]) extends Serializable {
-		override def equals(obj: Any): Boolean = obj match {
-			case v: Value => eqInstance.eqv(v.raw, raw)
-			case _ => false
-		}
-		override def hashCode(): Int = Arrays.hashCode(raw)
-	}
-	object Value {
-		def apply(raw: Bytes) = new Value(raw)
-	}
-
-	private [corama] val NULL_BYTE = 0.byteValue()
-
-	private [corama] val MAX_BYTE = ~NULL_BYTE
-	
-	def eq(a: Bytes, b: Bytes) = Arrays.equals(a, b)
-
-	implicit val eqInstance: Eq[Bytes] = Eq.instance(eq)
-
-	implicit val orderInstance: Order[Bytes] = Order.from { (a,b) =>
-		Arrays.compare(a, b)
-	}
-
-	implicit val orderingInstance: Ordering[Bytes] = Order.catsKernelOrderingForOrder[Bytes](orderInstance)
-	
-	def empty: Bytes = Array.empty
-}
 
 // TODO: use ByteString
 // TODO: Add embedding field, describing how values are embedded in a stream:

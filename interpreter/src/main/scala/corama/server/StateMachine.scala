@@ -1,5 +1,6 @@
 package corama.server
 
+import cats.syntax.all.*
 import corama.{Bytes, Codec, DepotId}
 import corama.interpreter.{DepotAppend, DepotAppends, ReplicationUpdate, LogIndex}
 import corama.interpreter.db.RocksDb
@@ -21,12 +22,12 @@ import corama.interpreter.PStateKey
 import corama.SelectOptions.Raw
 import fs2.concurrent.SignallingRef
 import cats.effect.IO
-import org.apache.ratis.server.protocol.TermIndex
 import cats.effect.unsafe.IORuntime
 
 object Keyspace {
 	private val Depot = 'D'.toByte
-	private [corama] val PState = 'S'.toByte
+	private [corama] val PStateKv = 'K'.toByte
+	private [corama] val PStateSet = 'S'.toByte
 	private val Meta = 'M'.toByte
 
 	private def lenPrefixed(s: String): Bytes = {
@@ -80,13 +81,18 @@ class StateMachine(task: TaskId, val appliedOffsets: SignallingRef[IO, LogIndex]
 	}
 
 	override def query(request: Message): CompletableFuture[Message] = {
-		// TODO: linearizable reads need readIndex; this reads local state.
-		val offset = rocks.get(Keyspace.applyOffsetKey).unsafeRunSync()
-			.flatMap(Codec.forLong.decode(_).toOption)
-			.getOrElse(0L)
+		if (request.size() === 0) {
+			// used for initializing group membership
+			CompletableFuture.completedFuture(Message.EMPTY)
+		} else {
+			// TODO: linearizable reads need readIndex; this reads local state.
+			val offset = rocks.get(Keyspace.applyOffsetKey).unsafeRunSync()
+				.flatMap(Codec.forLong.decode(_).toOption)
+				.getOrElse(0L)
 
-		val result = Message.valueOf(ByteBuffer.wrap(Codec.forLong.encode(offset)))
-		CompletableFuture.completedFuture(result)
+			val result = Message.valueOf(ByteBuffer.wrap(Codec.forLong.encode(offset)))
+			CompletableFuture.completedFuture(result)
+		}
 	}
 
 	override def applyTransaction(trx: TransactionContext): CompletableFuture[Message] = {
@@ -100,13 +106,11 @@ class StateMachine(task: TaskId, val appliedOffsets: SignallingRef[IO, LogIndex]
 			val rawIndex = entry.getIndex()
 			rocks.writeSync(StateMachine.applyWrites(update, rawIndex))
 			updateLastAppliedTermIndex(entry.getTerm(), rawIndex)
-			appliedOffsets.set(LogIndex(rawIndex)).as(ack(update.id)).unsafeToCompletableFuture()(using ioRuntime)
+			appliedOffsets.set(LogIndex(rawIndex)).as(Message.EMPTY).unsafeToCompletableFuture()(using ioRuntime)
 		} catch {
 			case e: Exception => CompletableFuture.failedFuture(e)
 		}
 	}
-
-	private def ack(id: LogIndex): Message = Message.valueOf(ByteBuffer.wrap(ServerCodecs.txId.encode(id)))
 }
 
 object StateMachine {

@@ -25,7 +25,7 @@ object ServerCodecs {
 			{ case (id, values) => DepotAppends(id, values.map { (partition, value) => Partitioned(PartitionId(partition), DepotAppend(value)) }.toArray) }
 
 	implicit val replicationUpdate: Codec[ReplicationUpdate] =
-		via[ReplicationUpdate, ((LogIndex, List[DepotAppends]), Array[PStateUpdate])](r => ((r.id, r.depotAppends), r.pstateUpdates)) {
-			case ((id, depotAppends), pstateUpdates) => ReplicationUpdate(id, depotAppends, pstateUpdates)
+		via[ReplicationUpdate, ((List[DepotAppends]), Array[PStateUpdate])](r => ((r.depotAppends), r.pstateUpdates)) {
+			case ((depotAppends), pstateUpdates) => ReplicationUpdate(depotAppends, pstateUpdates)
 		}
 }

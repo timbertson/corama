@@ -94,7 +94,7 @@ case class Origin(
 private[corama] final class LocalEvalSink[R](
 	val origin: Origin,
 	val varId: VarId,
-	agg: Agg[R],
+	val agg: Agg[R],
 	log: Log[IO],
 	xorState: Ref[IO, Long],
 	acc: Ref[IO, R],
@@ -109,7 +109,7 @@ private[corama] final class LocalEvalSink[R](
 		for {
 			_ <- value.traverse_(value => acc.updateAndGet(x => agg.combine(x, value)))
 			xorValue <- xorState.updateAndGet(x => x ^ edge.id)
-			_ <- log.debug(s"Received notification $edge|${value.fold("None")(_ => "Some")}, state: from ${HexString(xorValue ^ edge.id)} => ${HexString(xorValue)}")
+			_ <- log.debug(s"Received notification $edge|${value.fold("None")(_ => "Some")}, state(${HexString(xorValue ^ edge.id)} => ${HexString(xorValue)})")
 			_ <- IO.whenA(xorValue === 0L) {
 				log.debug(s"eval complete") *>
 				acc.get.flatMap(x => done.complete(Success(x))).flatMap { wasFirst =>

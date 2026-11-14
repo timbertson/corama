@@ -25,7 +25,7 @@ object Util {
 
 	def joinNothings(tasks: List[IO[Nothing]]) = tasks.parSequence_ *> neverReached
 
-	def withContext[F[_], T](desc: => String, value: F[T])(implicit E: ApplicativeError[F, Throwable]): F[T] = {
+	def withContext[F[_], T](desc: => String)(value: F[T])(implicit E: ApplicativeError[F, Throwable]): F[T] = {
 		E.handleErrorWith(value) { e =>
 			E.raiseError(new RuntimeException(desc, e))
 		}

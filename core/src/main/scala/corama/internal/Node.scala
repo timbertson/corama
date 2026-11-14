@@ -169,7 +169,7 @@ private[corama] object Node {
 				(List(n(Node.Combine(block, a.agg, innerVar.vid, out.vid))), out)
 
 			case g: Flow.Get[a] =>
-				val out = t.define[a](g.lens.schema.tag, g.lens.schema.codec, Var.internal, "get")
+				val out = t.define[Option[a]](g.lens.schema.optionTag, g.lens.schema.optionCodec, Var.internal, "get")
 				val path = CompiledPath.from(g.lens.path, g.lens.schema.tag.tag, g.lens.schema.codec.asAny)
 				(List(n(Node.PStateNode(g.lens.pstate.id, path, PStateOp.Get(out.vid)))), out.asInstanceOf[Var[A]])
 

@@ -352,7 +352,7 @@ object RamaBackend {
 	private[corama] def compilePathComponent(part: CompiledPath.Component): Any = {
 		part match {
 			case CompiledPath.Literal(p) => {
-				if (p.isInstanceOf[String] && p.asInstanceOf[String].startsWith("*")) {
+				if (p.value.isInstanceOf[String] && p.value.asInstanceOf[String].startsWith("*")) {
 					throw new IllegalArgumentException("Literal value in path component begins with an asterix: ${p}")
 				}
 				p

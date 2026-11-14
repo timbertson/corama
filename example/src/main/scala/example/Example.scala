@@ -7,6 +7,8 @@ import flogger.Log
 import corama.server.ClusterConfig
 import corama.server.Cluster
 import corama.client.TopologyClient
+import flogger.IOLogging
+import corama.internal.PrettyPrint
 
 /** A slice of `example.HelloWorldModule` rewritten in [[Flow]], as an API check.
   *
@@ -18,7 +20,7 @@ import corama.client.TopologyClient
   * `Object`, and the fan-out at `.each(Ops.EXPLODE, "*ticketIds").out("*ticketId")`
   * is invisible in the types. Here the same shape typechecks, and `Interp` runs it.
   */
-object Example extends IOApp {
+object Example extends IOApp with IOLogging {
 	import io.circe.generic.auto._
 	implicit val log: Log[IO] = Log.empty
 
@@ -62,7 +64,9 @@ object Example extends IOApp {
 			// Rama's version carries `prevAssignee` on an intermediate depot record so
 			// a retry can't lose it (Main.scala:196-200); the same concern applies here.
 			_ <- Flow.hashPartition(ticketId)
+			_ <- ticketId.foreach { id => println(s"Getting ticket ${id}") }
 			existing <- fullTickets.key(ticketId).get
+			_ <- existing.foreach { id => println(s"Got ticket ${id} @ ${existing}") }
 			_ <- existing.filter(_.isDefined)
 			previousOwner <- existing.map(_.flatMap(_.assignee))
 			_ <- fullTickets.key(ticketId).updateWith(newOwner) { (cur, owner) =>
@@ -141,7 +145,7 @@ object Example extends IOApp {
 			Ticket(2, "Troubles McGee", "I don't have water"),
 			Ticket(3, "Passerby", "There seems to be a fire"))
 
-		ClusterConfig.ephemeral(numPartitions = 12).flatMap(config => TopologyClient(config, topologies)).use { client =>
+		ClusterConfig.ephemeral(numPartitions = 12, numTasks = 1, numInstances = 1).flatMap(config => TopologyClient(config, topologies)).use { client =>
 			Cluster.runningCluster(client.config, topologies).use { _ =>
 				def createTicket(ticket: Ticket) = {
 					for {
@@ -156,6 +160,8 @@ object Example extends IOApp {
 				}
 
 				for {
+					_ <- log.info(s"Cluster config: ${client.config}")
+					_ <- log.info(s"Topologies:\n${PrettyPrint.format(topologies)}")
 					_ <- tickets.traverse_(createTicket)
 					_ <- assignTicket(111L, 1L)
 					_ <- assignTicket(111L, 2L)

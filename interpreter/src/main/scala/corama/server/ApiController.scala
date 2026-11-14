@@ -25,6 +25,8 @@ class ApiController(
 	}
 
 	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = {
+		// TODO: if there's no explicit partition, delegate to any task which
+		// this server leads
 		delegateTo(request.partition.map(PartitionId.apply)) { instance =>
 			instance.query(request, ctx)
 		}
@@ -47,4 +49,3 @@ class ApiController(
 		} yield result
 	}
 }
-

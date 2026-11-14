@@ -90,7 +90,6 @@ final class ServerTask private[server] (
 	submissions: Queue[IO, ServerTask.Submission],
 	outputsQueue: Queue[IO, (EvalState.Outputs, Option[ServerTask.PendingAck])],
 	pendingAcks: Queue[IO, ServerTask.PendingAck],
-
 )(using log: Log[IO]) extends IOLogging {
 	import TaskCommand.*
 	import ServerTask.*
@@ -113,16 +112,8 @@ final class ServerTask private[server] (
 		IO.raiseUnless(isLeader)(NotLeader(None))
 	}
 
-	def append[A, R](append: Append): IO[R] = {
-		submitOp(append).map { returns =>
-			append.level match {
-				case AckLevel.Ack => returns.asInstanceOf[R]
-				
-				// TODO: can we wait only until replicated, instead of until fully executed?
-				// Need to also trigger execution post-append, rather then at-append-time
-				case AckLevel.NoAck | AckLevel.AppendAck => ().asInstanceOf[R] // R is always Unit for these ack levels
-			}
-		}
+	def append[A, R](append: Append): IO[AckReturns] = {
+		submitOp(append)
 	}
 
 	def continue[A, R](cont: Continue): IO[Unit] = {
@@ -149,10 +140,10 @@ final class ServerTask private[server] (
 	private def handle(cmd: TaskCommand[?]): IO[Unit] = {
 		cmd match {
 			case c: Continue => {
-				val eval: SyncIO[EvalState] = for {
+				val eval: SyncIO[(EvalState, Either[EvalFailure, Unit])] = for {
 					// TODO create state per batch, not individual elem
 					evalState <- EvalState(speculative, pendingAck = None)
-					_ <- c.partitions.traverse_ { partitioned =>
+					result <- c.partitions.traverse_ { partitioned =>
 						val (edgeId, envs) = partitioned.value
 						evaluator.continue(
 							c.origin,
@@ -163,13 +154,20 @@ final class ServerTask private[server] (
 							c.continuation,
 							envs
 						)
+					}.attempt.map {
+						// in case of failure, send edge nacks
+						case Left(err) => {
+							val edges = c.partitions.toList.map(p => (c.origin, p.value._1))
+							Left(new EvalFailure(err, edges))
+						}
+						case Right(()) => Right(())
 					}
 					_ <- if (evalState.outputs.registeredEvalSinks.isEmpty) {
 						SyncIO.unit
 					} else {
 						SyncIO.raiseError(new RuntimeException("Continuation registered eval sinks"))
 					}
-				} yield (evalState)
+				} yield (evalState, result)
 				handleEval(eval)
 			}
 
@@ -177,7 +175,7 @@ final class ServerTask private[server] (
 				case Append(depot, partition, bytes, decoded, level) =>
 					// TODO: return early if the client isn't actually waiting for returns
 					val evalTopologies = subscribers(depot.id)
-					val eval: SyncIO[EvalState] = for {
+					val eval: SyncIO[(EvalState, Either[EvalFailure, Unit])] = for {
 						// TODO create state per batch, not individual elem
 						results <- EvalResults(instanceId, evalTopologies)
 						evalState <- EvalState(speculative, Some(PendingAck(results, reply, None)))
@@ -186,7 +184,7 @@ final class ServerTask private[server] (
 						// TODO: multiplex multiple commands into a single receiver, so we can just install one per batch
 						// speculative execution: run the depot-driven topologies for this
 						// record, capturing all writes into evalState
-						_ <- evalTopologies.traverse { topology =>
+						result <- evalTopologies.traverse_ { topology =>
 							SyncIO.fromTry(results.forTopology(topology)).flatMap { localResults =>
 								evaluator.run(
 									localResults,
@@ -196,8 +194,11 @@ final class ServerTask private[server] (
 									NonEmptyList.one(Map(topology.input.vid -> decoded))
 								)
 							}
+						}.attempt.map {
+							case Left(e) => Left(new EvalFailure(e, Nil))
+							case Right(()) => Right(())
 						}
-					} yield evalState
+					} yield (evalState, result)
 					handleEval(eval)
 
 				case Invoke(q, value) => ???
@@ -205,12 +206,11 @@ final class ServerTask private[server] (
 		}
 	}
 
-	private def handleEval(eval: SyncIO[EvalState]): IO[Unit] = {
+	private def handleEval(eval: (SyncIO[(EvalState, Either[EvalFailure, Unit])])): IO[Unit] = {
 		// common logic for append & continue branches in `handle`
-		eval.attempt.to[IO].flatMap {
-			case Right(evalState) =>
-				val txId = ??? : LogIndex
-				val update = evalState.toUpdate(txId)
+		eval.to[IO].flatMap {
+			case (evalState, Right(())) =>
+				val update = evalState.toUpdate
 				// pipeline: block only when the in-flight bound is reached —
 				// the slot is released by the await loop when this proposal resolves
 				for {
@@ -220,7 +220,19 @@ final class ServerTask private[server] (
 					_ <- speculative.append(seq, update).to[IO]
 					_ <- submissions.offer(submission)
 				} yield ()
-			case Left(ex) => ???
+			case (evalState, Left(failure)) => {
+				// evaluation failed, send a nack
+				val outputs = new EvalState.Outputs()
+				log.warn(s"Evaluation failed", failure.error) *>
+				failure.notifications.traverse_ { (origin, edgeId) =>
+					outputs.addFailureNotification(origin, edgeId)
+				}.to[IO] *>
+				// handle local pendingAck immediately, don't bother routing via outputs
+				evalState.pendingAck.traverse_ { ack =>
+					ack.release.sequence *> ack.reply.complete(Failure(failure.error)).void
+				} *>
+				outputsQueue.offer(outputs, None)
+			}
 		}
 	}
 
@@ -260,7 +272,8 @@ final class ServerTask private[server] (
 				edge = notification.edge.id,
 				value = notification.value.map { v =>
 					ByteString.copyFrom(notification.agg.codec.asAny.encode(v))
-				}
+				},
+				failure = notification.failure
 			), Metadata()).void.timeout(2.seconds)
 		}
 	}
@@ -280,7 +293,7 @@ final class ServerTask private[server] (
 				}.flatMap { releaseEvalSinks =>
 					val cleanup = releaseEvalSinks.sequence_
 					// then perform remote ops in parallel (continuations and notifications)
-					IO.race(
+					(
 						// TODO group by task, then by leader?
 						outputs.continuations.traverse_ { cont =>
 							clusterClient.invokeGrpc(cont.origin.instanceId) { client =>
@@ -290,9 +303,8 @@ final class ServerTask private[server] (
 						
 						// TODO group by origin
 						outputs.notifications.traverse_ { (origin, notification) => notifyOriginOrLog(origin, notification) }
-					).guaranteeCase { outcome =>
+					).parTupled.guaranteeCase { outcome =>
 						pendingAck match {
-							// TODO: when pendingAck is None, it's a continuation. We could notify the origin so it doesn't have to rely on a timeout
 							case None => outcome match {
 									case Outcome.Succeeded(_) => IO.unit
 									case _ => cleanup
@@ -363,6 +375,10 @@ object ServerTask {
 		}
 	}
 
+	class EvalFailure(
+		val error: Throwable,
+		val notifications: List[(Origin, EdgeId)]
+	)
 
 	/** One executor per task; its fibers run for the resource's lifetime */
 	def resource(

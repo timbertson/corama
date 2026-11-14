@@ -9,8 +9,9 @@ import cats.effect.Resource
 import corama.server.ratis.Server
 import corama.interpreter.IOMap
 import corama.server.ratis.RatisClusterClient
+import flogger.IOLogging
 
-object Cluster {
+object Cluster extends IOLogging {
 	// Run a full cluster on localhost
 	def runningCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, ClusterClient] = {
 		{
@@ -30,6 +31,9 @@ object Cluster {
 	{
 		val instanceLog = log.addContext("instance" -> instance.id.id.toString())
 		ActiveResource(for {
+			_ <- Resource.eval(IO.whenA(config.numInstances < 3)(
+				log.warn(s"Running a cluster with only ${config.numInstances} is not robust; at least 3 are required for HA + durability")
+			))
 			client <- RatisClusterClient(config)
 			pair <- Server(config, topologies, instance, client)(using instanceLog).resource
 		} yield pair)

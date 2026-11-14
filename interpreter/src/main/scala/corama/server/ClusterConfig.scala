@@ -60,7 +60,8 @@ case class ClusterConfig(
 	numPartitions: Int,
 	dataRoot: String,
 ) {
-	private val numTasks = instances.size
+	val numTasks = tasks.size
+	val numInstances = instances.size
 	def raftGroup(taskId: TaskId): Try[RaftGroup] = {
 		for {
 			groupInstances <- NonEmptyList.fromList(instances.filter(_.tasks.contains_(taskId))).toRight(
@@ -187,7 +188,7 @@ object ClusterConfig {
 			idNel <- NonEmptyList.fromList(ids)
 				.toRight(new RuntimeException("instances cannot be empty")).toTry
 			instances = idNel.zipWithIndex.map { (id, index) =>
-				val tasks = NonEmptyList.of(index, index + 1, index + 2).map(i => TaskId(i % numTasks))
+				val tasks = NonEmptyList.of(index, index + 1, index + 2).map(i => TaskId(i % numTasks)).distinct
 				ClusterInstance(id, tasks)
 			}
 		} yield (tasks, instances)

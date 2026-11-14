@@ -3,13 +3,10 @@ package corama.interpreter
 import cats.effect.IO
 import cats.effect.kernel.Ref
 import cats.effect.std.Queue
-import cats.syntax.all.*
 import corama.InstanceId
 import fs2.Stream
 import flogger.{Log, IOLogging}
 import corama.server.InMemoryGroup
-import org.apache.ratis.server.protocol.TermIndex
-
 
 class NotLeader(val leader: Option[InstanceId])
 	extends RuntimeException(s"not the leader (hint: ${leader.fold("unknown")(_.id.toString)})")
@@ -46,7 +43,6 @@ final class InMemoryRepLog(
 )(using Log[IO]) extends RepLog with IOLogging {
 	private val log = Ref.unsafe[IO, Vector[(LogIndex, ReplicationUpdate)]](Vector.empty)
 	private val appliedRef = Ref.unsafe[IO, LogIndex](LogIndex(0))
-	private val committedTx = Ref.unsafe[IO, Set[LogIndex]](Set.empty)
 	private val taskLeadership = group.leadership(instanceId)
 
 	private def requireLeader: IO[Unit] = taskLeadership.currentLeader.flatMap { leader =>
@@ -61,7 +57,6 @@ final class InMemoryRepLog(
 			entries <- log.get
 			index = LogIndex(entries.size)
 			_ <- log.update(_.appended(index -> update))
-			_ <- committedTx.update(_ + update.id)
 			_ <- pendingApply.offer(index -> update)
 		} yield Proposal.completedNow(index)
 	}
@@ -74,8 +69,6 @@ final class InMemoryRepLog(
 			_ <- appliedOffsetsQueue.offer(index)
 		} yield ()
 	}.foreverM
-
-	def isCommitted(txId: LogIndex): IO[Boolean] = committedTx.get.map(_.contains(txId))
 
 	def appliedOffsets: Stream[IO, LogIndex] = {
 		Stream.fromQueueUnterminated(appliedOffsetsQueue)

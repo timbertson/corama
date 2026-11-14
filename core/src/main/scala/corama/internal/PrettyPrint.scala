@@ -2,6 +2,7 @@ package corama.internal
 
 import corama.Topology
 import izumi.reflect.Tag
+import corama.Topologies
 
 object PrettyPrint {
 	case class State(indent: Int) {
@@ -11,6 +12,10 @@ object PrettyPrint {
 	
 	def format[S, R](topology: Topology[S, R]) = {
 		lines(topology).mkString("\n")
+	}
+
+	def format(topologies: Topologies) = {
+		topologies.topologies.flatMap(lines).mkString("\n")
 	}
 
 	private def cls[A](tag: Tag[A]): String = {
