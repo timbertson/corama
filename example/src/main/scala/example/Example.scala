@@ -65,10 +65,11 @@ object Example extends IOApp with IOLogging {
 			// a retry can't lose it (Main.scala:196-200); the same concern applies here.
 			_ <- Flow.hashPartition(ticketId)
 			_ <- ticketId.foreach { id => println(s"Getting ticket ${id}") }
-			existing <- fullTickets.key(ticketId).get
-			_ <- existing.foreach { id => println(s"Got ticket ${id} @ ${existing}") }
-			_ <- existing.filter(_.isDefined)
-			previousOwner <- existing.map(_.flatMap(_.assignee))
+			existingOpt <- fullTickets.key(ticketId).get
+			_ <- existingOpt.foreach { id => println(s"Got ticket ${id} @ ${existingOpt}") }
+			// TODO: filterMap is clearer
+			existing <- existingOpt.explodeBy(_.toList)
+			previousOwner <- existing.map(_.assignee)
 			_ <- fullTickets.key(ticketId).updateWith(newOwner) { (cur, owner) =>
 				cur.map(_.copy(assignee = Some(owner)))
 			}
@@ -80,9 +81,8 @@ object Example extends IOApp with IOLogging {
 			_ <- userTickets.key(newOwner).add(ticketId)
 
 			// And remove from the previous owner, when there was a different one.
-			hop <- previousOwner.mapWith(newOwner)((prev, now) => prev.filter(_ != now))
-			_ <- hop.filter(_.isDefined)
-			oldOwner <- hop.map(_.get)
+			oldOwnerOpt <- previousOwner.mapWith(newOwner)((prev, now) => prev.filter(_ != now))
+			oldOwner <- oldOwnerOpt.explodeBy(_.toList)
 			_ <- Flow.hashPartition(oldOwner)
 			_ <- userTickets.key(oldOwner).remove(ticketId)
 		} yield previousOwnerList
@@ -99,9 +99,9 @@ object Example extends IOApp with IOLogging {
 			// fans out each ID
 			ticketId <- ids.explodeBy(_.toList.sorted)
 			_ <- Flow.hashPartition(ticketId)
-			full <- fullTickets.key(ticketId).get
-			_ <- full.filter(_.isDefined)
-			ticket <- full.map(_.get.ticket)
+			fullOpt <- fullTickets.key(ticketId).get
+			full <- fullOpt.explodeBy(_.toList)
+			ticket <- full.map(_.ticket)
 			tickets <- ticket.into[List]
 		} yield tickets
 	}

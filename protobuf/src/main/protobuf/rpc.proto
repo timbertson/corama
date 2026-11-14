@@ -3,6 +3,7 @@ package streamdsl;
 
 import "google/protobuf/wrappers.proto";
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 // CoramaApi is a uniform API implemented by all nodes.
 // Requests may land on any node, and will be internally
@@ -85,11 +86,12 @@ message Either {
 // -- internal API
 
 message ContinueRequest {
-	int32 taskId = 1;
-	int32 topologyId = 2;
-	int32 afterNode = 4;
-	EvalOrigin origin = 5;
-	repeated PartitionEnvs partitions = 6;
+	google.protobuf.Timestamp deadline = 1; // TODO use native GRPC deadline?
+	int32 taskId = 2;
+	int32 topologyId = 3;
+	int32 afterNode = 5;
+	EvalOrigin origin = 6;
+	repeated PartitionEnvs partitions = 7;
 }
 
 message PartitionEnvs {

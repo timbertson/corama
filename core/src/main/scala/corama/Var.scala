@@ -85,7 +85,10 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 	private [corama] def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
 
 	def map[B](f: A => B)(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.MapN(tag, codec, pos, List(this.asAny), {
-		case List(v) => f(v.asInstanceOf[A])
+		case List(v) => {
+			println(s"${this} casting ${v} to ${this.tag}")
+			f(v.asInstanceOf[A])
+		}
 		case other => impossible(s"map with ${other.length}")
 	})
 
@@ -126,7 +129,10 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 	def explode[B](implicit pos: SourcePos, tag: Tag[B], codec: Codec[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
 
 	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.ExplodeOp(tag, codec, pos, List(this.asAny), {
-		case List(a) => f(a.asInstanceOf[A])
+		case List(a) => {
+			println(s"applying explode fn to ${a}")
+			f(a.asInstanceOf[A])
+		}
 		case other => impossible(s"explode with ${other.length}")
 	})
 

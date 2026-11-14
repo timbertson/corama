@@ -29,6 +29,7 @@ import streamdsl.rpc.NotifyRequest
 import corama.interpreter.IncomingEvalRouter
 import flogger.Log
 import flogger.IOLogging
+import java.time.Instant
 
 class InstanceController(
 	config: ClusterConfig,
@@ -84,6 +85,7 @@ class InstanceController(
 				task <- requireLeader(taskId)
 				topology <- IO.fromTry(topologies.get(topologyId))
 				originProto <- require("origin", request.origin)
+				deadlineProto <- require("deadline", request.deadline)
 				origin = Origin(InstanceId(originProto.instanceId), EvalId(originProto.evalId))
 				partitions <- IO.fromTry {
 					requireNel("partitions", request.partitions.toList).flatMap { partitions =>
@@ -106,6 +108,7 @@ class InstanceController(
 				}
 				continuation <- IO.fromTry(topology.continuationAfter(NodeId(request.afterNode)))
 				_ <- task.continue(TaskCommand.Continue(
+					Instant.ofEpochSecond(deadlineProto.seconds, deadlineProto.nanos),
 					origin,
 					topology.id,
 					continuation,

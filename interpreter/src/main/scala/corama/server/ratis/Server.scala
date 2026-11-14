@@ -73,7 +73,7 @@ object Server extends IOLogging {
 				.build()
 			))
 			
-			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
+			(incomingEvalRouter, evalRouterBg) <- IncomingEvalRouter(config).resource
 
 			_ <- Resource.eval(log.info(s"Starting server on ${networkConfig}"))
 			_ <- Resource.eval(IO.blocking {
@@ -112,7 +112,7 @@ object Server extends IOLogging {
 
 			_ <- grpcServer(networkConfig.bindGrpcSocket, controller, apiController)
 
-		} yield (new RatisServer(instance.id, server, clusterClient), bg)
+		} yield (new RatisServer(instance.id, server, clusterClient), Util.joinNothings(List(bg, evalRouterBg)))
 		
 		ActiveResource(res)
 	}
@@ -162,7 +162,7 @@ object Server extends IOLogging {
 		instance: ClusterInstance
 	)(using log: Log[IO]): ActiveResource[IO, InMemoryServer] = {
 		val res = for {
-			incomingEvalRouter <- Resource.eval(IncomingEvalRouter.apply)
+			(incomingEvalRouter, evalRouterBg) <- IncomingEvalRouter(config).resource
 			taskResources <- instance.tasks.traverse { taskId =>
 				for {
 					pstate <- Resource.eval(PStateView.inMemory)
@@ -190,7 +190,7 @@ object Server extends IOLogging {
 			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
 			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
 			server = new InMemoryServer(instance.id, controller)
-		} yield (server, bg)
+		} yield (server, Util.joinNothings(List(bg, evalRouterBg)))
 		ActiveResource(res)
 	}
 	

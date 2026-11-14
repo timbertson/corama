@@ -86,8 +86,8 @@ object PrettyPrint {
 					(Some(combine.out), nodeLines(indented, combine.block))
 			}
 
-			val outStr = out.fold("")(out => s" => {${out.id}}")
-			val depsList = node.op.deps.inputs.map(_.id).toList.sorted.mkString("{", ",", "}")
+			val outStr = out.fold("")(out => s" => {${out}}")
+			val depsList = node.op.deps.inputs.map(_.toString).toList.sorted.mkString("{", ",", "}")
 			val firstLine = s"$i* ${node.id.id}| ${opStr}: ${depsList}${outStr}"
 			firstLine :: tailLines
 		}

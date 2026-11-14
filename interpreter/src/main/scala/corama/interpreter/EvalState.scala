@@ -1,5 +1,6 @@
 package corama.interpreter
 
+import streamdsl.rpc
 import scala.collection.mutable
 import cats.syntax.all.*
 import corama.*
@@ -11,12 +12,13 @@ import corama.internal.NodeId
 import com.google.protobuf.ByteString
 import corama.server.ServerTask
 import cats.data.NonEmptyList
+import java.time.Instant
 
 // A mutable snapshot collecting updates (and serving a view), used for a single eval batch
 // Unsafe (mutation), must not be accessed concurrently
 // TODO: should this use Ref[SyncIO] for safety, or are the mutable collections more efficient?
-final class EvalState(base: PStateView, val pendingAck: Option[ServerTask.PendingAck]) extends PStateView {
-	val outputs = new EvalState.Outputs()
+final class EvalState(base: PStateView, val pendingAck: Option[ServerTask.PendingAck], val deadline: Instant) extends PStateView {
+	val outputs = new EvalState.Outputs(Some(deadline))
 	private val depotAppends = new mutable.HashMap[DepotId, mutable.ArrayBuffer[Partitioned[DepotAppend]]]()
 	private val pstateUpdates = new mutable.HashMap[PStateKey, Option[Bytes]]()
 
@@ -46,12 +48,12 @@ final class EvalState(base: PStateView, val pendingAck: Option[ServerTask.Pendin
 }
 
 object EvalState {
-	def apply(speculative: SpeculativeState, pendingAck: Option[ServerTask.PendingAck]): SyncIO[EvalState] = {
-		speculative.snapshot.map(new EvalState(_, pendingAck))
+	def apply(speculative: SpeculativeState, pendingAck: Option[ServerTask.PendingAck], deadline: Instant): SyncIO[EvalState] = {
+		speculative.snapshot.map(new EvalState(_, pendingAck, deadline))
 	}
 
 	// effectful outputs which are handled after the data changes are persisted
-	class Outputs {
+	class Outputs(val deadline: Option[Instant]) {
 		private val notificationBuffer = new mutable.HashMap[Origin, EvalNotification]()
 		private val continuationBuffer = new mutable.ArrayBuffer[EvalContinuation]()
 		private val evalSinkBuffer = new mutable.ArrayBuffer[LocalEvalSink[?]]()
@@ -132,8 +134,9 @@ case class EvalContinuation(
 )
 
 object EvalContinuation {
-	import streamdsl.rpc
-	def toProtobuf(c: EvalContinuation) = rpc.ContinueRequest.of(
+	import com.google.protobuf.timestamp.Timestamp
+	def toProtobuf(c: EvalContinuation, deadline: Option[Instant]) = rpc.ContinueRequest.of(
+		deadline = deadline.map(deadline => Timestamp.of(seconds = deadline.getEpochSecond(), nanos = deadline.getNano())),
 		taskId = c.taskId.id,
 		origin = Some(rpc.EvalOrigin.of(instanceId = c.origin.instanceId.id, evalId = c.origin.evalId.id)),
 		topologyId = c.topologyId.value,

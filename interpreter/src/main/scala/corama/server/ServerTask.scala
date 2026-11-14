@@ -14,7 +14,6 @@ import cats.effect.kernel.Resource
 import cats.effect.std.Queue
 import cats.syntax.all.*
 import corama.*
-import corama.AckLevel.AppendAck
 import corama.error.Util
 import corama.interpreter.*
 import corama.interpreter.SpeculativeState
@@ -30,11 +29,14 @@ import io.grpc.Metadata
 import corama.server.TaskCommand.OpCommand
 import com.google.protobuf.ByteString
 import cats.data.NonEmptyList
+import java.time.Instant
+import cats.effect.Clock
 
 private[server] sealed trait TaskCommand[A]
 private[server] sealed trait TaskOp[A]
 private[server] object TaskCommand {
 	case class Continue(
+		deadline: Instant,
 		origin: Origin,
 		topologyId: TopologyId,
 		continuation: Continuation,
@@ -77,6 +79,7 @@ class PersistentDbView(db: RocksDb) extends PStateView {
 final class ServerTask private[server] (
 	val instanceId: InstanceId,
 	val task: TaskId,
+	clusterConfig: ClusterConfig,
 	speculative: SpeculativeState,
 	clusterClient: ClusterClient,
 	replog: RepLog,
@@ -142,7 +145,7 @@ final class ServerTask private[server] (
 			case c: Continue => {
 				val eval: SyncIO[(EvalState, Either[EvalFailure, Unit])] = for {
 					// TODO create state per batch, not individual elem
-					evalState <- EvalState(speculative, pendingAck = None)
+					evalState <- EvalState(speculative, pendingAck = None, deadline = c.deadline)
 					result <- c.partitions.traverse_ { partitioned =>
 						val (edgeId, envs) = partitioned.value
 						evaluator.continue(
@@ -176,9 +179,11 @@ final class ServerTask private[server] (
 					// TODO: return early if the client isn't actually waiting for returns
 					val evalTopologies = subscribers(depot.id)
 					val eval: SyncIO[(EvalState, Either[EvalFailure, Unit])] = for {
+						now <- Clock[SyncIO].realTimeInstant
+						deadline = now.plusMillis(clusterConfig.evalTimeout.toMillis)
 						// TODO create state per batch, not individual elem
-						results <- EvalResults(instanceId, evalTopologies)
-						evalState <- EvalState(speculative, Some(PendingAck(results, reply, None)))
+						results <- EvalResults(clusterConfig, instanceId, evalTopologies)
+						evalState <- EvalState(speculative, Some(PendingAck(results, reply, None)), deadline)
 						_ <- evalState.append(depot.id, partition, bytes)
 
 						// TODO: multiplex multiple commands into a single receiver, so we can just install one per batch
@@ -222,7 +227,7 @@ final class ServerTask private[server] (
 				} yield ()
 			case (evalState, Left(failure)) => {
 				// evaluation failed, send a nack
-				val outputs = new EvalState.Outputs()
+				val outputs = new EvalState.Outputs(deadline = None)
 				log.warn(s"Evaluation failed", failure.error) *>
 				failure.notifications.traverse_ { (origin, edgeId) =>
 					outputs.addFailureNotification(origin, edgeId)
@@ -282,6 +287,15 @@ final class ServerTask private[server] (
 		// TODO: is this OK to do in parallel? I think it's valid for any `hashPartition` logic
 		// to be reordered with concurrently-executing eval steps
 		Stream.fromQueueUnterminated(outputsQueue)
+			.evalFilter { (outputs, _) =>
+				outputs.deadline.traverse { deadline =>
+					Clock[IO].realTimeInstant.flatMap { now =>
+						val keep = deadline.isAfter(now)
+						IO.whenA(!keep)(log.debug(s"Dropping outputs for eval with deadline ${deadline}"))
+							.as(keep)
+					}
+				}.map(_.getOrElse(true))
+			}
 			.parEvalMapUnordered(MAX_INFLIGHT_ACKS) { (outputs, pendingAck) =>
 				// complete any local results
 				outputs.localResults.traverse_ { (local, edge, values) =>
@@ -297,7 +311,7 @@ final class ServerTask private[server] (
 						// TODO group by task, then by leader?
 						outputs.continuations.traverse_ { cont =>
 							clusterClient.invokeGrpc(cont.origin.instanceId) { client =>
-								client.continue(EvalContinuation.toProtobuf(cont), Metadata())
+								client.continue(EvalContinuation.toProtobuf(cont, outputs.deadline), Metadata())
 							}
 						},
 						
@@ -391,7 +405,7 @@ object ServerTask {
 		replog: RepLog,
 		speculative: SpeculativeState,
 		
-		metadata: ClusterConfig,
+		clusterConfig: ClusterConfig,
 		taskLeadership: InstanceTaskLeadership,
 		evalRouter: IncomingEvalRouter,
 
@@ -405,13 +419,14 @@ object ServerTask {
 			serverTask = ServerTask(
 				instanceId,
 				task,
+				clusterConfig,
 				speculative,
 				clusterClient,
 				replog,
 				taskLeadership,
 				evalRouter,
 				topologies,
-				new Eval(metadata, log),
+				new Eval(clusterConfig, log),
 				commands,
 				submissions,
 				outputs,

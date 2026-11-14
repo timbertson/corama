@@ -13,6 +13,10 @@ import cats.effect.Deferred
 import corama.internal.HexString
 import corama.internal.HexId
 import cats.effect.SyncIO
+import java.time.Instant
+import corama.server.ClusterConfig
+import scala.concurrent.duration.FiniteDuration
+import cats.effect.Clock
 
 // Tracker for every topology spawned by a given depot append (or query)
 private[corama] final class EvalResults(results: Map[TopologyId, LocalEvalSink[?]])(using log: Log[IO]) extends IOLogging {
@@ -30,13 +34,18 @@ private[corama] final class EvalResults(results: Map[TopologyId, LocalEvalSink[?
 }
 
 private[corama] object EvalResults extends IOLogging with SyncIOLogging {
-	def apply(instanceId: InstanceId, topologies: List[Topology[?, ?]])(using baseLog: Log[IO]): SyncIO[EvalResults] = {
+	def apply(clusterConfig: ClusterConfig, instanceId: InstanceId, topologies: List[Topology[?, ?]])(using baseLog: Log[IO]): SyncIO[EvalResults] = {
 		val syncLog: Log[SyncIO] = Log.from(baseLog)
 		syncLog.debug(s"Creating a local result sink for ${topologies.map(_.id)}") *>
 		(topologies.traverse { topology =>
 			given log: Log[IO] = baseLog.addContext("topology" -> topology.id.value.toString())
-			EvalSink.local[topology.Result](instanceId, topology.output.vid, topology.agg, EdgeId.startingEdge(topology.id))
-				.map(topology.id -> _)
+			EvalSink.local[topology.Result](
+				clusterConfig.evalTimeout,
+				instanceId,
+				topology.output.vid,
+				topology.agg,
+				EdgeId.startingEdge(topology.id)
+			).map(topology.id -> _)
 		}.map { topologyResults =>
 			new EvalResults(topologyResults.toMap)
 		})
@@ -98,6 +107,7 @@ private[corama] final class LocalEvalSink[R](
 	log: Log[IO],
 	xorState: Ref[IO, Long],
 	acc: Ref[IO, R],
+	val deadline: Instant,
 	done: Deferred[IO, Try[R]],
 ) extends EvalSink[R] with EvalSource with IOLogging {
 	def asAny: LocalEvalSink[Any] = this.asInstanceOf[LocalEvalSink[Any]]
@@ -131,12 +141,14 @@ private[corama] final class LocalEvalSink[R](
 }
 
 private [corama] object EvalSink {
-	def local[R](instanceId: InstanceId, out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): SyncIO[LocalEvalSink[R]] = {
+	def local[R](timeout: FiniteDuration, instanceId: InstanceId, out: VarId, agg: Agg[R], start: EdgeId)(using log: Log[IO]): SyncIO[LocalEvalSink[R]] = {
 		for {
+			now <- Clock[SyncIO].realTimeInstant
+			deadline = now.plusMillis(timeout.toMillis)
 			evalId <- EvalId.generate
 			xorState <- Ref.in[SyncIO, IO, Long](start.id)
 			acc <- Ref.in[SyncIO, IO, R](agg.zero)
 			done <- Deferred.in[SyncIO, IO, Try[R]]
-		} yield new LocalEvalSink(Origin(instanceId, evalId), out, agg, log, xorState, acc, done)
+		} yield new LocalEvalSink(Origin(instanceId, evalId), out, agg, log, xorState, acc, deadline, done)
 	}
 }

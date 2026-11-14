@@ -45,7 +45,8 @@ class ApiController(
 				_ <- log.debug(s"Resolved partition task $taskId ($partition) to leader $leader")
 				response <- clusterClient.invokeGrpc(leader)(block)
 			} yield response
-			result <- Retry(fetch)
+			// result <- Retry(fetch)
+			result <- fetch
 		} yield result
 	}
 }

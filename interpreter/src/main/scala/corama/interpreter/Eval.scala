@@ -109,7 +109,9 @@ class Eval(
 										// we expand each of these into `out` in a
 										// copy of the parent env
 										envs.flatTraverse { env =>
+											println(s"env[$ins] = ${ins.map(env(_))}")
 											val seq = fn(ins.map(env(_))).asInstanceOf[Seq[?]]
+											println(s"exploded to seq ${seq}, storing in $out")
 											NonEmptyList.fromList(seq.toList).map { nel =>
 												nel.map { value =>
 													env.updated(out, value)
@@ -211,17 +213,18 @@ class Eval(
 										}
 										val rawOpts = SelectOptions.Raw(after, options.maxItems)
 										evalState.select(key, rawOpts).map { result =>
-											env.updated(out, result.map(out.codec.decodeEx))
+											env.updated(out, result.map(path.codec.decodeEx))
 										}
 									}
 
 									case PStateOp.Get(out: VarId) =>
 										evalState.get(PStateKey(partitionId, ps, path, env)).map { stored =>
-											env.updated(out, stored.map(out.codec.decodeEx))
+											println(s"pstate get updating out $out with ${stored}")
+											env.updated(out, stored.map(path.codec.decodeEx))
 										}
 
 									case PStateOp.Put(v: VarId) => {
-										evalState.put(PStateKey(partitionId, ps, path, env), Some(v.codec.encode(env(v)))).as(env)
+										evalState.put(PStateKey(partitionId, ps, path, env), Some(path.codec.encode(env(v)))).as(env)
 									}
 								}
 							}.flatMap { updatedEnvs =>

@@ -133,6 +133,7 @@ private[corama] object Node {
 
 			case e: Flow.ExplodeOp[A] =>
 				val out = t.define[A](e.tag, e.codec, e.pos, "exploded")
+				println(s"compiling explodeOp output to $out")
 				val f = e.f
 				(List(n(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Explode(out.vid)))), out)
 

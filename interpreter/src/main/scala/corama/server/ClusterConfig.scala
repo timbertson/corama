@@ -18,6 +18,7 @@ import cats.data.NonEmptyList
 import corama.PartitionId
 import corama.interpreter.Partitioned
 import cats.effect.std.Random
+import scala.concurrent.duration.*
 
 case class PerInstance[T](default: Option[T], overrides: Map[InstanceId, T]) {
 	def get(id: InstanceId): Try[T] = {
@@ -59,6 +60,7 @@ case class ClusterConfig(
 	networkConfig: PerInstance[NetworkConfig],
 	numPartitions: Int,
 	dataRoot: String,
+	evalTimeout: FiniteDuration,
 ) {
 	val numTasks = tasks.size
 	val numInstances = instances.size
@@ -124,25 +126,39 @@ object ClusterConfig {
 		Range(0, numInstances).map(i => InstanceId(s"instance-$i")).toList
 
 	// generate a random ephemeral cluster config on localhost. data files are removed on release
-	def ephemeral(numTasks: Int = 2, numPartitions: Int = 2, numInstances: Int = 2): Resource[IO, ClusterConfig] = {
+	def ephemeral(
+		numTasks: Int = 2,
+		numPartitions: Int = 2,
+		numInstances: Int = 2,
+		evalTimeout: FiniteDuration = 2.seconds,
+	): Resource[IO, ClusterConfig] = {
 		tempDir().evalMap { dataRoot =>
 			local(
 				dataRoot = dataRoot.toString,
 				clusterId = None,
 				numInstances = numInstances,
 				numTasks = numTasks,
-				numPartitions = numPartitions
+				numPartitions = numPartitions,
+				evalTimeout = evalTimeout,
 			)
 		}
 	}
 
-	def persistentLocal(dataRoot: String, clusterId: Option[String] = None, numTasks: Int = 2, numPartitions: Int = 2, numInstances: Int = 2): IO[ClusterConfig] = {
+	def persistentLocal(
+		dataRoot: String,
+		clusterId: Option[String] = None,
+		numTasks: Int = 2,
+		numPartitions: Int = 2,
+		numInstances: Int = 2,
+		evalTimeout: FiniteDuration = 2.seconds,
+	): IO[ClusterConfig] = {
 		local(
 			dataRoot = dataRoot,
 			clusterId = clusterId,
 			numInstances = numInstances,
 			numTasks = numTasks,
-			numPartitions = numPartitions
+			numPartitions = numPartitions,
+			evalTimeout = evalTimeout
 		)
 	}
 
@@ -152,6 +168,7 @@ object ClusterConfig {
 		numInstances: Int,
 		numTasks: Int,
 		numPartitions: Int,
+		evalTimeout: FiniteDuration,
 	): IO[ClusterConfig] = {
 		for {
 			(tasks, instances) <- IO.fromTry(assignTasks(numTasks, genIds(numInstances)))
@@ -176,6 +193,7 @@ object ClusterConfig {
 			instances = instances,
 			networkConfig = PerInstance(networkConfig.toList.toMap),
 			dataRoot = dataRoot,
+			evalTimeout = evalTimeout,
 		)
 	}
 	
