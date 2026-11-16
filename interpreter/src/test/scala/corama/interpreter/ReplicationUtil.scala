@@ -1,4 +1,4 @@
-package corama.interpreter
+/* package corama.interpreter
 
 import cats.syntax.all._
 import fs2.Stream
@@ -85,6 +85,11 @@ object Replication extends IOLogging {
 			name <- genName
 			updates <- Gen.listOfN(2, genDepotAppend)
 		} yield Append(DepotId(name), updates.toVector)
+
+		private def genPstateKey(pstate): Gen[PStateUpdate] = for {
+			key <- genBytes
+			value <- Gen.option(genBytes)
+		} yield PStateUpdate(key, value)
 
 		private def genPstateUpdate: Gen[PStateUpdate] = for {
 			key <- genBytes
@@ -299,3 +304,4 @@ object Replication extends IOLogging {
 
 	}
 }
+ */

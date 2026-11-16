@@ -107,10 +107,10 @@ object Server extends IOLogging {
 				))
 			}.resource
 			
-			controller = new InstanceController(config, topologies, incomingEvalRouter, IOMap(taskResources))
+			instanceController = new InstanceController(config, topologies, incomingEvalRouter, IOMap(taskResources))
 			apiController = new ApiController(config, clusterClient)
 
-			_ <- grpcServer(networkConfig.bindGrpcSocket, controller, apiController)
+			_ <- grpcServer(networkConfig.bindGrpcSocket, instanceController, apiController)
 
 		} yield (new RatisServer(instance.id, server, clusterClient), Util.joinNothings(List(bg, evalRouterBg)))
 		
@@ -133,12 +133,12 @@ object Server extends IOLogging {
 
 	private def grpcServer(
 		address: InetSocketAddress,
-		controller: InstanceController,
+		instanceController: InstanceController,
 		apiController: ApiController,
 	)(using log: Log[IO]): Resource[IO, io.grpc.Server] = {
 		import fs2.grpc.syntax.all._
 		for {
-			instanceService <- rpc.CoramaInstanceFs2Grpc.bindServiceResource(controller)
+			instanceService <- rpc.CoramaInstanceFs2Grpc.bindServiceResource(instanceController)
 			apiService <- rpc.CoramaFs2Grpc.bindServiceResource(apiController)
 			server <- NettyServerBuilder
 				.forAddress(address)
@@ -152,7 +152,8 @@ object Server extends IOLogging {
 
 	class InMemoryServer(
 		val instanceId: InstanceId,
-		val controller: InstanceController,
+		val instanceController: InstanceController,
+		val apiController: ApiController,
 	) extends Server
 
 	def inMemory(
@@ -187,9 +188,10 @@ object Server extends IOLogging {
 				)
 			}
 			serverTaskMap = IOMap(taskResources.map(_._1))
-			controller = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
+			instanceController = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
 			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
-			server = new InMemoryServer(instance.id, controller)
+			apiController = new ApiController(config, clusterClient)
+			server = new InMemoryServer(instance.id, instanceController, apiController)
 		} yield (server, Util.joinNothings(List(bg, evalRouterBg)))
 		ActiveResource(res)
 	}

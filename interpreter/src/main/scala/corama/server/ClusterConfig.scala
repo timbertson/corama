@@ -53,7 +53,7 @@ case class ClusterInstance(id: InstanceId, tasks: NonEmptyList[TaskId]) {
 	val peerId: RaftPeerId = RaftPeerId.valueOf(id.id)
 }
 
-case class ClusterConfig(
+case class ClusterConfig private(
 	id: ClusterId,
 	tasks: NonEmptyList[TaskId],
 	instances: NonEmptyList[ClusterInstance],
@@ -122,8 +122,10 @@ case class ClusterConfig(
 }
 
 object ClusterConfig {
-	private def genIds(numInstances: Int) =
-		Range(0, numInstances).map(i => InstanceId(s"instance-$i")).toList
+	private def genIds(numInstances: Int): Try[NonEmptyList[InstanceId]] =
+		NonEmptyList.fromList(
+			Range(0, numInstances).map(i => InstanceId(s"instance-$i")).toList
+		).toRight(new RuntimeException("numInstances cannot be 0")).toTry
 
 	// generate a random ephemeral cluster config on localhost. data files are removed on release
 	def ephemeral(
@@ -131,8 +133,9 @@ object ClusterConfig {
 		numPartitions: Int = 2,
 		numInstances: Int = 2,
 		evalTimeout: FiniteDuration = 2.seconds,
+		tempDirResource: Resource[IO, String] = tempDir(),
 	): Resource[IO, ClusterConfig] = {
-		tempDir().evalMap { dataRoot =>
+		tempDirResource.evalMap { dataRoot =>
 			local(
 				dataRoot = dataRoot.toString,
 				clusterId = None,
@@ -162,6 +165,28 @@ object ClusterConfig {
 		)
 	}
 
+	def make(
+		dataRoot: String,
+		instances: NonEmptyList[InstanceId],
+		networkConfig: PerInstance[NetworkConfig],
+		numTasks: Int,
+		numPartitions: Int,
+		evalTimeout: FiniteDuration,
+		clusterId: Option[String] = None,
+	): Try[ClusterConfig] = {
+		assignTasks(numTasks, instances).map { (tasks, instances) =>
+			new ClusterConfig(
+				id = ClusterId(clusterId.getOrElse("cluster")),
+				tasks = tasks,
+				numPartitions = numPartitions,
+				instances = instances,
+				networkConfig = networkConfig,
+				dataRoot = dataRoot,
+				evalTimeout = evalTimeout,
+			)
+		}
+	}
+
 	private def local(
 		dataRoot: String,
 		clusterId: Option[String],
@@ -171,7 +196,8 @@ object ClusterConfig {
 		evalTimeout: FiniteDuration,
 	): IO[ClusterConfig] = {
 		for {
-			(tasks, instances) <- IO.fromTry(assignTasks(numTasks, genIds(numInstances)))
+			instanceIds <- IO.fromTry(genIds(numInstances))
+			(tasks, instances) <- IO.fromTry(assignTasks(numTasks, instanceIds))
 			networkConfig <- instances.traverse { instance =>
 				// on localhost, each instance needs its own unique set of ports
 				for {
@@ -186,7 +212,7 @@ object ClusterConfig {
 					grpcPort,
 				))
 			}
-		} yield ClusterConfig(
+		} yield new ClusterConfig(
 			id = ClusterId(clusterId.getOrElse("cluster")),
 			tasks = tasks,
 			numPartitions = numPartitions,
@@ -197,15 +223,13 @@ object ClusterConfig {
 		)
 	}
 	
-	private def assignTasks(numTasks: Int, ids: List[InstanceId]): Try[(NonEmptyList[TaskId], NonEmptyList[ClusterInstance])] = {
+	private def assignTasks(numTasks: Int, ids: NonEmptyList[InstanceId]): Try[(NonEmptyList[TaskId], NonEmptyList[ClusterInstance])] = {
 		// each task is assigned to three consecutive instances, with wraparound
 		// i.e. task 0 is assigned to instance 0, -1, & -2
 		for {
 			tasks <- NonEmptyList.fromList(Range(0, numTasks).map(TaskId.apply).toList)
 				.toRight(new RuntimeException("numTasks cannot be 0")).toTry
-			idNel <- NonEmptyList.fromList(ids)
-				.toRight(new RuntimeException("instances cannot be empty")).toTry
-			instances = idNel.zipWithIndex.map { (id, index) =>
+			instances = ids.zipWithIndex.map { (id, index) =>
 				val tasks = NonEmptyList.of(index, index + 1, index + 2).map(i => TaskId(i % numTasks)).distinct
 				ClusterInstance(id, tasks)
 			}
@@ -221,8 +245,10 @@ object ClusterConfig {
 		}
 	}
 
-	def tempDir(desc: String = ""): Resource[IO, os.Path] =
-		Resource.make(IO.blocking(os.temp.dir(prefix = s"corama-$desc")))(deleteRecursive)
+	def tempDir(desc: String = ""): Resource[IO, String] =
+		Resource.make(
+			IO.blocking(os.temp.dir(prefix = s"corama-$desc"))
+		)(deleteRecursive).map(_.toString)
 
 	private def deleteRecursive(root: os.Path): IO[Unit] = IO.blocking(os.remove.all(root))
 }

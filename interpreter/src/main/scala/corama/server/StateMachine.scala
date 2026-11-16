@@ -104,7 +104,7 @@ class StateMachine(task: TaskId, val appliedOffsets: SignallingRef[IO, LogIndex]
 			}
 			// TODO: why is this a future if we're writing sync?
 			val rawIndex = entry.getIndex()
-			rocks.writeSync(StateMachine.applyWrites(update, rawIndex))
+			rocks.write(StateMachine.applyWrites(update, rawIndex)).unsafeRunSync()
 			updateLastAppliedTermIndex(entry.getTerm(), rawIndex)
 			appliedOffsets.set(LogIndex(rawIndex)).as(Message.EMPTY).unsafeToCompletableFuture()(using ioRuntime)
 		} catch {

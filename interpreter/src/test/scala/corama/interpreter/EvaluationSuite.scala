@@ -4,6 +4,7 @@ import cats.syntax.all.*
 import cats.effect.IO
 import flogger.*
 import weaver.scalacheck.Checkers
+import corama.server.Cluster
 
 object EvaluationSuite extends CoramaSuite {
 	import Fixtures.*
@@ -19,15 +20,15 @@ object EvaluationSuite extends CoramaSuite {
 			// .withPerPropertyParallelism(1)
 			// .withInitialSeed(org.scalacheck.rng.Seed.fromBase64("InbV10NadZ2Ad1lHST7nRvDRMRXiA9q7ZMM9KKS4VaL=").toOption)
 		)(gen) { (ctx, runSync) =>
-			val body = Interpreter.createCluster(ctx.root, clusterInstances, numPartitions = 4).use { interpreter =>
+			val body = Cluster.inMemoryCluster(clusterConfig, ctx.topologies).use { client =>
 				for {
-					ack <- interpreter.append(ctx.depot, List("Hello"))
+					ack <- client.append(ctx.depot, List("Hello"))
 					_ <- log.info(s"Got ackResults: $ack")
-					results = ctx.topologies.map(ack.result)
+					results = ctx.streamTopologies.map(ack.result)
 				} yield success
 			}
 			runSync(
-				ctx.topologies.toList.traverse_ { t =>
+				ctx.streamTopologies.toList.traverse_ { t =>
 					IO(println(t.topology.prettyPrint))
 				} *>
 				body

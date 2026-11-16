@@ -51,7 +51,7 @@ final class RocksDb private (val client: rocksdb.RocksDB) {
 	def get(key: Bytes): SyncIO[Option[Bytes]] = SyncIO(Option(client.get(key)))
 
 	/** Atomic batched write, fsynced — one WAL fsync spans the whole batch. */
-	def writeSync(updates: Seq[(Bytes, Option[Bytes])]): Unit = {
+	def write(updates: Seq[(Bytes, Option[Bytes])]): SyncIO[Unit] = SyncIO {
 		val writeOptions = new rocksdb.WriteOptions()
 		val batch = new rocksdb.WriteBatch()
 		try {

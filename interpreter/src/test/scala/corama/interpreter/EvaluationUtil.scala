@@ -137,20 +137,20 @@ object Evaluation {
 		}
 	}
 
-	def map[A](s: State[A])(using g: Generics[A]): Gen[State[A]] = {
+	def map[A](s: State[A])(using codec: Codec[A])(using g: Generics[A]): Gen[State[A]] = {
 		given Tag[A] = g.tag
 		g.mapFn.flatMap { fn =>
 			s.extend(_.map[List[A]](fn))
 		}
 	}
 
-	def filter[A](s: State[A])(using g: Generics[A]): Gen[State[A]] = {
+	def filter[A](s: State[A])(using codec: Codec[A])(using g: Generics[A]): Gen[State[A]] = {
 		g.filterFn.flatMap { fn =>
 			s.extend(_.filter(fn))
 		}
 	}
 
-	def explode[A](s: State[A])(using g: Generics[A]): Gen[State[A]] = {
+	def explode[A](s: State[A])(using codec: Codec[A])(using g: Generics[A]): Gen[State[A]] = {
 		given Tag[A] = g.tag
 		s.extend(_.explode.flatMap(_.map(List(_))))
 	}
@@ -176,21 +176,21 @@ object Evaluation {
 	// }
 	
 	val MAX_FLOW_STEPS = 10
-	def genFlow(root: Fl[String]) : Gen[Fl[String]] = {
+	def genFlow(rootFlow: Fl[String]) : Gen[Fl[String]] = {
 		Gen.choose(0, MAX_FLOW_STEPS).flatMap { n =>
-			val rootState = State(Map.empty, root)
+			val rootState = State(Map.empty, rootFlow)
 			extendString(n, rootState).map(_.flow)
 		}
 	}
 
-	def genSimpleFlow[A](root: Fl[A])(using Generics[A]): Gen[Fl[A]] = {
+	def genSimpleFlow[A](rootFlow: Fl[A])(using codec: Codec[A])(using Generics[A]): Gen[Fl[A]] = {
 		Gen.choose(0, MAX_FLOW_STEPS).flatMap { n =>
-			val rootState = State(Map.empty, root)
+			val rootState = State(Map.empty, rootFlow)
 			extendSimple(n, rootState).map(_.flow)
 		}
 	}
 
-	private def simpleOp[A](s: State[A])(using Generics[A]): Gen[State[A]] = {
+	private def simpleOp[A](s: State[A])(using codec: Codec[A])(using Generics[A]): Gen[State[A]] = {
 		Gen.frequency(
 			3 -> map(s),
 			1 -> filter(s),
@@ -199,7 +199,7 @@ object Evaluation {
 		)
 	}
 
-	private def extendSimple[A](n: Int, s: State[A])(using Generics[A]): Gen[State[A]] = {
+	private def extendSimple[A](n: Int, s: State[A])(using codec: Codec[A])(using Generics[A]): Gen[State[A]] = {
 		if (n <= 0) {
 			Gen.const(s)
 		} else {
@@ -242,12 +242,18 @@ object Evaluation {
 		}
 	}
 
-	case class TopologyCtx(root: Topologies, depot: Depot[LS], topologies: NonEmptyList[StreamTopology[LS, LS]])
+	case class TopologyCtx(topologies: Topologies, depot: Depot[LS], streamTopologies: NonEmptyList[StreamTopology[LS, LS]]) {
+	}
 
 	def genTopology: Gen[TopologyCtx] = {
 		aggOp.flatMap { agg =>
 			// Hack: varid-0 will always be the input var generated in `t.stream`, due to evaluation order
-			val inputVar = new Var[LS](VarId(0, "input"), implicitly, implicitly)
+			val inputVar = new Var[LS](
+				VarId(0, "input", implicitly[Tag[LS]].tag, implicitly[Codec[LS]].asAny),
+				implicitly,
+				implicitly,
+				implicitly
+			)
 
 			for {
 				numFlows <- Gen.choose(1, 4)
@@ -255,13 +261,13 @@ object Evaluation {
 			} yield {
 				val t = Topologies()
 				val depot = t.depot[LS]("inputs")
-				val topologies = NonEmptyList.fromListUnsafe(flows).map { flow =>
+				val streamTopologies = NonEmptyList.fromListUnsafe(flows).map { flow =>
 					t.stream(depot, agg) { input =>
 						assert(input == inputVar)
 						flow
 					}
 				}
-				TopologyCtx(t, depot, topologies)
+				TopologyCtx(t, depot, streamTopologies)
 			}
 		}
 	}

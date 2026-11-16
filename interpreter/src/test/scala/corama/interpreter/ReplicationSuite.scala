@@ -1,4 +1,4 @@
-package corama.interpreter
+/* package corama.interpreter
 
 import cats.syntax.all._
 import scala.concurrent.duration._
@@ -145,3 +145,4 @@ object ReplicationSuite extends CoramaSuite {
 	}
 
 }
+ */

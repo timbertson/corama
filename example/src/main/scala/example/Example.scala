@@ -121,7 +121,7 @@ object Example extends IOApp with IOLogging {
 	val assigning: StreamTopology[Assignment, List[Option[Long]]] =
 		topologies.stream(ticketAssignment, Agg.list[Option[Long]])(propagateAssignment)
 
-	val ticketCreation = topologies.stream(newTickets, Result.agg[Unit]) { ticket =>
+	val ticketCreation = topologies.stream(newTickets, Agg.unit) { ticket =>
 		for {
 			ticketId <- ticket.map(_.id)
 			_ <- Flow.hashPartition(ticketId)
@@ -129,9 +129,10 @@ object Example extends IOApp with IOLogging {
 			fullTicket <- ticket.map(FullTicket(_, None))
 			existing <- fullTickets.key(ticketId).get
 			result <- existing.fold {
-				fullTickets.key(ticketId).put(fullTicket).as(Flow.pure(Result.unit))
+				fullTickets.key(ticketId).put(fullTicket).as(Flow.unit)
 			} { _existing =>
-				ticketId.map(id => Result.failure(s"Ticket ID ${id} already exists"))
+				// ignore resubmission
+				Flow.unit
 			}
 		} yield result
 	}
@@ -148,11 +149,7 @@ object Example extends IOApp with IOLogging {
 		ClusterConfig.ephemeral(numPartitions = 12, numTasks = 1, numInstances = 1).flatMap(config => TopologyClient(config, topologies)).use { client =>
 			Cluster.runningCluster(client.config, topologies).use { _ =>
 				def createTicket(ticket: Ticket) = {
-					for {
-						acks <- client.append(newTickets, ticket)
-						result <- IO.fromTry(acks.result(ticketCreation))
-						_ <- Result.to[IO](result)
-					} yield ()
+					client.append(newTickets, ticket).void
 				}
 
 				def assignTicket(userId: Long, ticketId: Long): IO[AckReturns] = {

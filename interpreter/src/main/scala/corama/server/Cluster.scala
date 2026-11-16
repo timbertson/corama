@@ -10,6 +10,8 @@ import corama.server.ratis.Server
 import corama.interpreter.IOMap
 import corama.server.ratis.RatisClusterClient
 import flogger.IOLogging
+import corama.client.TopologyClient
+import corama.client.ApiClient
 
 object Cluster extends IOLogging {
 	// Run a full cluster on localhost
@@ -40,7 +42,7 @@ object Cluster extends IOLogging {
 	}
 
 	// Run a mock cluster without real IO (stubs out ratis, grpc, network & disk)
-	def inMemoryCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, InMemoryClusterClient] = {
+	def inMemoryCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, TopologyClient] = {
 		val res = for {
 			groups <- Resource.eval(config.tasks.traverse { taskId =>
 				InMemoryGroup(taskId).map(taskId -> _)
@@ -53,9 +55,14 @@ object Cluster extends IOLogging {
 				Server.inMemory(config, topologies, clusterClient, instance)(using instanceLog)
 			}.resource
 
-			instanceMap = IOMap(instances.map(i => i.instanceId -> i.controller))
+			// connect instance & API clients directly to the controller implementation,
+			// bypassing GRPC.
+			// TODO this doesn't let us inject faults into the API layer, nor does it test
+			// GRPC level handling like headers etc.
+			instanceMap = IOMap(instances.map(i => i.instanceId -> i.instanceController))
 			_ <- Resource.eval(clusterClient.setInstances(instanceMap))
-		} yield (clusterClient, bg)
+			apiClient = new ApiClient(instances.head.apiController)
+		} yield (new TopologyClient(config, topologies, apiClient), bg)
 		ActiveResource(res)
 	}
 }
