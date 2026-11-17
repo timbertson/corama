@@ -146,56 +146,58 @@ object Example extends IOApp with IOLogging {
 			Ticket(2, "Troubles McGee", "I don't have water"),
 			Ticket(3, "Passerby", "There seems to be a fire"))
 
-		ClusterConfig.ephemeral(numPartitions = 12, numTasks = 1, numInstances = 1).flatMap(config => TopologyClient(config, topologies)).use { client =>
-			Cluster.runningCluster(client.config, topologies).use { _ =>
-				def createTicket(ticket: Ticket) = {
-					client.append(newTickets, ticket).void
+		ClusterConfig.ephemeral(numPartitions = 12, numTasks = 1, numInstances = 1).use { config =>
+			TopologyClient(config.clientConfig, topologies).use { client =>
+				Cluster.runningCluster(config, topologies).use { _ =>
+					def createTicket(ticket: Ticket) = {
+						client.append(newTickets, ticket).void
+					}
+
+					def assignTicket(userId: Long, ticketId: Long): IO[AckReturns] = {
+						client.append(ticketAssignment, Assignment(ticketId = ticketId, assigneeId = userId))
+					}
+
+					for {
+						_ <- log.info(s"Cluster config: ${config}")
+						_ <- log.info(s"Topologies:\n${PrettyPrint.format(topologies)}")
+						_ <- tickets.traverse_(createTicket)
+						_ <- assignTicket(111L, 1L)
+						_ <- assignTicket(111L, 2L)
+						_ <- assignTicket(222L, 3L)
+
+						_ = println("Getting user tickets")
+						listed <- client.query(userTicketsQuery, 111L)
+						_ = println(s"  user 111 tickets: $listed")
+
+						expected = List(tickets(0), tickets(1))
+						_ = assert(listed == expected, s"expected $expected, got $listed")
+						
+
+						// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
+						acks <- assignTicket(222L, 1L)
+
+						// And the ack *return* carries a value back: who owned the ticket before.
+						previous <- IO.fromTry(acks.unique(assigning))
+						_ = println(s"  reassigned ticket 1, previously owned by: $previous")
+						_ = assert(previous == Some(111L), s"ack return: $previous")
+
+						_ <- client.query(userTicketsQuery, 222L).map { result =>
+							assert(result.map(_.id).toSet === Set(3L, 1L), s"new owner: ${result}")
+						}
+						_ <- client.query(userTicketsQuery, 111L).map { result =>
+							assert(result.map(_.id).toSet === Set(2L), s"old owner: ${result}")
+						}
+						_ <- client.query(fullTicketsQuery, 1L).map { result =>
+							assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
+						}
+
+						// Reassigning to the same owner must not remove the ticket.
+						_ <- assignTicket(222L, 1L)
+						_ <- client.query(userTicketsQuery, 222L).map { result =>
+							assert(result.map(_.id).toSet == Set(3L, 1L), s"self-reassign: ${result}")
+						}
+					} yield ExitCode.Success
 				}
-
-				def assignTicket(userId: Long, ticketId: Long): IO[AckReturns] = {
-					client.append(ticketAssignment, Assignment(ticketId = ticketId, assigneeId = userId))
-				}
-
-				for {
-					_ <- log.info(s"Cluster config: ${client.config}")
-					_ <- log.info(s"Topologies:\n${PrettyPrint.format(topologies)}")
-					_ <- tickets.traverse_(createTicket)
-					_ <- assignTicket(111L, 1L)
-					_ <- assignTicket(111L, 2L)
-					_ <- assignTicket(222L, 3L)
-
-					_ = println("Getting user tickets")
-					listed <- client.query(userTicketsQuery, 111L)
-					_ = println(s"  user 111 tickets: $listed")
-
-					expected = List(tickets(0), tickets(1))
-					_ = assert(listed == expected, s"expected $expected, got $listed")
-					
-
-					// Reassign ticket 1 from user 111 to user 222 and check both sets moved.
-					acks <- assignTicket(222L, 1L)
-
-					// And the ack *return* carries a value back: who owned the ticket before.
-					previous <- IO.fromTry(acks.unique(assigning))
-					_ = println(s"  reassigned ticket 1, previously owned by: $previous")
-					_ = assert(previous == Some(111L), s"ack return: $previous")
-
-					_ <- client.query(userTicketsQuery, 222L).map { result =>
-						assert(result.map(_.id).toSet === Set(3L, 1L), s"new owner: ${result}")
-					}
-					_ <- client.query(userTicketsQuery, 111L).map { result =>
-						assert(result.map(_.id).toSet === Set(2L), s"old owner: ${result}")
-					}
-					_ <- client.query(fullTicketsQuery, 1L).map { result =>
-						assert(result == Some(FullTicket(tickets(0), Some(222L))), s"ticket: ${result}")
-					}
-
-					// Reassigning to the same owner must not remove the ticket.
-					_ <- assignTicket(222L, 1L)
-					_ <- client.query(userTicketsQuery, 222L).map { result =>
-						assert(result.map(_.id).toSet == Set(3L, 1L), s"self-reassign: ${result}")
-					}
-				} yield ExitCode.Success
 			}
 		}
 	}

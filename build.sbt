@@ -64,8 +64,8 @@ lazy val core = (project in file("core")).settings(
   ),
 ).dependsOn(pb)
 
-lazy val interpreter = (project in file("interpreter")).settings(
-  name := "corama-interpreter",
+lazy val server = (project in file("server")).settings(
+  name := "corama-server",
   commonSettings,
   libraryDependencies ++= Seq(
     "org.rocksdb" % "rocksdbjni" % "9.3.1",
@@ -76,6 +76,15 @@ lazy val interpreter = (project in file("interpreter")).settings(
   ) ++ List("ratis-grpc", "ratis-server", "ratis-metrics-default").map { component =>
     "org.apache.ratis" % component % "3.3.1"
   },
+).dependsOn(core, pb, client)
+
+lazy val client = (project in file("client")).settings(
+  name := "corama-client",
+  commonSettings,
+  libraryDependencies ++= Seq(
+    "io.grpc" % "grpc-netty-shaded" % scalapb.compiler.Version.grpcJavaVersion,
+    "com.github.cb372" %% "cats-retry" % "4.0.0",
+  ),
 ).dependsOn(core, pb)
 
 lazy val rama = (project in file("rama")).settings(
@@ -95,8 +104,8 @@ lazy val example = (project in file("example")).settings(
   commonSettings,
   Compile / mainClass := Some("example.Example"),
   dependencyOverrides += "com.google.guava" % "guava" % "32.1.3-jre",
-).dependsOn(core, rama, interpreter)
+).dependsOn(core, rama, server)
 
 lazy val root = (project in file(".")).settings(
   name := "root",
-).aggregate(core, interpreter, rama, example)
+).aggregate(core, server, rama, example)
