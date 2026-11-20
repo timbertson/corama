@@ -38,4 +38,13 @@ object Util {
 	def require[A](name: String, v: Option[A]): IO[A] =
 		IO.fromEither(v.toRight(new RuntimeException(s"Missing property: $name")))
 
+	extension[F[_], A](value: F[A]) {
+		def asAnyF: F[Any] = value.asInstanceOf[F[Any]]
+		def remapGenericF[B, C](implicit ev: B =:= A): F[C] = (value).asInstanceOf[F[C]]
+	}
+
+	extension[F[_, _], M, A](value: F[M, A]) {
+		def asAnyF2: F[M, Any] = value.asInstanceOf[F[M, Any]]
+		def remapGenericF2[B, C](implicit ev: B =:= A): F[M, C] = (value).asInstanceOf[F[M, C]]
+	}
 }

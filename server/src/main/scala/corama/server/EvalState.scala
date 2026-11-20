@@ -12,6 +12,7 @@ import corama.internal.NodeId
 import com.google.protobuf.ByteString
 import cats.data.NonEmptyList
 import java.time.Instant
+import corama.error.Util.asAnyF
 
 // A mutable snapshot collecting updates (and serving a view), used for a single eval batch
 // Unsafe (mutation), must not be accessed concurrently
@@ -63,7 +64,7 @@ object EvalState {
 		def addNotification(source: EvalSource, edge: EdgeId, values: Option[NonEmptyList[Any]], agg: Agg[?]): SyncIO[Unit] =
 			source match {
 				case origin: Origin => SyncIO {
-					val updated = EvalNotification.merge(notificationBuffer.get(origin), edge, values, agg.asAny)
+					val updated = EvalNotification.merge(notificationBuffer.get(origin), edge, values, agg.asAnyF)
 					notificationBuffer.put(origin, updated)
 				}.void
 
@@ -73,12 +74,12 @@ object EvalState {
 				// from Eval directly?
 				case local: LocalEvalSink[?] => SyncIO {
 					// TODO should this store List or Option[Nel]?
-					localResultsBuffer.addOne((local.asAny, edge, values.fold(Nil)(_.toList)))
+					localResultsBuffer.addOne((local.asAnyF, edge, values.fold(Nil)(_.toList)))
 				}
 			}
 
 		def addFailureNotification(origin: Origin, edge: EdgeId): SyncIO[Unit] = SyncIO {
-			notificationBuffer.addOne(origin, new EvalNotification(edge, None, Agg.unit.asAny, failure = true))
+			notificationBuffer.addOne(origin, new EvalNotification(edge, None, Agg.unit.asAnyF, failure = true))
 		}
 		
 		def localResults: Seq[(LocalEvalSink[Any], EdgeId, List[Any])] = localResultsBuffer.toSeq
@@ -149,7 +150,7 @@ object EvalContinuation {
 					rpc.Env.of(
 						items = env.toList.map { (varId, value) =>
 							println(s"Encoding ${value} with ${varId.codec} @ ${varId}")
-							rpc.EnvItem.of(varId = varId.id, value = ByteString.copyFrom(varId.codec.asAny.encode(value)))
+							rpc.EnvItem.of(varId = varId.id, value = ByteString.copyFrom(varId.codec.asAnyF.encode(value)))
 						}
 					)
 				}

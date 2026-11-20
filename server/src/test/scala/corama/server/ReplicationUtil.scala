@@ -1,4 +1,4 @@
-/* package corama.interpreter
+/* package corama.server
 
 import cats.syntax.all._
 import fs2.Stream
@@ -14,7 +14,7 @@ import cats.effect.Ref
 import weaver.Expectations
 import corama.Bytes
 import flogger._
-import corama.interpreter.Fixtures._
+import Fixtures._
 
 object Replication extends IOLogging {
 	sealed trait Event {

@@ -14,7 +14,6 @@ final class Agg[A: Codec] private[corama] (
 	private[corama] def merge(values: List[A]): A = values.foldLeft(zero)(combine)
 	private[corama] def mergeAny(values: List[Any]): A = merge(values.asInstanceOf[List[A]])
 	private[corama] def combineAny(a: Any, b: Any): A = combine(a.asInstanceOf[A], b.asInstanceOf[A])
-	private[corama] def asAny: Agg[Any] = this.asInstanceOf[Agg[Any]]
 }
 
 object Agg {

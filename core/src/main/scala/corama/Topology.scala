@@ -52,11 +52,13 @@ final class Topologies {
 
 	private val builtPstates = ListBuffer.empty[PState]
 	private val builtDepots = ListBuffer.empty[Depot[?]]
+	private val builtQueries = ListBuffer.empty[QueryTopology[?, ?]]
 
 	def topologies: List[Topology[?, ?]] = built.reverse
 
 	def pstates: Map[PStateId, PState] = builtPstates.map(p => p.id -> p).toMap
 	def depots: Map[DepotId, Depot[?]] = builtDepots.map(d => d.id -> d).toMap
+	def queries: Map[QueryId, QueryTopology[?, ?]] = builtQueries.map(q => q.id -> q).toMap
 
 	private[corama] def declared(t: Topology[?, ?]): Boolean = built.exists(_ eq t)
 
@@ -104,7 +106,9 @@ final class Topologies {
 		block: Var[S] => Flow[R, QueryContext],
 	)(implicit tagS: Tag[S], tagR: Tag[R], codecS: Codec[S], codecR: Codec[R], pos: SourcePos): QueryTopology[S, R] = {
 		val id = claim(QueryId(name))
-		QueryTopology(id, declare[S, R, QueryContext](id, agg, tagS, tagR, pos)(block))
+		val result = QueryTopology(id, declare[S, R, QueryContext](id, agg, tagS, tagR, pos)(block))
+		builtQueries.append(result)
+		result
 	}
 
 	/** A stream topology: driven by an append, writes PStates, returns nothing.

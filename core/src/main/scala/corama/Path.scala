@@ -4,6 +4,7 @@ import cats.data.NonEmptyList
 import cats.syntax.all.*
 import izumi.reflect.Tag
 import izumi.reflect.macrortti.LightTypeTag
+import corama.error.Util.asAnyF
 
 // TODO: how can we encode path components? They can be arbitrary
 // binary, and we need to distinguish e.g. [ab, cd] from [a, bc, d]
@@ -40,7 +41,7 @@ object CompiledPath {
 	def from(path: Path, terminalTag: LightTypeTag, codec: AnyCodec): CompiledPath = {
 		CompiledPath(path.raw.map { part =>
 			part.value match {
-				case lit: Var.Literal[?] => Literal(lit.value.asAny)
+				case lit: Var.Literal[?] => Literal(lit.value.asAnyF)
 				case v: Var[?] => Variable(v.vid)
 			}
 		}, terminalTag, codec)

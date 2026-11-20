@@ -8,14 +8,15 @@ import izumi.reflect.macrortti.LightTypeTag
 import scala.util.Try
 import scala.util.Success
 import scala.util.Failure
+import corama.error.Util.asAnyF
 
 // Allocates var ids within one topology.
 private[corama] class VarRegistry {
 	private var list: Vector[Var[Any]] = Vector.empty
 
 	def add[A](hint: String, tag: Tag[A], codec: Codec[A], pos: SourcePos): Var[A] = {
-		val v = new Var[A](new VarId(list.length, hint, tag.tag, codec.asAny), tag, codec, pos)
-		list = list.appended(v.asAny)
+		val v = new Var[A](new VarId(list.length, hint, tag.tag, codec.asAnyF), tag, codec, pos)
+		list = list.appended(v.asAnyF)
 		v
 	}
 
@@ -82,34 +83,29 @@ object IntoVar extends DefaultIntoVar {
 }
 
 final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag[A], val codec: Codec[A], pos: SourcePos) extends MaybeVar[A] {
-	private [corama] def asAny: Var[Any] = this.asInstanceOf[Var[Any]]
-
-	def map[B](f: A => B)(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.MapN(tag, codec, pos, List(this.asAny), {
-		case List(v) => {
-			println(s"${this} casting ${v} to ${this.tag}")
-			f(v.asInstanceOf[A])
-		}
-		case other => impossible(s"map with ${other.length}")
+	def map[B](f: A => B)(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.MapN(tag, codec, pos, List(this.asAnyF), {
+		case List(v) => f(v.asInstanceOf[A])
+		case other   => impossible(s"map with ${other.length}")
 	})
 
-	def mapWith[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos, tag: Tag[C], codec: Codec[C]): Flow[C, Any] = Flow.MapN(tag, codec, pos, List(this.asAny, b.asAny), {
+	def mapWith[B, C](b: Var[B])(f: (A, B) => C)(implicit pos: SourcePos, tag: Tag[C], codec: Codec[C]): Flow[C, Any] = Flow.MapN(tag, codec, pos, List(this.asAnyF, b.asAnyF), {
 		case List(a, b) => f(a.asInstanceOf[A], b.asInstanceOf[B])
 		case other => impossible(s"mapWith[2] with ${other.length}")
 	})
 
-	def mapWith[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos, tag: Tag[D], codec: Codec[D]): Flow[D, Any] = Flow.MapN(tag, codec, pos, List(this.asAny, b.asAny, c.asAny), {
+	def mapWith[B, C, D](b: Var[B], c: Var[C])(f: (A, B, C) => D)(implicit pos: SourcePos, tag: Tag[D], codec: Codec[D]): Flow[D, Any] = Flow.MapN(tag, codec, pos, List(this.asAnyF, b.asAnyF, c.asAnyF), {
 		case List(a, b, c) => f(a.asInstanceOf[A], b.asInstanceOf[B], c.asInstanceOf[C])
 		case other => impossible(s"mapWith[3] with ${other.length}")
 	})
 
 	def filter(p: A => Boolean)(implicit pos: SourcePos): Flow[A, Any] =
-		Flow.FilterOp(pos, List(this.asAny), {
+		Flow.FilterOp(pos, List(this.asAnyF), {
 			case List(a) => p(a.asInstanceOf[A])
 			case other => impossible(s"filter with ${other.length}")
 		}).as(this)
 
 	def filterWith[B](b: Var[B])(p: (A, B) => Boolean)(implicit pos: SourcePos): Flow[A, Any] =
-		Flow.FilterOp(pos, List(this.asAny, b.asAny), {
+		Flow.FilterOp(pos, List(this.asAnyF, b.asAnyF), {
 			case List(a,b) => p(a.asInstanceOf[A],b.asInstanceOf[B])
 			case other => impossible(s"filter[2] with ${other.length}")
 		}).as(this)
@@ -128,11 +124,8 @@ final class Var[A] private[corama] (private[corama] val vid: VarId, val tag: Tag
 	/** Fan out: emit one value per element, running everything downstream per element. */
 	def explode[B](implicit pos: SourcePos, tag: Tag[B], codec: Codec[B], ev: A <:< Seq[B]): Flow[B, Any] = explodeBy(identity)
 
-	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.ExplodeOp(tag, codec, pos, List(this.asAny), {
-		case List(a) => {
-			println(s"applying explode fn to ${a}")
-			f(a.asInstanceOf[A])
-		}
+	def explodeBy[B](f: A => Seq[B])(implicit pos: SourcePos, tag: Tag[B], codec: Codec[B]): Flow[B, Any] = Flow.ExplodeOp(tag, codec, pos, List(this.asAnyF), {
+		case List(a) => f(a.asInstanceOf[A])
 		case other => impossible(s"explode with ${other.length}")
 	})
 
@@ -153,7 +146,7 @@ object Var {
 
 	// Virtual vars have a unique id < 0 and are never given a Rama name
 	val unit: Var[Unit] = new Var[Unit](
-		new VarId(-2, "unit", implicitly[Tag[Unit]].tag, implicitly[Codec[Unit]].asAny),
+		new VarId(-2, "unit", implicitly[Tag[Unit]].tag, implicitly[Codec[Unit]].asAnyF),
 		implicitly[Tag[Unit]],
 		implicitly[Codec[Unit]],
 		implicitly[SourcePos]

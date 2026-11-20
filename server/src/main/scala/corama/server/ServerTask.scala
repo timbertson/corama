@@ -1,5 +1,6 @@
 package corama.server
 
+import corama.error.Util.*
 import scala.concurrent.duration._
 import streamdsl.rpc
 import cats.effect.IO
@@ -42,18 +43,18 @@ private[server] object TaskCommand {
 	) extends TaskCommand[Unit]
 
 	case class OpCommand[A](op: TaskOp[A], reply: Deferred[IO, Try[A]]) extends TaskCommand[A]
-	case class Append(
-		depot: Depot[?],
+	case class Append[A](
+		depot: Depot[A],
 		partition: PartitionId,
-		bytes: Bytes,
-		decoded: Any,
+		value: Encoded[A],
 		level: AckLevel[?],
 	) extends TaskOp[AckReturns]
 
-	case class Invoke(
-		q: QueryTopology[?, ?],
-		value: Any,
-	) extends TaskOp[Any]
+	case class Query[A, B](
+		q: QueryTopology[A, B],
+		partition: PartitionId,
+		value: Encoded[A],
+	) extends TaskOp[B]
 }
 
 // rocksDB storage view for a task
@@ -113,19 +114,11 @@ final class ServerTask private[server] (
 		IO.raiseUnless(isLeader)(NotLeader(None))
 	}
 
-	def append[A, R](append: Append): IO[AckReturns] = {
-		submitOp(append)
-	}
-
 	def continue[A, R](cont: Continue): IO[Unit] = {
 		commands.offer(cont)
 	}
 
-	def invoke[S, R](q: QueryTopology[S, R], value: S): IO[R] = {
-		submitOp(Invoke(q, value)).map(_.asInstanceOf[R])
-	}
-	
-	private def submitOp[A](op: TaskOp[A]): IO[A] = {
+	def performOp[A](op: TaskOp[A]): IO[A] = {
 		for {
 			replyRef <- Deferred[IO, Try[A]]
 			_ <- commands.offer(OpCommand(op, replyRef)).to[IO]
@@ -173,40 +166,70 @@ final class ServerTask private[server] (
 			}
 
 			case OpCommand(op, reply) => op match {
-				case Append(depot, partition, bytes, decoded, level) =>
+				case Append(depot, partition, encoded, level) =>
 					// TODO: return early if the client isn't actually waiting for returns
 					val evalTopologies = subscribers(depot.id)
 					val eval: SyncIO[(EvalState, Either[EvalFailure, Unit])] = for {
-						now <- Clock[SyncIO].realTimeInstant
-						deadline = now.plusMillis(clusterConfig.evalTimeout.toMillis)
+						deadline <- createDeadline
 						// TODO create state per batch, not individual elem
 						results <- EvalResults(clusterConfig, instanceId, evalTopologies)
-						evalState <- EvalState(speculative, Some(PendingAck(results, reply, None)), deadline)
-						_ <- evalState.append(depot.id, partition, bytes)
+						evalState <- EvalState(speculative, Some(PendingAppendAck(topologies, results, reply, None)), deadline)
+						_ <- evalState.append(depot.id, partition, encoded.bytes)
 
 						// TODO: multiplex multiple commands into a single receiver, so we can just install one per batch
 						// speculative execution: run the depot-driven topologies for this
 						// record, capturing all writes into evalState
-						result <- evalTopologies.traverse_ { topology =>
+						result <- wrapEvalFailure(evalTopologies.traverse_ { topology =>
 							SyncIO.fromTry(results.forTopology(topology)).flatMap { localResults =>
 								evaluator.run(
 									localResults,
 									partition,
 									evalState,
 									topology,
-									NonEmptyList.one(Map(topology.input.vid -> decoded))
+									NonEmptyList.one(Map(topology.input.vid -> encoded.value))
 								)
 							}
-						}.attempt.map {
-							case Left(e) => Left(new EvalFailure(e, Nil))
-							case Right(()) => Right(())
-						}
+						})
 					} yield (evalState, result)
 					handleEval(eval)
 
-				case Invoke(q, value) => ???
+				case Query(q, partition, decoded) =>
+					val topology = q.topology
+					val eval: SyncIO[(EvalState, Either[EvalFailure, Unit])] = for {
+						deadline <- createDeadline
+						sink <- EvalSink.local[topology.Result](
+							clusterConfig.evalTimeout,
+							instanceId,
+							topology.output.vid,
+							topology.agg,
+							EdgeId.startingEdge(topology.id)
+						)
+						evalState <- EvalState(speculative, Some(PendingQueryAck(sink, reply.remapGenericF[Try[topology.Result], Try[Any]], None)), deadline)
+
+						// TODO: multiplex multiple commands into a single receiver, so we can just install one per batch
+						// speculative execution: run the depot-driven topologies for this
+						// record, capturing all writes into evalState
+						result <- wrapEvalFailure(evaluator.run(
+							sink,
+							partition,
+							evalState,
+							topology,
+							NonEmptyList.one(Map(topology.input.vid -> decoded))
+						))
+					} yield (evalState, result)
+					handleEval(eval)
 			}
 		}
+	}
+
+	private def createDeadline: SyncIO[Instant] =
+		Clock[SyncIO].realTimeInstant.map { now =>
+			now.plusMillis(clusterConfig.evalTimeout.toMillis)
+		}
+
+	private def wrapEvalFailure(eval: SyncIO[Unit]) = eval.attempt.map {
+		case Left(e) => Left(new EvalFailure(e, Nil))
+		case Right(()) => Right(())
 	}
 
 	private def handleEval(eval: (SyncIO[(EvalState, Either[EvalFailure, Unit])])): IO[Unit] = {
@@ -232,7 +255,7 @@ final class ServerTask private[server] (
 				}.to[IO] *>
 				// handle local pendingAck immediately, don't bother routing via outputs
 				evalState.pendingAck.traverse_ { ack =>
-					ack.release.sequence *> ack.reply.complete(Failure(failure.error)).void
+					ack.onCommit(Failure(failure.error)).void
 				} *>
 				outputsQueue.offer(outputs, None)
 			}
@@ -258,7 +281,7 @@ final class ServerTask private[server] (
 				case Left(e) =>
 					speculative.discard(submission.seq).to[IO] *>
 						// immediately reject, don't go via pendingAcks
-						submission.pendingAck.traverse_(_.onCommit(topologies, Failure(e)))
+						submission.pendingAck.traverse_(_.onCommit(Failure(e)))
 			}
 		} yield ()).foreverM
 	}
@@ -274,7 +297,7 @@ final class ServerTask private[server] (
 				evalId = origin.evalId.id,
 				edge = notification.edge.id,
 				value = notification.value.map { v =>
-					ByteString.copyFrom(notification.agg.codec.asAny.encode(v))
+					ByteString.copyFrom(notification.agg.codec.asAnyF.encode(v))
 				},
 				failure = notification.failure
 			), Metadata()).void.timeout(2.seconds)
@@ -322,9 +345,10 @@ final class ServerTask private[server] (
 									case _ => cleanup
 							}
 							case Some(pendingAck) => outcome match {
-								case Outcome.Succeeded(_) => pendingAcks.offer(pendingAck.copy(release = Some(cleanup)))
-								case Outcome.Errored(t) => cleanup *> pendingAck.reply.complete(Failure(t)).void
-								case Outcome.Canceled() => cleanup *> pendingAck.reply.complete(Failure(new RuntimeException("Canceled"))).void
+								// TODO: is delaying until pendingAck useful? Or should we just resolve them here?
+								case Outcome.Succeeded(_) => pendingAcks.offer(pendingAck.withRelease(cleanup))
+								case Outcome.Errored(t) => pendingAck.onCommit(Failure(t))
+								case Outcome.Canceled() => pendingAck.onCommit(Failure(new RuntimeException("Canceled")))
 							}
 						}
 					}
@@ -339,7 +363,7 @@ final class ServerTask private[server] (
 		Stream.fromQueueUnterminated(pendingAcks)
 			.parEvalMapUnordered(MAX_INFLIGHT_ACKS) { pendingAck =>
 				// only committed acks make it to this queue, so this is always Success
-				pendingAck.onCommit(topologies, Success(()))
+				pendingAck.onCommit(Success(()))
 			}.compile.drain *> Util.neverReached
 	}
 
@@ -365,26 +389,54 @@ object ServerTask {
 		pendingAck: Option[PendingAck],
 		outputs: EvalState.Outputs
 	)
+	
+	trait PendingAck {
+		def onCommit(committed: Try[Unit]): IO[Unit]
+		def release: IO[Unit]
+		def withRelease(action: IO[Unit]): PendingAck
+	}
 
 	// captures both the client-connected state (promise)
 	// plus references to the EvalResults which will receive
 	// return values from other partitions
-	case class PendingAck(
+	case class PendingAppendAck(
+		topologies: Topologies,
 		results: EvalResults,
 		reply: Deferred[IO, Try[AckReturns]],
-		release: Option[IO[Unit]]
-	) {
-		def onCommit(topologies: Topologies, committed: Try[Unit]) = {
+		releaseOpt: Option[IO[Unit]]
+	) extends PendingAck {
+		def onCommit(committed: Try[Unit]): IO[Unit] = {
 			val respond = committed match {
 				case Success(()) => for {
 					map <- results.await
 					acks = AckReturns(map, topologies)
 					_ <- reply.complete(Success(acks))
 				} yield ()
+				case Failure(err) => reply.complete(Failure(err)).void
+			}
+			respond.guarantee(release)
+		}
+
+		def withRelease(action: IO[Unit]): PendingAck = copy(releaseOpt = Some(action))
+
+		def release: IO[Unit] = releaseOpt.sequence_
+	}
+
+	case class PendingQueryAck[R](
+		results: LocalEvalSink[R],
+		reply: Deferred[IO, Try[?]],
+		releaseOpt: Option[IO[Unit]]
+	) extends PendingAck {
+		def onCommit(committed: Try[Unit]): IO[Unit] = {
+			val respond = committed match {
+				case Success(()) => results.await.flatMap(result => reply.complete(Success(result)))
 				case Failure(err) => reply.complete(Failure(err))
 			}
-			respond.guarantee(release.sequence_)
+			respond.guarantee(release).void
 		}
+
+		def withRelease(action: IO[Unit]): PendingAck = copy(releaseOpt = Some(action))
+		def release: IO[Unit] = releaseOpt.sequence_
 	}
 
 	class EvalFailure(

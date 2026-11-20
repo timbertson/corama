@@ -8,25 +8,24 @@ import com.google.protobuf.empty.Empty
 import streamdsl.rpc.Response
 import corama.Topologies
 import corama.error.Util
-import corama.DepotId
-import corama.AckLevel
 import streamdsl.rpc.AppendRequest
 import streamdsl.rpc.QueryRequest
 import corama.PartitionId
 import corama.AckReturns
 import com.google.protobuf.ByteString
 import corama.TopologyId
-import corama.server.TaskCommand.Append
 import corama.InstanceId
 import corama.internal.NodeId
 import streamdsl.rpc.NotifyRequest
 import flogger.Log
 import flogger.IOLogging
 import java.time.Instant
+import corama.error.Util.asAnyF
 
 class InstanceController(
 	config: ClusterConfig,
 	topologies: Topologies,
+	requestResolver: RequestResolver,
 	incomingEvalRouter: IncomingEvalRouter,
 	tasks: IOMap[TaskId, ServerTask],
 )(using log: Log[IO]) extends streamdsl.rpc.CoramaInstanceFs2Grpc[IO, Metadata] with IOLogging {
@@ -40,26 +39,31 @@ class InstanceController(
 		}
 	}
 
-	override def append(request: AppendRequest, ctx: Metadata): IO[Response] = {
+	override def append(request: AppendRequest, ctx: Metadata): IO[Response] = GrpcError.wrap {
 		logErrors(s"appending to ${request.depot}") {
-			val depotId = DepotId(request.depot)
 			for {
-				depot <- IO.fromEither(topologies.depots.get(depotId).toRight(Util.err("No such depot")))
-				bytes = request.value.toByteArray
-				// TODO: we could skip this, but it gives some protection from invalid bytes. Pass both through?
-				decoded <- IO.fromTry(depot.codec.decode(bytes))
-				partition <- IO.fromEither(request.partition.toRight(Util.err("Partition required"))).map(PartitionId.apply)
-				taskId = config.taskFor(partition)
+				op <- IO.fromTry(requestResolver.resolveAppend(request))
+				taskId = config.taskFor(op.partition)
 				task <- requireLeader(taskId)
-				result <- task.append(TaskCommand.Append(depot, partition, bytes, decoded, AckLevel.Ack)) // TODO configurable ack level
+				result <- task.performOp(op.value)
 				serialized = AckReturns.codec(topologies).encode(result)
 			} yield Response.of(value = Some(ByteString.copyFrom(serialized)))
 		}
 	}
 
-	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = ???
+	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = GrpcError.wrap {
+		logErrors(s"running query ${request.query}") {
+			for {
+				op <- IO.fromTry(requestResolver.resolveQuery(request))
+				taskId = config.taskFor(op.partition)
+				task <- requireLeader(taskId)
+				result <- task.performOp(op.value)
+				serialized = op.value.q.topology.codec.asAnyF.encode(result)
+			} yield Response.of(value = Some(ByteString.copyFrom(serialized)))
+		}
+	}
 
-	override def notify(request: NotifyRequest, ctx: Metadata): IO[Empty] = {
+	override def notify(request: NotifyRequest, ctx: Metadata): IO[Empty] = GrpcError.wrap {
 		logErrors(s"notifying evalId ${request.evalId}") {
 			incomingEvalRouter.invoke(
 				EvalId(request.evalId),
@@ -69,7 +73,7 @@ class InstanceController(
 		}
 	}
 	
-	override def continue(request: ContinueRequest, ctx: Metadata): IO[Empty] = {
+	override def continue(request: ContinueRequest, ctx: Metadata): IO[Empty] = GrpcError.wrap {
 		logErrors(s"contining evalId ${request.origin.map(_.evalId)}") {
 			import Util.*
 			val topologyId = TopologyId(request.topologyId)

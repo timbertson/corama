@@ -41,10 +41,6 @@ object Codec {
 		def decode(bytes: Bytes): Try[A] = codec.decode(bytes).flatMap(from)
 	}
 	
-	extension[A](c: Codec[A]) {
-		def asAny: Codec[Any] = c.asInstanceOf[Codec[Any]]
-	}
-
 	// this one's explicit, otherwise we may pick up unintended instances
 	def json[T](implicit cd: circe.Decoder[T], ce: circe.Encoder[T]): Codec[T] = new Codec[T] {
 		import io.circe.syntax.*

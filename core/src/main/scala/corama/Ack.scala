@@ -5,6 +5,7 @@ import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
 import corama.error.Util
+import corama.error.Util.asAnyF
 
 sealed trait AckLevel[R]
 
@@ -72,14 +73,14 @@ object AckReturns {
 		Codec.tryVia[AckReturns, List[(Int, Bytes)]] { ackReturns =>
 			ackReturns.values.toList.traverse { (topologyId, value) =>
 				topologies.get(topologyId).map { t =>
-					(topologyId.value, t.codec.asAny.encode(value))
+					(topologyId.value, t.codec.asAnyF.encode(value))
 				}
 			}.get // TODO unsafe
 		} { list =>
 			list.traverse { (key, bytes) =>
 				val topologyId = TopologyId(key)
 				topologies.get(topologyId).flatMap { t =>
-					t.codec.asAny.decode(bytes).map(topologyId -> _)
+					t.codec.asAnyF.decode(bytes).map(topologyId -> _)
 				}
 			}.map(list => AckReturns(list.toMap, topologies))
 		}

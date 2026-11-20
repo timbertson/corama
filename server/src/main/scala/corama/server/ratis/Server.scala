@@ -102,8 +102,9 @@ object Server extends IOLogging {
 				))
 			}.resource
 			
-			instanceController = new InstanceController(config, topologies, incomingEvalRouter, IOMap(taskResources))
-			apiController = new ApiController(config, clusterClient)
+			requestResolver = new RequestResolver(config, topologies)
+			instanceController = new InstanceController(config, topologies, requestResolver, incomingEvalRouter, IOMap(taskResources))
+			apiController = new ApiController(config, clusterClient, requestResolver)
 
 			_ <- grpcServer(networkConfig.bindGrpcSocket, instanceController, apiController)
 
@@ -183,9 +184,10 @@ object Server extends IOLogging {
 				)
 			}
 			serverTaskMap = IOMap(taskResources.map(_._1))
-			instanceController = new InstanceController(config, topologies, incomingEvalRouter, serverTaskMap)
+			requestResolver = new RequestResolver(config, topologies)
+			instanceController = new InstanceController(config, topologies, requestResolver, incomingEvalRouter, serverTaskMap)
 			bg = taskResources.parTraverse_(_.last) *> Util.neverReached
-			apiController = new ApiController(config, clusterClient)
+			apiController = new ApiController(config, clusterClient, requestResolver)
 			server = new InMemoryServer(instance.id, instanceController, apiController)
 		} yield (server, Util.joinNothings(List(bg, evalRouterBg)))
 		ActiveResource(res)

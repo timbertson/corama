@@ -3,7 +3,6 @@ package corama
 import java.util.Arrays
 import cats.Eq
 import cats.kernel.Order
-import corama.error.Util._
 import scala.reflect.ClassTag
 import scala.util.Try
 
@@ -39,9 +38,7 @@ object Bytes {
 }
 
 // Carry a value along with its bytes
-class Encoded[A](val value: A, val bytes: Bytes) {
-	def asAny = this.asInstanceOf[Encoded[Any]]
-}
+class Encoded[A](val value: A, val bytes: Bytes)
 object Encoded {
 	def apply[A](value: A)(using codec: Codec[A]) = new Encoded(value, codec.encode(value))
 

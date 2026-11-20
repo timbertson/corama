@@ -1,10 +1,11 @@
-package corama.interpreter
+package corama.server
 
 import corama.*
 import org.scalacheck.Gen
 import corama.Flow
 import cats.data.NonEmptyList
 import izumi.reflect.Tag
+import corama.error.Util.asAnyF
 
 object Evaluation {
 
@@ -249,7 +250,7 @@ object Evaluation {
 		aggOp.flatMap { agg =>
 			// Hack: varid-0 will always be the input var generated in `t.stream`, due to evaluation order
 			val inputVar = new Var[LS](
-				VarId(0, "input", implicitly[Tag[LS]].tag, implicitly[Codec[LS]].asAny),
+				VarId(0, "input", implicitly[Tag[LS]].tag, implicitly[Codec[LS]].asAnyF),
 				implicitly,
 				implicitly,
 				implicitly

@@ -1,11 +1,8 @@
-package corama.interpreter
+package corama.server
 
 import scala.concurrent.duration.*
 import corama.InstanceId
-import corama.server.ClusterConfig
 import cats.data.NonEmptyList
-import corama.server.PerInstance
-import corama.server.NetworkConfig
 
 object Fixtures {
 	val taskId = TaskId(1)

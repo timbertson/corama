@@ -1,10 +1,9 @@
-package corama.interpreter
+package corama.server
 
 import cats.syntax.all.*
 import cats.effect.IO
 import flogger.*
 import weaver.scalacheck.Checkers
-import corama.server.Cluster
 
 object EvaluationSuite extends CoramaSuite {
 	import Fixtures.*

@@ -6,6 +6,7 @@ import org.tpolecat.sourcepos.*
 import java.util.concurrent.atomic.AtomicInteger
 import cats.kernel.Eq
 import izumi.reflect.macrortti.LightTypeTag
+import corama.error.Util.asAnyF
 
 // ---------------------------------------------------------------------------
 // base AST
@@ -133,7 +134,6 @@ private[corama] object Node {
 
 			case e: Flow.ExplodeOp[A] =>
 				val out = t.define[A](e.tag, e.codec, e.pos, "exploded")
-				println(s"compiling explodeOp output to $out")
 				val f = e.f
 				(List(n(Node.Dynamic(e.pos, e.ins.map(_.vid), f, DynamicOp.Explode(out.vid)))), out)
 
@@ -171,24 +171,24 @@ private[corama] object Node {
 
 			case g: Flow.Get[a] =>
 				val out = t.define[Option[a]](g.lens.schema.optionTag, g.lens.schema.optionCodec, Var.internal, "get")
-				val path = CompiledPath.from(g.lens.path, g.lens.schema.tag.tag, g.lens.schema.codec.asAny)
+				val path = CompiledPath.from(g.lens.path, g.lens.schema.tag.tag, g.lens.schema.codec.asAnyF)
 				(List(n(Node.PStateNode(g.lens.pstate.id, path, PStateOp.Get(out.vid)))), out.asInstanceOf[Var[A]])
 
 			case Flow.Put(lens, value) =>
-				val path = CompiledPath.from(lens.path, lens.schema.tag.tag, lens.schema.codec.asAny)
+				val path = CompiledPath.from(lens.path, lens.schema.tag.tag, lens.schema.codec.asAnyF)
 				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Put(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Add(lens, value) =>
-				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec.asAny)
+				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec.asAnyF)
 				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Add(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case Flow.Remove(lens, value) =>
-				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec.asAny)
+				val path = CompiledPath.from(lens.path, lens.schema.itemTag.tag, lens.schema.codec.asAnyF)
 				(List(n(Node.PStateNode(lens.pstate.id, path, PStateOp.Remove(value.vid)))), Var.unit.asInstanceOf[Var[A]])
 
 			case u: Flow.Update[v] =>
 				val f = u.f
-				val path = CompiledPath.from(u.lens.path, u.lens.schema.tag.tag, u.lens.schema.codec.asAny)
+				val path = CompiledPath.from(u.lens.path, u.lens.schema.tag.tag, u.lens.schema.codec.asAnyF)
 				(List(n(Node.PStateUpdate(u.pos, u.lens.pstate.id, path, u.ins.map(_.vid), f))), Var.unit.asInstanceOf[Var[A]])
 
 			case s: Flow.Select[v] =>

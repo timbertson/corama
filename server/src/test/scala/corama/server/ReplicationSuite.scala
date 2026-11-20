@@ -1,4 +1,4 @@
-/* package corama.interpreter
+/* package corama.server
 
 import cats.syntax.all._
 import scala.concurrent.duration._

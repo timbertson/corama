@@ -11,6 +11,7 @@ import cats.data.NonEmptyList
 import corama.Encoded
 import izumi.reflect.Tag
 import cats.Show
+import corama.error.Util.asAnyF
 
 object StateMachineSuite extends SimpleIOSuite {
 	private val partition0 = PartitionId(0)
@@ -21,9 +22,9 @@ object StateMachineSuite extends SimpleIOSuite {
 		partition0,
 		pstate,
 		CompiledPath(
-			NonEmptyList.of(CompiledPath.Literal(Encoded("key1").asAny)),
+			NonEmptyList.of(CompiledPath.Literal(Encoded("key1").asAnyF)),
 			terminalTag = implicitly[Tag[Bytes]].tag,
-			codec = implicitly[Codec[Bytes]].asAny,
+			codec = implicitly[Codec[Bytes]].asAnyF,
 		),
 		env = Map.empty
 	)
@@ -32,9 +33,9 @@ object StateMachineSuite extends SimpleIOSuite {
 		partition1,
 		PStateId("pstate-1"),
 		CompiledPath(
-			NonEmptyList.of(CompiledPath.Literal(Encoded("key2").asAny)),
+			NonEmptyList.of(CompiledPath.Literal(Encoded("key2").asAnyF)),
 			terminalTag = implicitly[Tag[Bytes]].tag,
-			codec = implicitly[Codec[Bytes]].asAny,
+			codec = implicitly[Codec[Bytes]].asAnyF,
 		),
 		env = Map.empty
 	)
@@ -43,9 +44,9 @@ object StateMachineSuite extends SimpleIOSuite {
 		partition1,
 		PStateId("pstate-1"),
 		CompiledPath(
-			NonEmptyList.of(CompiledPath.Literal(Encoded("key3").asAny)),
+			NonEmptyList.of(CompiledPath.Literal(Encoded("key3").asAnyF)),
 			terminalTag = implicitly[Tag[Bytes]].tag,
-			codec = implicitly[Codec[Bytes]].asAny,
+			codec = implicitly[Codec[Bytes]].asAnyF,
 		),
 		env = Map.empty
 	)

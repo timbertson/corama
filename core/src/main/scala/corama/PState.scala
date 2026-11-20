@@ -5,6 +5,7 @@ import cats.syntax.all.*
 import izumi.reflect.Tag
 import org.tpolecat.sourcepos.*
 import cats.Order
+import corama.error.Util.asAnyF
 
 // A lens into some arbitrary path of a pstate, containing the given leaf schema
 sealed trait Lens[A]
@@ -16,7 +17,7 @@ case class ValueLens[A](pstate: PState, path: Path, schema: Schema.ClassSchema[A
 	def delete(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, this, Nil, (_, _) => None)
 	def update(f: Option[A] => Option[A])(implicit pos: SourcePos): Flow[Unit, Etl] = ???
 	def updateWith[B](b: Var[B])(f: (Option[A], B) => Option[A])(implicit pos: SourcePos): Flow[Unit, Etl] =
-		Flow.Update(pos, this, List(b.asAny), { (a, args) =>
+		Flow.Update(pos, this, List(b.asAnyF), { (a, args) =>
 			args match {
 				case List(b) => f(a.asInstanceOf[Option[A]], b.asInstanceOf[B])
 				case other => impossible(s"update with ${other.length}")
@@ -32,20 +33,8 @@ case class SetLens[A](pstate: PState, path: Path, schema: Schema.SetSchema[A]) e
 		Flow.Select(this, SelectOptions(Some(afterItem), maxItems = Some(maxItems), schema.ord))
 }
 
-// object PState {
-
-// 	// class Update[K, V](pstate: PState[K,V], key: Var[K]) {
-// 	// 	def apply(f: Option[V] => Option[V])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.Update(pos, pstate, key, f)
-// 	// 	def zip[A](arg: Var[A])(f: (Option[V], A) => Option[V])(implicit pos: SourcePos): Flow[Unit, Etl] = Flow.UpdateWith(pos, pstate, key, arg, f)
-// 	// }
-// 	//
-// }
-
-
 // Pstate with nested schemas. Not fully type safe, validity of paths is verified at runtime
-// TODO: Identity vs PStateId
 final case class PState(id: PStateId, schema: Schema) {
-	// println(s"created pstate ${id.name} with schema $schema")
 	private def checkType(value: PathComponent[?], schema: Schema): Either[String, Unit] =
 		def requireValueOf(schemaTag: Tag[?]) = {
 			if (value.value.tag =:= schemaTag) {

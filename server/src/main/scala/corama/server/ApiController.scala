@@ -2,42 +2,46 @@ package corama.server
 
 import cats.effect.IO
 import corama.PartitionId
-import corama.error.Util
 import io.grpc.Metadata
 import streamdsl.rpc
 import streamdsl.rpc.AppendRequest
 import streamdsl.rpc.QueryRequest
 import streamdsl.rpc.Response
-import corama.client.Retry
 import flogger.Log
 import flogger.IOLogging
+import scala.util.Success
+import scala.util.Try
 
 class ApiController(
 	clusterConfig: ClusterConfig,
 	clusterClient: ClusterClient,
+	requestResolver: RequestResolver
 )(using log: Log[IO]) extends rpc.CoramaFs2Grpc[IO, Metadata] with IOLogging {
 	// TODO: accept requests without an explicit partition
 	override def append(request: AppendRequest, ctx: Metadata): IO[Response] = {
-		delegateTo(request.partition.map(PartitionId.apply)) { instance =>
-			instance.append(request, ctx)
+		val tryPartition = request.partition.map(PartitionId.apply) match {
+			case None => requestResolver.resolveAppend(request).map(_.partition)
+			case Some(p) => Success(p)
 		}
+		delegateTo(tryPartition)(_.append(request, ctx))
 	}
 
 	override def query(request: QueryRequest, ctx: Metadata): IO[Response] = {
-		// TODO: if there's no explicit partition, delegate to any task which
-		// this server leads
-		delegateTo(request.partition.map(PartitionId.apply)) { instance =>
-			instance.query(request, ctx)
+		val tryPartition = request.partition.map(PartitionId.apply) match {
+			case None => requestResolver.resolveQuery(request).map(_.partition)
+			case Some(p) => Success(p)
 		}
+		delegateTo(tryPartition)(_.query(request, ctx))
 	}
 	
 	// TODO: retry if group leadership was stale
-	private def delegateTo[A](partition: Option[PartitionId])
+	// TODO: redirect internally if this instance is the leader for this task?
+	private def delegateTo[A](partition: Try[PartitionId])
 		(block: rpc.CoramaInstanceFs2Grpc[IO, Metadata] => IO[A])
 		: IO[A] =
 	{
-		for {
-			partition <- Util.require("partition", partition)
+		GrpcError.wrap(for {
+			partition <- IO.fromTry(partition)
 			taskId = clusterConfig.taskFor(partition)
 			fetch = for {
 				leader <- clusterClient.requireCurrentLeader(taskId)
@@ -46,6 +50,6 @@ class ApiController(
 			} yield response
 			// result <- Retry(fetch)
 			result <- fetch
-		} yield result
+		} yield result)
 	}
 }
