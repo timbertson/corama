@@ -23,7 +23,13 @@ object Env {
 	opaque type Impl = Map[VarId, Any]
 	extension (i: Impl) {
 		inline def toList: List[(VarId, Any)] = i.toList
-		inline def getOrThrow(key: VarId): Any = i(key)
+		inline def getOrThrow(key: VarId): Any = {
+			if (key.id < 0) {
+				Var.getVirtual(key)
+			} else {
+				i(key)
+			}
+		}
 		inline def updated(key: VarId, value: Any): Env = i.updated(key, value)
 	}
 }

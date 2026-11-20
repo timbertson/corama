@@ -1,5 +1,6 @@
 package corama
 
+import cats.syntax.all.*
 import cats.Applicative
 import cats.Eq
 import izumi.reflect.Tag
@@ -151,6 +152,14 @@ object Var {
 		implicitly[Codec[Unit]],
 		implicitly[SourcePos]
 	)
+
+	def getVirtual(v: VarId): Any = {
+		if (v === unit.vid) {
+			return ()
+		} else {
+			throw new RuntimeException(s"Unknown virtual var: ${v}")
+		}
+	}
 
 	private [corama] val internal = SourcePos("internal", 1)
 
