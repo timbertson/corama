@@ -186,7 +186,7 @@ final class ServerTask private[server] (
 									partition,
 									evalState,
 									topology,
-									NonEmptyList.one(Map(topology.input.vid -> encoded.value))
+									NonEmptyList.one(Env(Map(topology.input.vid -> encoded.value)))
 								)
 							}
 						})
@@ -214,7 +214,7 @@ final class ServerTask private[server] (
 							partition,
 							evalState,
 							topology,
-							NonEmptyList.one(Map(topology.input.vid -> decoded))
+							NonEmptyList.one(Env(Map(topology.input.vid -> decoded)))
 						))
 					} yield (evalState, result)
 					handleEval(eval)

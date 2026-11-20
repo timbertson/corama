@@ -97,7 +97,7 @@ class InstanceController(
 								}.map { envs =>
 									val edgeId = EdgeId(partitionEnvs.edgeId)
 									val partitionId = PartitionId(partitionEnvs.partitionId)
-									Partitioned(partitionId, (edgeId, envs))
+									Partitioned(partitionId, (edgeId, envs.map(Env.apply)))
 								}
 							}
 						}

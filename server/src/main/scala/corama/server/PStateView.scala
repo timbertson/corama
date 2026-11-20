@@ -29,7 +29,7 @@ object PStateKey {
 	// encode as: (pathlen,path,val) so we can tell between (4|key1|2x) and (5|key12|x)
 	def forSetElem(partition: PartitionId, pstate: PStateId, path: CompiledPath, env: Env, value: VarId): PStateKey = {
 		val bs = build(Keyspace.PStateSet, partition, pstate, path, env)
-		bs.write(value.codec.encode(env(value)))
+		bs.write(value.codec.encode(env.getOrThrow(value)))
 		PStateKey(Bytes.Value(bs.toByteArray))
 	}
 	
@@ -52,7 +52,7 @@ object PStateKey {
 		path.path.toList.foreach { part =>
 			bs.write(part match {
 				case Literal(inner) => inner.bytes
-				case Variable(vid) => vid.codec.encode(env(vid))
+				case Variable(vid) => vid.codec.encode(env.getOrThrow(vid))
 			})
 		}
 		bs

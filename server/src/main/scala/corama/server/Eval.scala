@@ -91,7 +91,7 @@ class Eval(
 			import Node.PStateOp
 			nodes match {
 				case Nil =>
-					evalState.outputs.addNotification(source, edgeId, Some(envs.map(_(continuation.output))), continuation.agg)
+					evalState.outputs.addNotification(source, edgeId, Some(envs.map(_.getOrThrow(continuation.output))), continuation.agg)
 
 				case node :: tail => {
 					log.debug(s"Executing node: ${node}") *>
@@ -100,15 +100,15 @@ class Eval(
 							val results: Option[NonEmptyList[Env]] = try {
 								op match {
 									case DynamicOp.Map(out) =>
-										Some(envs.map(env => env.updated(out, fn(ins.map(env(_))))))
+										Some(envs.map(env => env.updated(out, fn(ins.map(env.getOrThrow(_))))))
 									case DynamicOp.Explode(out) =>
 										// in each env, `in` holds an `A`
 										// `fn` takes A and yields a Seq of values.
 										// we expand each of these into `out` in a
 										// copy of the parent env
 										envs.flatTraverse { env =>
-											println(s"env[$ins] = ${ins.map(env(_))}")
-											val seq = fn(ins.map(env(_))).asInstanceOf[Seq[?]]
+											println(s"env[$ins] = ${ins.map(env.getOrThrow(_))}")
+											val seq = fn(ins.map(env.getOrThrow(_))).asInstanceOf[Seq[?]]
 											println(s"exploded to seq ${seq}, storing in $out")
 											NonEmptyList.fromList(seq.toList).map { nel =>
 												nel.map { value =>
@@ -117,7 +117,7 @@ class Eval(
 											}
 										}
 									case DynamicOp.Filter(_) =>
-										NonEmptyList.fromList(envs.filter(env => fn(ins.map(env(_))).asInstanceOf[Boolean]))
+										NonEmptyList.fromList(envs.filter(env => fn(ins.map(env.getOrThrow(_))).asInstanceOf[Boolean]))
 								}
 							} catch {
 								case e => throw new EvalError(s"Error evaluating node", pos, e)
@@ -127,14 +127,14 @@ class Eval(
 
 						case Node.Assign(in, out) =>
 							continueTopology(tail, envs.map { env =>
-								env.updated(out, env(in))
+								env.updated(out, env.getOrThrow(in))
 							})
 
 						case Node.If(cond, ifBranch, elseBranch, out) =>
 							// TODO: I don't think we can break up envs like this! Need to statically extend execution tree.
 							// TODO: is single-exec batching even useful? We should batch multiple appends instead
 							envs.traverse_ { env =>
-								if (env(cond).asInstanceOf[Boolean]) {
+								if (env.getOrThrow(cond).asInstanceOf[Boolean]) {
 									continueTopology(ifBranch ++ tail, NonEmptyList.one(env))
 								} else {
 									continueTopology(elseBranch ++ tail, NonEmptyList.one(env))
@@ -147,7 +147,7 @@ class Eval(
 							started in parallel. The result notification of this edge being complete is
 							combined (via xor) with the opening of all fanout edges at once.
 							*/
-							val taskPartitions = metadata.partitionBatches(envs, env => env(in))
+							val taskPartitions = metadata.partitionBatches(envs, env => env.getOrThrow(in))
 							for {
 								origin <- source match {
 									case remote: Origin => SyncIO.pure(remote)
@@ -205,7 +205,7 @@ class Eval(
 										val key = PStateKey(partitionId, ps, path, env)
 
 										val after = options.after.flatMap { after =>
-											env(after.vid)
+											env.getOrThrow(after.vid)
 												.asInstanceOf[Option[Any]]
 												.map(after.vid.codec.encode)
 										}
@@ -222,7 +222,7 @@ class Eval(
 										}
 
 									case PStateOp.Put(v: VarId) => {
-										evalState.put(PStateKey(partitionId, ps, path, env), Some(path.codec.encode(env(v)))).as(env)
+										evalState.put(PStateKey(partitionId, ps, path, env), Some(path.codec.encode(env.getOrThrow(v)))).as(env)
 									}
 								}
 							}.flatMap { updatedEnvs =>
@@ -235,7 +235,7 @@ class Eval(
 								val key = PStateKey(partitionId, ps, path, env)
 								evalState.get(key).flatMap { currentBytes =>
 									val current = currentBytes.map(path.codec.decodeEx)
-									val args = ins.map(env(_))
+									val args = ins.map(env.getOrThrow(_))
 									val updated = f(current, args).map(path.codec.encode)
 									evalState.put(key, updated)
 								}
@@ -245,7 +245,7 @@ class Eval(
 
 						case Node.LocalAppend(dep, value) =>
 							envs.traverse_ { env =>
-								val v = env(value)
+								val v = env.getOrThrow(value)
 								evalState.append(dep, partitionId, value.codec.encode(v))
 							} >> continueTopology(tail, envs)
 					})
