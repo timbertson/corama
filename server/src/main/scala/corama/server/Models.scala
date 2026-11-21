@@ -20,6 +20,9 @@ import cats.Order
 type Env = Env.Impl
 object Env {
 	def apply(map: Map[VarId, Any]): Impl = map
+
+	val empty: Env = Map.empty
+
 	opaque type Impl = Map[VarId, Any]
 	extension (i: Impl) {
 		inline def toList: List[(VarId, Any)] = i.toList

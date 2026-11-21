@@ -17,6 +17,11 @@ object Bytes {
 		override def hashCode(): Int = Arrays.hashCode(raw)
 	}
 	object Value {
+		implicit val order: Order[Value] = new Order {
+			override def compare(a: Value, b: Value): Int = Arrays.compare(a.raw, b.raw)
+		}
+		implicit val ordering: Ordering[Value] = order.toOrdering
+
 		def apply(raw: Bytes) = new Value(raw)
 	}
 

@@ -5,6 +5,7 @@ import corama.InstanceId
 import cats.effect.Ref
 import cats.effect.IO
 import org.apache.ratis.protocol.RaftGroupId
+import cats.data.NonEmptyList
 
 class InMemoryGroup(private val taskId: TaskId, state: Ref[IO, InMemoryGroup.State]) {
 	def currentLeader = state.get.map(_.leader)
@@ -21,9 +22,11 @@ class InMemoryGroup(private val taskId: TaskId, state: Ref[IO, InMemoryGroup.Sta
 }
 
 object InMemoryGroup {
-	def apply(taskId: TaskId): IO[InMemoryGroup] = for {
+	def apply(config: ClusterConfig, taskId: TaskId): IO[InMemoryGroup] = for {
+		instances <- IO.fromTry(config.groupInstances(taskId))
+		instanceIds = instances.map(_.id)
 		state <- Ref[IO].of(State(
-			leader = None
+			leader = Some(instanceIds.head)
 		))
 	} yield new InMemoryGroup(taskId, state)
 

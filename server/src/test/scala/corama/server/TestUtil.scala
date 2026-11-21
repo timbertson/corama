@@ -112,8 +112,7 @@ object TestUtil extends IOLogging {
 			} catch {
 				case e => {
 					ref.flush.unsafeRunSync()
-					// throw(e)
-					failure(e.toString())
+					failure(GrpcError.format(e))
 				}
 			}
 		}

@@ -44,7 +44,7 @@ object Cluster extends IOLogging {
 	def inMemoryCluster(config: ClusterConfig, topologies: Topologies)(using log: Log[IO]): ActiveResource[IO, TopologyClient] = {
 		val res = for {
 			groups <- Resource.eval(config.tasks.traverse { taskId =>
-				InMemoryGroup(taskId).map(taskId -> _)
+				InMemoryGroup(config, taskId).map(taskId -> _)
 			}.map(IOMap.apply))
 
 			clusterClient <- Resource.eval(ClusterClient.inMemory(groups))

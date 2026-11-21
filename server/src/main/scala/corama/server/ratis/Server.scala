@@ -162,9 +162,9 @@ object Server extends IOLogging {
 			(incomingEvalRouter, evalRouterBg) <- IncomingEvalRouter(config).resource
 			taskResources <- instance.tasks.traverse { taskId =>
 				for {
-					pstate <- Resource.eval(PStateView.inMemory)
+					pstate <- Resource.eval(PStateView.inMemory.to[IO])
 					speculativeState = new SpeculativeState(pstate)
-					group <- Resource.eval(InMemoryGroup(taskId))
+					group <- Resource.eval(InMemoryGroup(config, taskId))
 					replog <- Resource.eval(RepLog.inMemory(instance.id, group))
 					(serverTask, bg) <- ServerTask.resource(
 						instance.id,

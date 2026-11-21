@@ -4,11 +4,13 @@ import cats.effect.SyncIO
 import cats.syntax.all.*
 import corama.*
 
-import cats.effect.IO
 import corama.CompiledPath.Literal
 import corama.CompiledPath.Variable
 import java.io.ByteArrayOutputStream
 import corama.server.Env
+import cats.effect.Ref
+import scala.collection.immutable.TreeMap
+import corama.SelectOptions.Raw
 
 trait PStateView {
 	def get(key: PStateKey): SyncIO[Option[Bytes]]
@@ -16,7 +18,13 @@ trait PStateView {
 }
 
 object PStateView {
-	def inMemory: IO[PStateView] = ???
+	class InMemory(ref: Ref[SyncIO, TreeMap[Bytes.Value, Bytes]]) extends PStateView {
+		override def get(key: PStateKey): SyncIO[Option[Bytes]] = ref.get.map(_.get(key.raw))
+
+		override def select(key: PStateKey, options: Raw): SyncIO[Vector[Bytes]] = ???
+	}
+
+	def inMemory: SyncIO[PStateView] = Ref[SyncIO].of(TreeMap.empty[Bytes.Value, Bytes]).map(ref => new InMemory(ref))
 }
 
 // an encoded, prefixed key composed of (partition, pstate, key)

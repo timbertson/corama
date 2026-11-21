@@ -18,7 +18,7 @@ object GrpcError {
 		}
 	}
 	
-	private def format(t: Throwable): String = {
+	def format(t: Throwable): String = {
 		val base = s"${t.getClass.getSimpleName()}: ${t.getMessage}\n at ${t.getStackTrace().mkString("\n")}"
 		Option(t.getCause()).fold(base) { cause =>
 			s"${base}\ncaused by:\n${format(cause)}"

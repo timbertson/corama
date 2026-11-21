@@ -26,7 +26,7 @@ object StateMachineSuite extends SimpleIOSuite {
 			terminalTag = implicitly[Tag[Bytes]].tag,
 			codec = implicitly[Codec[Bytes]].asAnyF,
 		),
-		env = Map.empty
+		env = Env.empty
 	)
 
 	private val pstateKey2 = PStateKey(
@@ -37,7 +37,7 @@ object StateMachineSuite extends SimpleIOSuite {
 			terminalTag = implicitly[Tag[Bytes]].tag,
 			codec = implicitly[Codec[Bytes]].asAnyF,
 		),
-		env = Map.empty
+		env = Env.empty
 	)
 
 	private val pstateKey3 = PStateKey(
@@ -48,7 +48,7 @@ object StateMachineSuite extends SimpleIOSuite {
 			terminalTag = implicitly[Tag[Bytes]].tag,
 			codec = implicitly[Codec[Bytes]].asAnyF,
 		),
-		env = Map.empty
+		env = Env.empty
 	)
 
 	private val sample = ReplicationUpdate(

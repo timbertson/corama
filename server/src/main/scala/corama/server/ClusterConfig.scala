@@ -18,6 +18,8 @@ import corama.PartitionId
 import cats.effect.std.Random
 import scala.concurrent.duration.*
 import corama.client.ClientConfig
+import scala.util.Failure
+import scala.util.Success
 
 case class PerInstance[T](default: Option[T], overrides: Map[InstanceId, T]) {
 	def get(id: InstanceId): Try[T] = {
@@ -67,12 +69,17 @@ case class ClusterConfig private(
 ) {
 	val numTasks = tasks.size
 	val numInstances = instances.size
+
+	def groupInstances(taskId: TaskId): Try[NonEmptyList[ClusterInstance]] = {
+		NonEmptyList.fromList(instances.filter(_.tasks.contains_(taskId))).toRight(
+			new RuntimeException(s"No instances for task: ${taskId}. Instances:\n${instances.toList.mkString("\n")}")
+		).toTry
+	}
+
 	def raftGroup(taskId: TaskId): Try[RaftGroup] = {
 		for {
-			groupInstances <- NonEmptyList.fromList(instances.filter(_.tasks.contains_(taskId))).toRight(
-				new RuntimeException(s"No instances for task: ${taskId}")
-			).toTry
-			peers <- groupInstances.traverse { instance =>
+			peerInstances <- groupInstances(taskId)
+			peers <- peerInstances.traverse { instance =>
 				networkConfig.get(instance.id).map { nc =>
 					RaftPeer.newBuilder()
 						.setId(RaftPeerId.valueOf(instance.id.id))
@@ -120,13 +127,9 @@ case class ClusterConfig private(
 
 	// TODO make much better
 	private def rawPartitionKey(value: Any) = {
-		val mod = value.hashCode() % numPartitions
-		if (mod < 0) {
-			mod + numPartitions
-		} else {
-			mod
-		}
+		ClusterConfig.posMod(value.hashCode(), numPartitions)
 	}
+
 }
 
 object ClusterConfig {
@@ -234,12 +237,18 @@ object ClusterConfig {
 	private def assignTasks(numTasks: Int, ids: NonEmptyList[InstanceId]): Try[(NonEmptyList[TaskId], NonEmptyList[ClusterInstance])] = {
 		// each task is assigned to three consecutive instances, with wraparound
 		// i.e. task 0 is assigned to instance 0, -1, & -2
+		val numInstances = ids.length
 		for {
 			tasks <- NonEmptyList.fromList(Range(0, numTasks).map(TaskId.apply).toList)
 				.toRight(new RuntimeException("numTasks cannot be 0")).toTry
-			instances = ids.zipWithIndex.map { (id, index) =>
-				val tasks = NonEmptyList.of(index, index + 1, index + 2).map(i => TaskId(i % numTasks)).distinct
-				ClusterInstance(id, tasks)
+			instances <- ids.zipWithIndex.traverse { (instanceId, instanceIndex) =>
+				val instanceTasks = tasks.filter { taskId =>
+					val base = taskId.id
+					List(base, base + 1, base + 2).exists(taskId => posMod(taskId, numInstances) === instanceIndex)
+				}
+				NonEmptyList.fromList(instanceTasks)
+					.toRight(new RuntimeException(s"configuration (${numTasks} tasks and ${numInstances} instances) would leave instance ${instanceId} without any tasks to replicate")).toTry
+					.map { instanceTasks => ClusterInstance(instanceId, instanceTasks) }
 			}
 		} yield (tasks, instances)
 	}
@@ -259,4 +268,14 @@ object ClusterConfig {
 		)(deleteRecursive).map(_.toString)
 
 	private def deleteRecursive(root: os.Path): IO[Unit] = IO.blocking(os.remove.all(root))
+
+	// always returns in the range (0..size)
+	def posMod(i: Int, size: Int) = {
+		val mod = i % size
+		if (mod < 0) {
+			mod + size
+		} else {
+			mod
+		}
+	}
 }
